@@ -59,8 +59,8 @@ pub struct CycleContext {
 
     intersection_over_union_threshold:
         Parameter<f32, "object_detection.$cycler_instance.intersection_over_union_threshold">,
-    keypoint_confidence_threshold:
-        Parameter<f32, "object_detection.$cycler_instance.keypoint_confidence_threshold">,
+    bounding_box_confidence_threshold:
+        Parameter<f32, "object_detection.$cycler_instance.bounding_box_confidence_threshold">,
     enable: Parameter<bool, "object_detection.$cycler_instance.enable">,
 }
 
@@ -166,7 +166,7 @@ impl PoseDetection {
             .into_iter()
             .filter_map(|row| {
                 let confidence = row[4];
-                if confidence < *context.keypoint_confidence_threshold {
+                if confidence < *context.bounding_box_confidence_threshold {
                     return None;
                 }
                 let bounding_box_slice = row.slice(s![0..4]);
