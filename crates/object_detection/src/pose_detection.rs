@@ -58,10 +58,10 @@ pub struct CycleContext {
     motion_command: Input<MotionCommand, "Control", "motion_command">,
 
     intersection_over_union_threshold:
-        Parameter<f32, "object_detection.$cycler_instance.intersection_over_union_threshold">,
+        Parameter<f32, "pose_detection.intersection_over_union_threshold">,
     bounding_box_confidence_threshold:
-        Parameter<f32, "object_detection.$cycler_instance.bounding_box_confidence_threshold">,
-    enable: Parameter<bool, "object_detection.$cycler_instance.enable">,
+        Parameter<f32, "pose_detection.bounding_box_confidence_threshold">,
+    enable: Parameter<bool, "pose_detection.enable">,
 }
 
 #[context]
