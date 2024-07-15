@@ -1,10 +1,11 @@
-use std::f32::consts::FRAC_PI_4;
+use std::f32::consts::{FRAC_PI_2, FRAC_PI_4};
 
 use coordinate_systems::{Field, Ground};
 use framework::AdditionalOutput;
 use geometry::look_at::LookAt;
-use linear_algebra::{point, Pose2, Rotation2, Vector2};
+use linear_algebra::{point, Orientation2, Point2, Pose2, Rotation2, Vector2};
 use types::{
+    ball,
     field_dimensions::FieldDimensions,
     filtered_game_state::FilteredGameState,
     motion_command::{MotionCommand, WalkSpeed},
@@ -58,10 +59,9 @@ fn support_pose(
         .or(world_state.ball)
         .unwrap_or_else(|| BallState::new_at_center(ground_to_field));
     let side = field_side.unwrap_or_else(|| ball.field_side.opposite());
-    let offset_vector = Rotation2::new(match side {
-        Side::Left => -FRAC_PI_4,
-        Side::Right => FRAC_PI_4,
-    }) * -(Vector2::<Field>::x_axis() * distance_to_ball);
+
+    let offset_vector =
+        calculate_position_offset_vector(ball.ball_in_field, side, distance_to_ball, minimum_x);
     let supporting_position = ball.ball_in_field + offset_vector;
 
     let filtered_game_state = world_state
@@ -89,4 +89,32 @@ fn support_pose(
         clamped_position.look_at(&ball.ball_in_field).angle(),
     );
     Some(ground_to_field.inverse() * support_pose)
+}
+
+fn calculate_position_offset_vector(
+    ball_in_field: Point2<Field>,
+    side: Side,
+    distance_to_ball: f32,
+    minimum_x: f32,
+) -> Vector2<Field> {
+    // #[allow::clippy::]
+    let offset_angle = if ball_in_field.x() < -minimum_x {
+        FRAC_PI_2
+    } else if (-minimum_x..0.0).contains(&ball_in_field.x()) {
+        Orientation2::<Field>::new(FRAC_PI_4)
+            .slerp(
+                Orientation2::<Field>::new(FRAC_PI_2),
+                ball_in_field.x() / (-minimum_x + f32::EPSILON),
+            )
+            .angle()
+    } else {
+        FRAC_PI_4
+    };
+
+    let rotation = Rotation2::new(match side {
+        Side::Left => -offset_angle,
+        Side::Right => offset_angle,
+    });
+
+    rotation * -(Vector2::<Field>::x_axis() * distance_to_ball)
 }
