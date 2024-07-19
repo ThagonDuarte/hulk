@@ -1142,7 +1142,7 @@
       "distance_to_look_directly_at_the_ball": 1.0
     },
     "walk_and_stand": {
-      "hysteresis": [0.1, 0.1],
+      "hysteresis": [0.3, 0.1],
       "target_reached_thresholds": [0.02, 0.05],
       "hybrid_align_distance": 1.0,
       "distance_to_be_aligned": 0.05
