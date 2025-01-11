@@ -159,7 +159,7 @@ impl Behavior {
             Role::DefenderLeft => match world_state.filtered_game_controller_state {
                 Some(FilteredGameControllerState {
                     sub_state: Some(SubState::CornerKick),
-                    kicking_team: Team::Opponent,
+                    kicking_team: Some(Team::Opponent),
                     ..
                 }) => actions.push(Action::DefendOpponentCornerKick { side: Side::Left }),
                 Some(FilteredGameControllerState {
@@ -169,6 +169,7 @@ impl Behavior {
                             ball_is_free: false,
                             ..
                         },
+                    kicking_team: None,
                     own_team_is_home_after_coin_toss: false,
                     ..
                 }) => {
@@ -180,7 +181,7 @@ impl Behavior {
             Role::DefenderRight => match world_state.filtered_game_controller_state {
                 Some(FilteredGameControllerState {
                     sub_state: Some(SubState::CornerKick),
-                    kicking_team: Team::Opponent,
+                    kicking_team: Some(Team::Opponent),
                     ..
                 }) => actions.push(Action::DefendOpponentCornerKick { side: Side::Right }),
                 Some(FilteredGameControllerState {
@@ -190,6 +191,7 @@ impl Behavior {
                             ball_is_free: false,
                             ..
                         },
+                    kicking_team: None,
                     own_team_is_home_after_coin_toss: true,
                     ..
                 }) => {
@@ -205,7 +207,7 @@ impl Behavior {
                 })
                 | Some(FilteredGameControllerState {
                     game_state: FilteredGameState::Playing { .. },
-                    kicking_team: Team::Opponent,
+                    kicking_team: Some(Team::Opponent),
                     sub_state: Some(SubState::PenaltyKick),
                     ..
                 }) => {
@@ -223,6 +225,7 @@ impl Behavior {
                             ball_is_free: false,
                             ..
                         },
+                    kicking_team: None,
                     own_team_is_home_after_coin_toss: false,
                     ..
                 }) => {
@@ -239,6 +242,7 @@ impl Behavior {
                             ball_is_free: false,
                             ..
                         },
+                    kicking_team: None,
                     own_team_is_home_after_coin_toss: true,
                     ..
                 }) => {
@@ -251,6 +255,7 @@ impl Behavior {
             Role::Searcher => match world_state.filtered_game_controller_state {
                 Some(FilteredGameControllerState {
                     sub_state: Some(SubState::KickIn) | Some(SubState::PushingFreeKick),
+                    kicking_team: None,
                     penalties,
                     ..
                 }) => {
@@ -284,11 +289,8 @@ impl Behavior {
                     actions.push(Action::Dribble);
                 }
                 Some(FilteredGameControllerState {
-                    game_state:
-                        FilteredGameState::Ready {
-                            kicking_team_known: true,
-                        },
-                    kicking_team: Team::Hulks,
+                    game_state: FilteredGameState::Ready,
+                    kicking_team: Some(Team::Hulks),
                     sub_state,
                     ..
                 }) => match sub_state {
@@ -298,7 +300,7 @@ impl Behavior {
                 Some(FilteredGameControllerState {
                     game_state: FilteredGameState::Ready { .. } | FilteredGameState::Playing { .. },
                     sub_state: Some(SubState::PenaltyKick),
-                    kicking_team: Team::Opponent,
+                    kicking_team: Some(Team::Opponent),
                     ..
                 }) => actions.push(Action::DefendPenaltyKick),
                 _ => actions.push(Action::DefendKickOff),
