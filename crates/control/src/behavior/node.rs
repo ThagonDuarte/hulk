@@ -174,6 +174,7 @@ impl Behavior {
                             ball_is_free: false,
                             ..
                         },
+                    kicking_team: None,
                     own_team_is_home_after_coin_toss: false,
                     ..
                 }) => {
@@ -195,6 +196,7 @@ impl Behavior {
                             ball_is_free: false,
                             ..
                         },
+                    kicking_team: None,
                     own_team_is_home_after_coin_toss: true,
                     ..
                 }) => {
@@ -228,6 +230,7 @@ impl Behavior {
                             ball_is_free: false,
                             ..
                         },
+                    kicking_team: None,
                     own_team_is_home_after_coin_toss: false,
                     ..
                 }) => {
@@ -244,6 +247,7 @@ impl Behavior {
                             ball_is_free: false,
                             ..
                         },
+                    kicking_team: None,
                     own_team_is_home_after_coin_toss: true,
                     ..
                 }) => {
@@ -256,7 +260,7 @@ impl Behavior {
             Role::Searcher => match world_state.filtered_game_controller_state {
                 Some(FilteredGameControllerState {
                     sub_state: Some(SubState::KickIn) | Some(SubState::PushingFreeKick),
-                    // kicking_team: None, TODO: Change this to None when the game controller is fixed
+                    kicking_team: None,
                     penalties,
                     ..
                 }) => {
