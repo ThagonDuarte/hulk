@@ -1,4 +1,4 @@
-use std::{convert::identity, f32::consts::PI, time::Duration};
+use std::{f32::consts::PI, time::Duration};
 
 use color_eyre::{eyre::Ok, Result};
 use framework::MainOutput;
@@ -21,10 +21,6 @@ pub struct CycleContext {
 
     stand_up_back_estimated_remaining_duration:
         CyclerState<RemainingStandUpDuration, "stand_up_back_estimated_remaining_duration">,
-    stand_up_front_estimated_remaining_duration:
-        CyclerState<RemainingStandUpDuration, "stand_up_front_estimated_remaining_duration">,
-    stand_up_sitting_estimated_remaining_duration:
-        CyclerState<RemainingStandUpDuration, "stand_up_sitting_estimated_remaining_duration">,
 }
 
 #[context]
@@ -81,7 +77,6 @@ impl TimeToReachKickPosition {
         let time_to_reach_kick_position = [
             Some(walk_duration),
             (*context.stand_up_back_estimated_remaining_duration).into(),
-            (*context.stand_up_front_estimated_remaining_duration).into(),
             Some(turn_duration),
         ]
         .into_iter()
