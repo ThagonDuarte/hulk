@@ -73,6 +73,7 @@ pub struct CycleContext {
     optional_roles: Parameter<Vec<Role>, "behavior.optional_roles">,
     player_number: Parameter<PlayerNumber, "player_number">,
     spl_network: Parameter<SplNetworkParameters, "spl_network">,
+    is_challenger_shield_game: Parameter<bool, "is_challenger_shield_game">,
 
     hardware: HardwareInterface,
 
@@ -139,7 +140,11 @@ impl RoleAssignment {
             role_for_penalty_shootout(context.filtered_game_controller_state),
             keep_current_role_in_penalty_kick(context.filtered_game_controller_state, self.role),
             keep_current_role_if_not_in_playing(primary_state, self.role),
-            keep_current_role_during_free_kicks(context.filtered_game_controller_state, self.role),
+            keep_current_role_during_free_kicks(
+                context.filtered_game_controller_state,
+                self.role,
+                *context.is_challenger_shield_game,
+            ),
             Some(role_from_state_machine),
         ]
         .iter()
@@ -626,7 +631,12 @@ fn keep_current_role_in_penalty_kick(
 fn keep_current_role_during_free_kicks(
     filtered_game_controller_state: Option<&FilteredGameControllerState>,
     current_role: Role,
+    is_challenger_shield_game: bool,
 ) -> Option<Role> {
+    if is_challenger_shield_game {
+        return None;
+    }
+
     if let Some(FilteredGameControllerState {
         sub_state: Some(SubState::KickIn | SubState::PushingFreeKick),
         ..

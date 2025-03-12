@@ -67,6 +67,7 @@ pub struct CycleContext {
     keeper_motion: Parameter<KeeperMotionParameters, "keeper_motion">,
     use_stand_head_unstiff_calibration:
         Parameter<bool, "calibration_controller.use_stand_head_unstiff_calibration">,
+    is_challenger_shield_game: Parameter<bool, "is_challenger_shield_game">,
 
     defend_walk_speed: Parameter<WalkSpeed, "walk_speed.defend">,
     dribble_walk_speed: Parameter<WalkSpeed, "walk_speed.dribble">,
@@ -173,7 +174,9 @@ impl Behavior {
                     own_team_is_home_after_coin_toss: false,
                     ..
                 }) => {
-                    actions.push(Action::LookAtReferee);
+                    if !*context.is_challenger_shield_game {
+                        actions.push(Action::LookAtReferee);
+                    }
                     actions.push(Action::DefendLeft);
                 }
                 _ => actions.push(Action::DefendLeft),
@@ -195,7 +198,9 @@ impl Behavior {
                     own_team_is_home_after_coin_toss: true,
                     ..
                 }) => {
-                    actions.push(Action::LookAtReferee);
+                    if !*context.is_challenger_shield_game {
+                        actions.push(Action::LookAtReferee);
+                    }
                     actions.push(Action::DefendRight);
                 }
                 _ => actions.push(Action::DefendRight),
@@ -229,7 +234,9 @@ impl Behavior {
                     own_team_is_home_after_coin_toss: false,
                     ..
                 }) => {
-                    actions.push(Action::LookAtReferee);
+                    if !*context.is_challenger_shield_game {
+                        actions.push(Action::LookAtReferee);
+                    }
                     actions.push(Action::SupportLeft);
                 }
                 _ => actions.push(Action::SupportLeft),
@@ -246,7 +253,9 @@ impl Behavior {
                     own_team_is_home_after_coin_toss: true,
                     ..
                 }) => {
-                    actions.push(Action::LookAtReferee);
+                    if !*context.is_challenger_shield_game {
+                        actions.push(Action::LookAtReferee);
+                    }
                     actions.push(Action::SupportRight);
                 }
                 _ => actions.push(Action::SupportRight),
@@ -269,7 +278,9 @@ impl Behavior {
                     if first_two_nonpenalized_nonkeeper_player_numbers
                         .contains(&world_state.robot.player_number)
                     {
-                        actions.push(Action::LookAtReferee);
+                        if !*context.is_challenger_shield_game {
+                            actions.push(Action::LookAtReferee);
+                        }
                         actions.push(Action::Search);
                     } else {
                         actions.push(Action::Search);

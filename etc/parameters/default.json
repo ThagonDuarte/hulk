@@ -1127,6 +1127,7 @@
     "walk_to_kickoff": "Normal",
     "walk_to_penalty_kick": "Normal"
   },
+  "is_challenger_shield_game": true,
   "behavior": {
     "optional_roles": [
       "DefenderLeft",
