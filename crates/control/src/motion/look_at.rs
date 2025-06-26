@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 
 use context_attribute::context;
 use coordinate_systems::{Camera, Field, Ground, Head, Robot};
-use framework::MainOutput;
+use framework::{AdditionalOutput, MainOutput};
 use linear_algebra::{distance, point, vector, Isometry3, Point2};
 use types::{
     camera_position::CameraPosition,
@@ -38,6 +38,9 @@ pub struct CycleContext {
     expected_referee_position: Input<Option<Point2<Field>>, "expected_referee_position?">,
     world_state: Input<WorldState, "world_state">,
 
+    expected_referee_position_in_ground:
+        AdditionalOutput<Point2<Ground>, "expected_referee_position_in_ground">,
+
     glance_angle: Parameter<f32, "look_at.glance_angle">,
     image_region_parameters: Parameter<ImageRegionParameters, "look_at.image_regions">,
     glance_direction_toggle_interval:
@@ -59,7 +62,7 @@ impl LookAt {
         })
     }
 
-    pub fn cycle(&mut self, context: CycleContext) -> Result<MainOutputs> {
+    pub fn cycle(&mut self, mut context: CycleContext) -> Result<MainOutputs> {
         let cycle_start_time = context.cycle_time.start_time;
         let measured_head_angles = context.sensor_data.positions.head;
         let default_output = Ok(MainOutputs {
@@ -104,6 +107,10 @@ impl LookAt {
             * context
                 .expected_referee_position
                 .unwrap_or(&point!(0.0, 0.0));
+
+        context
+            .expected_referee_position_in_ground
+            .fill_if_subscribed(|| expected_referee_position);
 
         let (target, image_region_target, camera) = match *head_motion {
             HeadMotion::LookAt {
