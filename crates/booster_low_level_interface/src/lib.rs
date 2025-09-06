@@ -43,7 +43,7 @@ pub enum CommandType {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct LowCmd {
+pub struct LowCommand {
     #[serde(rename = "cmd_type")]
     pub command_type: CommandType,
     #[serde(rename = "motor_cmd")]
@@ -136,15 +136,15 @@ pub struct RemoteControllerState {
     #[serde(rename = "lb")]
     pub left_button: bool,
     #[serde(rename = "rb")]
-    pub rb: bool,
+    pub right_button: bool,
     #[serde(rename = "lt")]
-    pub lt: bool,
+    pub left_trigger: bool,
     #[serde(rename = "rt")]
-    pub rt: bool,
+    pub right_trigger: bool,
     #[serde(rename = "ls")]
-    pub ls: bool,
+    pub left_joystick: bool,
     #[serde(rename = "rs")]
-    pub rs: bool,
+    pub right_joystick: bool,
     pub back: bool,
     pub start: bool,
 
@@ -231,7 +231,7 @@ pub struct Time {
 pub trait BoosterLowLevelInterface {
     fn subscribe_low_state(&self) -> Receiver<LowState>;
 
-    fn publish_joint_ctrl(&self) -> Sender<LowCmd>;
+    fn publish_joint_ctrl(&self) -> Sender<LowCommand>;
 
     fn subscribe_fall_down(&self) -> Receiver<FallDownState>;
 
