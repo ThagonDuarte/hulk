@@ -18,7 +18,7 @@ use crate::{
     color::{Rgb, YCbCr422, YCbCr444},
     jpeg::JpegImage,
 };
-use ros2::sensor_msgs::image::Image as Ros2Image;
+use ros2::sensor_msgs::image::{Image as Ros2Image, ImageEncoding};
 
 pub const SAMPLE_SIZE: usize = 32;
 
@@ -115,8 +115,8 @@ impl From<&Ros2Image> for YCbCr422Image {
         let width_422 = ros2_image.width / 2;
         let height = ros2_image.height;
 
-        let data = match ros2_image.encoding.as_str() {
-            "rgb8" => ros2_image
+        let data = match ros2_image.encoding {
+            ImageEncoding::Rgb8 => ros2_image
                 .data
                 .chunks(6)
                 .map(|pixel| {
@@ -135,7 +135,7 @@ impl From<&Ros2Image> for YCbCr422Image {
                     [left_color, right_color].into()
                 })
                 .collect(),
-            _ => unimplemented!("image encoding not supported"),
+            _ => unimplemented!("image encoding {:#?} not supported", ros2_image.encoding),
         };
 
         Self {
