@@ -21,12 +21,10 @@ impl Overlay for FieldBorder {
     const NAME: &'static str = "Field Border";
 
     fn new(nao: Arc<crate::nao::Nao>, selected_cycler: VisionCycler) -> Self {
-        let cycler_path = selected_cycler.as_path();
         Self {
-            border_lines: nao.subscribe_value(format!("{cycler_path}.main_outputs.field_border")),
-            candidates: nao.subscribe_value(format!(
-                "{cycler_path}.additional_outputs.field_border_points"
-            )),
+            border_lines: nao.subscribe_value(format!("Vision.main_outputs.field_border")),
+            candidates: nao
+                .subscribe_value(format!("Vision.additional_outputs.field_border_points")),
         }
     }
 

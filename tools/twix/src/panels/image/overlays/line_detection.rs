@@ -26,14 +26,13 @@ impl Overlay for LineDetection {
     const NAME: &'static str = "Line Detection";
 
     fn new(nao: std::sync::Arc<crate::nao::Nao>, selected_cycler: VisionCycler) -> Self {
-        let cycler_path = selected_cycler.as_path();
         Self {
             lines_in_image: nao
-                .subscribe_value(format!("{cycler_path}.additional_outputs.lines_in_image")),
+                .subscribe_value(format!("Vision.additional_outputs.lines_in_image")),
             discarded_lines: nao
-                .subscribe_value(format!("{cycler_path}.additional_outputs.discarded_lines")),
+                .subscribe_value(format!("Vision.additional_outputs.discarded_lines")),
             filtered_segments: nao.subscribe_value(format!(
-                "{cycler_path}.additional_outputs.line_detection.filtered_segments"
+                "Vision.additional_outputs.line_detection.filtered_segments"
             )),
         }
     }

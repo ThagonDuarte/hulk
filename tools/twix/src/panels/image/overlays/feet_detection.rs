@@ -23,13 +23,12 @@ impl Overlay for FeetDetection {
     const NAME: &'static str = "Feet Detection";
 
     fn new(nao: Arc<Nao>, selected_cycler: VisionCycler) -> Self {
-        let cycler_path = selected_cycler.as_path();
         Self {
-            camera_matrix: nao.subscribe_value(format!("{cycler_path}.main_outputs.camera_matrix")),
+            camera_matrix: nao.subscribe_value(format!("vision.main_outputs.camera_matrix")),
             cluster_points: nao.subscribe_value(format!(
-                "{cycler_path}.additional_outputs.feet_detection.cluster_points"
+                "vision.additional_outputs.feet_detection.cluster_points"
             )),
-            detected_feet: nao.subscribe_value(format!("{cycler_path}.main_outputs.detected_feet")),
+            detected_feet: nao.subscribe_value(format!("vision.main_outputs.detected_feet")),
         }
     }
 

@@ -17,10 +17,8 @@ impl Overlay for LimbProjector {
     const NAME: &'static str = "Projected Limbs";
 
     fn new(nao: std::sync::Arc<crate::nao::Nao>, selected_cycler: VisionCycler) -> Self {
-        let cycler_path = selected_cycler.as_path();
         Self {
-            projected_limbs: nao
-                .subscribe_value(format!("{cycler_path}.main_outputs.projected_limbs")),
+            projected_limbs: nao.subscribe_value(format!("Vision.main_outputs.projected_limbs")),
         }
     }
 

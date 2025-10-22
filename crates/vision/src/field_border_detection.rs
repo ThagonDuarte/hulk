@@ -28,16 +28,15 @@ pub struct CreationContext {}
 pub struct CycleContext {
     field_border_points: AdditionalOutput<Vec<Point2<Pixel>>, "field_border_points">,
 
-    enable: Parameter<bool, "field_border_detection.$cycler_instance.enable">,
-    angle_threshold: Parameter<f32, "field_border_detection.$cycler_instance.angle_threshold">,
+    enable: Parameter<bool, "field_border_detection.enable">,
+    angle_threshold: Parameter<f32, "field_border_detection.angle_threshold">,
     first_line_association_distance:
-        Parameter<f32, "field_border_detection.$cycler_instance.first_line_association_distance">,
-    min_points_per_line:
-        Parameter<usize, "field_border_detection.$cycler_instance.min_points_per_line">,
+        Parameter<f32, "field_border_detection.first_line_association_distance">,
+    min_points_per_line: Parameter<usize, "field_border_detection.min_points_per_line">,
     second_line_association_distance:
-        Parameter<f32, "field_border_detection.$cycler_instance.second_line_association_distance">,
+        Parameter<f32, "field_border_detection.second_line_association_distance">,
 
-    camera_matrix: RequiredInput<Option<CameraMatrix>, "camera_matrix?">,
+    camera_matrix: RequiredInput<Option<CameraMatrix>, "control", "camera_matrix?">,
     image_segments: Input<ImageSegments, "image_segments">,
 }
 

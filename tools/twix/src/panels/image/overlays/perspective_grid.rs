@@ -21,10 +21,9 @@ impl Overlay for PerspectiveGrid {
     const NAME: &'static str = "Perspective Grid";
 
     fn new(nao: Arc<Nao>, selected_cycler: VisionCycler) -> Self {
-        let cycler_path = selected_cycler.as_path();
         Self {
             perspective_grid: nao.subscribe_value(format!(
-                "{cycler_path}.additional_outputs.perspective_grid_ball_sizes"
+                "vision.additional_outputs.perspective_grid_ball_sizes"
             )),
         }
     }

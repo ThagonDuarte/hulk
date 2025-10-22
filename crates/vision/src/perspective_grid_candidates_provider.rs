@@ -25,15 +25,16 @@ pub struct CreationContext {}
 
 #[context]
 pub struct CycleContext {
-    camera_matrix: RequiredInput<Option<CameraMatrix>, "camera_matrix?">,
+    camera_matrix: RequiredInput<Option<CameraMatrix>, "Control", "camera_matrix?">,
     filtered_segments: Input<FilteredSegments, "filtered_segments">,
     line_data: RequiredInput<Option<LineData>, "line_data?">,
     image: Input<YCbCr422Image, "image">,
 
-    minimum_radius:
-    Parameter<f32, "perspective_grid_candidates_provider.$cycler_instance.minimum_radius">,
-    minimum_number_of_segments_per_circle:
-    Parameter<usize, "perspective_grid_candidates_provider.$cycler_instance.minimum_number_of_segments_per_circle">,
+    minimum_radius: Parameter<f32, "perspective_grid_candidates_provider.minimum_radius">,
+    minimum_number_of_segments_per_circle: Parameter<
+        usize,
+        "perspective_grid_candidates_provider.minimum_number_of_segments_per_circle",
+    >,
     ball_radius: Parameter<f32, "field_dimensions.ball_radius">,
 
     perspective_grid_ball_sizes: AdditionalOutput<Vec<Row>, "perspective_grid_ball_sizes">,

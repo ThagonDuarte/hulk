@@ -1,1 +1,464 @@
-{}
+{
+    "feet_detection": {
+        "enable": true,
+        "maximum_cluster_distance": 0.25,
+        "minimum_consecutive_segments": 5,
+        "minimum_luminance_standard_deviation": 10,
+        "minimum_samples_per_cluster": 5,
+        "minimum_feet_width": 0.0,
+        "minimum_segment_height": 0.08
+    },
+    "field_border_detection": {
+        "enable": true,
+        "min_points_per_line": 10,
+        "angle_threshold": 0.35,
+        "first_line_association_distance": 2.0,
+        "second_line_association_distance": 2.0
+    },
+    "image_segmenter": {
+        "horizontal_edge_threshold": 15,
+        "horizontal_median_mode": "FivePixels",
+        "horizontal_stride": 8,
+        "vertical_edge_threshold": 15,
+        "vertical_median_mode": "FivePixels",
+        "vertical_stride": 2,
+        "vertical_stride_in_ground": 0.02
+    },
+    "projected_limbs": {
+        "enable": false,
+        "torso_bounding_polyline": [
+            [
+                0,
+                -0.09799999743700027,
+                0.23499999940395355
+            ],
+            [
+                -0.03500000014901161,
+                -0.09799999743700027,
+                0.2199999988079071
+            ],
+            [
+                -0.05999999865889549,
+                -0.09799999743700027,
+                0.17000000178813934
+            ],
+            [
+                -0.05000000074505806,
+                -0.07000000029802322,
+                0.17000000178813934
+            ],
+            [
+                -0.05000000074505806,
+                -0.05000000074505806,
+                0.17000000178813934
+            ],
+            [
+                -0.05000000074505806,
+                -0.029999999329447743,
+                0.17000000178813934
+            ],
+            [
+                -0.05000000074505806,
+                0,
+                0.17000000178813934
+            ],
+            [
+                -0.05000000074505806,
+                0.029999999329447743,
+                0.17000000178813934
+            ],
+            [
+                -0.05000000074505806,
+                0.05000000074505806,
+                0.17000000178813934
+            ],
+            [
+                -0.05000000074505806,
+                0.07000000029802322,
+                0.17000000178813934
+            ],
+            [
+                -0.05999999865889549,
+                0.09799999743700027,
+                0.17000000178813934
+            ],
+            [
+                -0.03500000014901161,
+                0.09799999743700027,
+                0.2199999988079071
+            ],
+            [
+                0,
+                0.09799999743700027,
+                0.23499999940395355
+            ],
+            [
+                0.03500000014901161,
+                0.09799999743700027,
+                0.2199999988079071
+            ],
+            [
+                0.05999999865889549,
+                0.09799999743700027,
+                0.17000000178813934
+            ],
+            [
+                0.03650000074505806,
+                0.06000000029802322,
+                0.1850000059604645
+            ],
+            [
+                0.06000000029802322,
+                0.03500000014901161,
+                0.15000000596046448
+            ],
+            [
+                0.06300000029802322,
+                0,
+                0.15000000596046448
+            ],
+            [
+                0.06000000029802322,
+                -0.03500000014901161,
+                0.15000000596046448
+            ],
+            [
+                0.05000000074505806,
+                -0.07000000029802322,
+                0.15000000596046448
+            ],
+            [
+                0.05999999865889549,
+                -0.09799999743700027,
+                0.17000000178813934
+            ],
+            [
+                0.03500000014901161,
+                -0.09799999743700027,
+                0.2199999988079071
+            ],
+            [
+                0,
+                -0.09799999743700027,
+                0.23499999940395355
+            ]
+        ],
+        "lower_arm_bounding_polyline": [
+            [
+                -0.06,
+                0.03,
+                0
+            ],
+            [
+                -0.06,
+                0.0225,
+                0.0225
+            ],
+            [
+                -0.06,
+                0,
+                0.03
+            ],
+            [
+                -0.06,
+                -0.0225,
+                0.0225
+            ],
+            [
+                -0.06,
+                -0.03,
+                0
+            ],
+            [
+                -0.06,
+                -0.0225,
+                -0.0225
+            ],
+            [
+                -0.06,
+                0,
+                -0.03
+            ],
+            [
+                -0.06,
+                0.0225,
+                -0.0225
+            ],
+            [
+                -0.06,
+                0.03,
+                0
+            ],
+            [
+                0.085,
+                0.045,
+                0
+            ],
+            [
+                0.085,
+                0.0325,
+                0.0325
+            ],
+            [
+                0.085,
+                0,
+                0.045
+            ],
+            [
+                0.085,
+                -0.0325,
+                0.0325
+            ],
+            [
+                0.085,
+                -0.045,
+                0
+            ],
+            [
+                0.085,
+                -0.0325,
+                -0.0325
+            ],
+            [
+                0.085,
+                0,
+                -0.045
+            ],
+            [
+                0.085,
+                0.0325,
+                -0.0325
+            ],
+            [
+                0.085,
+                0.045,
+                0
+            ]
+        ],
+        "upper_arm_bounding_polyline": [
+            [
+                0,
+                0.029999999329447746,
+                0
+            ],
+            [
+                0,
+                0.02250000089406967,
+                0.02250000089406967
+            ],
+            [
+                0,
+                0,
+                0.029999999329447746
+            ],
+            [
+                0,
+                -0.02250000089406967,
+                0.02250000089406967
+            ],
+            [
+                0,
+                -0.029999999329447746,
+                0
+            ],
+            [
+                0,
+                -0.02250000089406967,
+                -0.02250000089406967
+            ],
+            [
+                0,
+                0,
+                -0.029999999329447746
+            ],
+            [
+                0,
+                0.02250000089406967,
+                -0.02250000089406967
+            ],
+            [
+                0,
+                0.029999999329447746,
+                0
+            ],
+            [
+                -0.12,
+                0.029999999329447746,
+                0
+            ],
+            [
+                -0.12,
+                0.02250000089406967,
+                0.02250000089406967
+            ],
+            [
+                -0.12,
+                0,
+                0.029999999329447746
+            ],
+            [
+                -0.12,
+                -0.02250000089406967,
+                0.02250000089406967
+            ],
+            [
+                -0.12,
+                -0.029999999329447746,
+                0
+            ],
+            [
+                -0.12,
+                -0.02250000089406967,
+                -0.02250000089406967
+            ],
+            [
+                -0.12,
+                0,
+                -0.029999999329447746
+            ],
+            [
+                -0.12,
+                0.02250000089406967,
+                -0.02250000089406967
+            ],
+            [
+                -0.12,
+                0.029999999329447746,
+                0
+            ]
+        ],
+        "knee_bounding_polyline": [
+            [
+                0.05,
+                0.05,
+                -0.1
+            ],
+            [
+                0.08,
+                0,
+                -0.1
+            ],
+            [
+                0.05,
+                -0.05,
+                -0.1
+            ]
+        ],
+        "foot_bounding_polyline": [
+            [
+                0.1,
+                0.06,
+                0.02
+            ],
+            [
+                0.12,
+                0,
+                0.02
+            ],
+            [
+                0.1,
+                -0.06,
+                0.02
+            ]
+        ]
+    },
+    "line_detection": {
+        "use_horizontal_segments": true,
+        "use_vertical_segments": true,
+        "allowed_line_length_in_field": {
+            "start": 0.3,
+            "end": 4.0
+        },
+        "check_edge_types": true,
+        "check_edge_gradient": false,
+        "check_line_distance": true,
+        "check_line_length": true,
+        "check_line_segments_projection": true,
+        "gradient_alignment": -0.9,
+        "gradient_sobel_stride": 3,
+        "margin_for_point_inclusion": 0.025,
+        "maximum_distance_to_robot": 6.0,
+        "maximum_fit_distance_in_ground": 0.05,
+        "maximum_gap_on_line": 0.25,
+        "maximum_merge_gap_in_pixels": 5,
+        "maximum_number_of_lines": 10,
+        "allowed_projected_segment_length": {
+            "start": 0.02,
+            "end": 0.095
+        },
+        "minimum_number_of_points_on_line": 15,
+        "ransac_iterations": 20
+    },
+    "perspective_grid_candidates_provider": {
+        "minimum_radius": 3.0,
+        "minimum_number_of_segments_per_circle": 2
+    },
+    "camera_matrix_parameters": {
+        "camera_properties": {
+            "camera_pitch": -1.2,
+            "focal_lengths": [
+                0.96666,
+                1.28574
+            ],
+            "cc_optical_center": [
+                0.5,
+                0.5
+            ]
+        },
+        "calibration": {
+            "correction_in_robot": [
+                0.0,
+                0.0,
+                0.0
+            ],
+            "correction_in_camera": [
+                0.0,
+                0.0,
+                0.0
+            ]
+        }
+    },
+    "ball_detection": {
+        "minimal_radius": 42.0,
+        "preclassifier_neural_network": "preclassifier.hdf5",
+        "classifier_neural_network": "classifier.hdf5",
+        "positioner_neural_network": "positioner.hdf5",
+        "maximum_number_of_candidate_evaluations": 75,
+        "preclassifier_confidence_threshold": 0.9,
+        "classifier_confidence_threshold": 0.9,
+        "confidence_merge_factor": 1.0,
+        "correction_proximity_merge_factor": 1.0,
+        "image_containment_merge_factor": 1.0,
+        "cluster_merge_radius_factor": 1.5,
+        "ball_radius_enlargement_factor": 1.8,
+        "detection_noise": [
+            8.0,
+            8.0
+        ],
+        "noise_increase_slope": 8.0,
+        "noise_increase_distance_threshold": 3.0
+    },
+    "field_dimensions": {
+        "ball_radius": 0.05,
+        "length": 9.0,
+        "width": 6.0,
+        "line_width": 0.05,
+        "penalty_marker_size": 0.1,
+        "goal_box_area_length": 0.6,
+        "goal_box_area_width": 2.2,
+        "penalty_area_length": 1.65,
+        "penalty_area_width": 4.0,
+        "penalty_marker_distance": 1.3,
+        "center_circle_diameter": 1.5,
+        "border_strip_width": 2.0,
+        "goal_inner_width": 1.5,
+        "goal_post_diameter": 0.1,
+        "goal_depth": 0.5
+    },
+    "orientation_filter": {
+        "filter_gain": 0.01,
+        "calibration_steady_threshold": 0.02,
+        "calibration_smoothing_factor": 0.1,
+        "number_of_calibration_cycles": 25
+    }
+}

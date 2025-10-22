@@ -55,10 +55,7 @@ impl Panel for ImageColorSelectPanel {
                 VisionCycler::try_from(string).ok()
             })
             .unwrap_or(VisionCycler::Top);
-        let image = nao.subscribe_value(format!(
-            "{cycler_path}.main_outputs.image",
-            cycler_path = cycler.as_path()
-        ));
+        let image = nao.subscribe_value(format!("Vision.main_outputs.image"));
 
         let brush_size = 50.0;
 
@@ -190,10 +187,9 @@ impl Widget for &mut ImageColorSelectPanel {
                 ui.horizontal(|ui| {
                     let mut cycler_selector = VisionCyclerSelector::new(&mut self.cycler);
                     if cycler_selector.ui(ui).changed() {
-                        self.image = self.nao.subscribe_value(format!(
-                            "{cycler_path}.main_outputs.image",
-                            cycler_path = self.cycler.as_path()
-                        ));
+                        self.image = self
+                            .nao
+                            .subscribe_value(format!("Vision.main_outputs.image"));
                     }
 
                     if ui.button("reset").clicked() {

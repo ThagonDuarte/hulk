@@ -30,21 +30,17 @@ pub struct CycleContext {
     cluster_points: AdditionalOutput<Vec<ClusterPoint>, "feet_detection.cluster_points">,
     clusters_in_ground: AdditionalOutput<Vec<CountedCluster>, "feet_detection.clusters_in_ground">,
 
-    enable: Parameter<bool, "feet_detection.$cycler_instance.enable">,
-    maximum_cluster_distance:
-        Parameter<f32, "feet_detection.$cycler_instance.maximum_cluster_distance">,
-    minimum_consecutive_segments:
-        Parameter<usize, "feet_detection.$cycler_instance.minimum_consecutive_segments">,
+    enable: Parameter<bool, "feet_detection.enable">,
+    maximum_cluster_distance: Parameter<f32, "feet_detection.maximum_cluster_distance">,
+    minimum_consecutive_segments: Parameter<usize, "feet_detection.minimum_consecutive_segments">,
     minimum_luminance_standard_deviation:
-        Parameter<f32, "feet_detection.$cycler_instance.minimum_luminance_standard_deviation">,
-    minimum_samples_per_cluster:
-        Parameter<usize, "feet_detection.$cycler_instance.minimum_samples_per_cluster">,
-    minimum_feet_width: Parameter<f32, "feet_detection.$cycler_instance.minimum_feet_width">,
-    minimum_segment_height:
-        Parameter<f32, "feet_detection.$cycler_instance.minimum_segment_height">,
+        Parameter<f32, "feet_detection.minimum_luminance_standard_deviation">,
+    minimum_samples_per_cluster: Parameter<usize, "feet_detection.minimum_samples_per_cluster">,
+    minimum_feet_width: Parameter<f32, "feet_detection.minimum_feet_width">,
+    minimum_segment_height: Parameter<f32, "feet_detection.minimum_segment_height">,
 
     balls: RequiredInput<Option<Vec<BallPercept>>, "balls?">,
-    camera_matrix: RequiredInput<Option<CameraMatrix>, "camera_matrix?">,
+    camera_matrix: RequiredInput<Option<CameraMatrix>, "control", "camera_matrix?">,
     filtered_segments: Input<FilteredSegments, "filtered_segments">,
     line_data: RequiredInput<Option<LineData>, "line_data?">,
 }

@@ -29,24 +29,19 @@ pub struct CreationContext {}
 pub struct CycleContext {
     image: Input<YCbCr422Image, "image">,
 
-    camera_matrix: RequiredInput<Option<CameraMatrix>, "camera_matrix?">,
+    camera_matrix: RequiredInput<Option<CameraMatrix>, "control", "camera_matrix?">,
     projected_limbs: Input<Option<ProjectedLimbs>, "projected_limbs?">,
 
-    horizontal_stride: Parameter<usize, "image_segmenter.$cycler_instance.horizontal_stride">,
-    vertical_stride_in_ground: Parameter<
-        Framed<Ground, f32>,
-        "image_segmenter.$cycler_instance.vertical_stride_in_ground",
-    >,
-    horizontal_edge_threshold:
-        Parameter<u8, "image_segmenter.$cycler_instance.horizontal_edge_threshold">,
+    horizontal_stride: Parameter<usize, "image_segmenter.horizontal_stride">,
+    vertical_stride_in_ground:
+        Parameter<Framed<Ground, f32>, "image_segmenter.vertical_stride_in_ground">,
+    horizontal_edge_threshold: Parameter<u8, "image_segmenter.horizontal_edge_threshold">,
     horizontal_median_mode:
-        Parameter<MedianModeParameters, "image_segmenter.$cycler_instance.horizontal_median_mode">,
+        Parameter<MedianModeParameters, "image_segmenter.horizontal_median_mode">,
 
-    vertical_stride: Parameter<usize, "image_segmenter.$cycler_instance.vertical_stride">,
-    vertical_edge_threshold:
-        Parameter<u8, "image_segmenter.$cycler_instance.vertical_edge_threshold">,
-    vertical_median_mode:
-        Parameter<MedianModeParameters, "image_segmenter.$cycler_instance.vertical_median_mode">,
+    vertical_stride: Parameter<usize, "image_segmenter.vertical_stride">,
+    vertical_edge_threshold: Parameter<u8, "image_segmenter.vertical_edge_threshold">,
+    vertical_median_mode: Parameter<MedianModeParameters, "image_segmenter.vertical_median_mode">,
 }
 
 #[context]

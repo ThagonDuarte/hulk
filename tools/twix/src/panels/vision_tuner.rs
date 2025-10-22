@@ -88,10 +88,10 @@ impl Panel for VisionTunerPanel {
 
         let cycler_path = cycler.as_snake_case_path();
         let horizontal_edge_threshold = nao.subscribe_value(format!(
-            "parameters.image_segmenter.{cycler_path}.horizontal_edge_threshold",
+            "parameters.image_segmenter.vision.horizontal_edge_threshold",
         ));
         let vertical_edge_threshold = nao.subscribe_value(format!(
-            "parameters.image_segmenter.{cycler_path}.vertical_edge_threshold",
+            "parameters.image_segmenter.vision.vertical_edge_threshold",
         ));
 
         Self {
@@ -134,7 +134,7 @@ impl VisionTunerPanel {
     fn resubscribe(&mut self) {
         let cycler_path = self.cycler.as_snake_case_path();
         self.vertical_edge_threshold = self.nao.subscribe_value(format!(
-            "parameters.image_segmenter.{cycler_path}.vertical_edge_threshold"
+            "parameters.image_segmenter.vision.vertical_edge_threshold"
         ));
     }
 }

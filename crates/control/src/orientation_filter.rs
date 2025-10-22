@@ -1,3 +1,4 @@
+use booster::LowState;
 use color_eyre::Result;
 use filtering::{low_pass_filter::LowPassFilter, madgwick::Madgwick};
 use nalgebra::UnitQuaternion;
@@ -8,7 +9,7 @@ use context_attribute::context;
 use coordinate_systems::{Field, Robot};
 use framework::MainOutput;
 use linear_algebra::{IntoFramed, Orientation3, Vector3};
-use types::{cycle_time::CycleTime, sensor_data::SensorData};
+use types::cycle_time::CycleTime;
 
 #[derive(
     Clone, Default, Serialize, Deserialize, PathDeserialize, PathSerialize, PathIntrospect,
@@ -34,7 +35,7 @@ pub struct CreationContext {}
 #[context]
 pub struct CycleContext {
     cycle_time: Input<CycleTime, "cycle_time">,
-    sensor_data: Input<SensorData, "sensor_data">,
+    low_state: Input<LowState, "low_state">,
     filter_gain: Parameter<f32, "orientation_filter.filter_gain">,
     calibration_steady_threshold: Parameter<f32, "orientation_filter.calibration_steady_threshold">,
     calibration_smoothing_factor: Parameter<f32, "orientation_filter.calibration_smoothing_factor">,
@@ -55,14 +56,8 @@ impl OrientationFilter {
     }
 
     pub fn cycle(&mut self, context: CycleContext) -> Result<MainOutputs> {
-        let measured_angular_velocity = context
-            .sensor_data
-            .inertial_measurement_unit
-            .angular_velocity;
-        let measured_acceleration = context
-            .sensor_data
-            .inertial_measurement_unit
-            .linear_acceleration;
+        let measured_angular_velocity = context.low_state.imu_state.angular_velocity;
+        let measured_acceleration = context.low_state.imu_state.linear_acceleration;
         let angular_velocity_sum = measured_angular_velocity.abs().inner.sum();
 
         let mut recalibrated_this_cycle = false;

@@ -60,10 +60,10 @@ impl Panel for ImagePanel {
             .unwrap_or(true);
 
         let image_buffer = if is_jpeg {
-            let path = format!("{cycler_path}.main_outputs.image.jpeg");
+            let path = format!("Vision.main_outputs.image.jpeg");
             RawOrJpeg::Jpeg(nao.subscribe_value(path))
         } else {
-            let path = format!("{cycler_path}.main_outputs.image");
+            let path = format!("Vision.main_outputs.image");
             RawOrJpeg::Raw(nao.subscribe_value(path))
         };
 
@@ -187,12 +187,12 @@ impl ImagePanel {
         self.image_buffer = if jpeg {
             RawOrJpeg::Jpeg(
                 self.nao
-                    .subscribe_value(format!("{cycler_path}.main_outputs.image.jpeg")),
+                    .subscribe_value(format!("Vision.main_outputs.image.jpeg")),
             )
         } else {
             RawOrJpeg::Raw(
                 self.nao
-                    .subscribe_value(format!("{cycler_path}.main_outputs.image")),
+                    .subscribe_value(format!("Vision.main_outputs.image")),
             )
         };
     }

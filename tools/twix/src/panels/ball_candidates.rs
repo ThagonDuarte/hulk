@@ -43,12 +43,12 @@ impl Panel for BallCandidatePanel {
 
         let cycler_path = cycler.as_snake_case_path();
         let ball_radius_enlargement_factor = nao.subscribe_value(format!(
-            "parameters.ball_detection.{cycler_path}.ball_radius_enlargement_factor",
+            "parameters.ball_detection.ball_radius_enlargement_factor",
         ));
         let cycler_path = cycler.as_path();
         let ball_candidates =
-            nao.subscribe_value(format!("{cycler_path}.additional_outputs.ball_candidates"));
-        let image = nao.subscribe_value(format!("{cycler_path}.main_outputs.image"));
+            nao.subscribe_value(format!("Vision.additional_outputs.ball_candidates"));
+        let image = nao.subscribe_value(format!("Vision.main_outputs.image"));
         Self {
             nao,
             cycler,
@@ -117,15 +117,15 @@ impl BallCandidatePanel {
     fn resubscribe(&mut self) {
         let cycler_path = self.cycler.as_snake_case_path();
         self.ball_radius_enlargement_factor = self.nao.subscribe_value(format!(
-            "parameters.ball_detection.{cycler_path}.ball_radius_enlargement_factor",
+            "parameters.ball_detection.Vision.ball_radius_enlargement_factor",
         ));
         let cycler_path = self.cycler.as_path();
         self.ball_candidates = self
             .nao
-            .subscribe_value(format!("{cycler_path}.additional_outputs.ball_candidates"));
+            .subscribe_value(format!("Vision.additional_outputs.ball_candidates"));
         self.image = self
             .nao
-            .subscribe_value(format!("{cycler_path}.main_outputs.image"));
+            .subscribe_value(format!("Vision.main_outputs.image"));
     }
 }
 

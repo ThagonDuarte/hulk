@@ -82,7 +82,7 @@ impl Panel for SemiAutomaticCameraCalibrationPanel {
         let cycler_path = cycler.as_path();
 
         let image_buffer = {
-            let path = format!("{cycler_path}.main_outputs.image");
+            let path = format!("vision.main_outputs.image");
             nao.subscribe_value(path)
         };
 
@@ -177,7 +177,7 @@ impl SemiAutomaticCameraCalibrationPanel {
         let cycler_path = self.cycler.as_path();
         self.image_buffer = self
             .nao
-            .subscribe_value(format!("{cycler_path}.main_outputs.image"));
+            .subscribe_value(format!("vision.main_outputs.image"));
     }
 
     fn show_image(&mut self, painter: &TwixPainter<Pixel>) -> Result<()> {

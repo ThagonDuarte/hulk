@@ -22,10 +22,10 @@ pub struct CreationContext {}
 
 #[context]
 pub struct CycleContext {
-    camera_matrix: RequiredInput<Option<CameraMatrix>, "camera_matrix?">,
+    camera_matrix: RequiredInput<Option<CameraMatrix>, "Control", "camera_matrix?">,
     robot_kinematics: Input<RobotKinematics, "Control", "robot_kinematics">,
 
-    enable: Parameter<bool, "projected_limbs.$cycler_instance.enable">,
+    enable: Parameter<bool, "projected_limbs.enable">,
     sole_bounding_polyline:
         Parameter<Vec<Point3<LeftSole>>, "projected_limbs.foot_bounding_polyline">,
     thigh_bounding_polyline:

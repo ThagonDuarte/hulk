@@ -32,10 +32,7 @@ impl Overlay for FieldLines {
         else {
             return Ok(());
         };
-        let lines = match self.cycler {
-            VisionCycler::Top => &penalty_boxes_lines_in_image.top,
-            VisionCycler::Bottom => &penalty_boxes_lines_in_image.bottom,
-        };
+        let lines = &penalty_boxes_lines_in_image.projected_field_lines;
         for line in lines {
             painter.line_segment(line.0, line.1, Stroke::new(3.0, Color32::GRAY));
         }

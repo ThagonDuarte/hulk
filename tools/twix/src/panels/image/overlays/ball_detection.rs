@@ -13,7 +13,7 @@ use crate::{
 
 pub struct BallDetection {
     balls: BufferHandle<Option<Vec<BallPercept>>>,
-    filtered_balls: BufferHandle<Option<Vec<Circle<Pixel>>>>,
+    // filtered_balls: BufferHandle<Option<Vec<Circle<Pixel>>>>,
     ball_candidates: BufferHandle<Option<Vec<CandidateEvaluation>>>,
     ball_radius_enlargement_factor: BufferHandle<f32>,
 }
@@ -22,31 +22,25 @@ impl Overlay for BallDetection {
     const NAME: &'static str = "Ball Detection";
 
     fn new(nao: std::sync::Arc<crate::nao::Nao>, selected_cycler: VisionCycler) -> Self {
-        let camera_position = match selected_cycler {
-            VisionCycler::Top => "top",
-            VisionCycler::Bottom => "bottom",
-        };
-        let cycler_path = selected_cycler.as_path();
-        let cycler_path_snake_case = selected_cycler.as_snake_case_path();
         Self {
-            balls: nao.subscribe_value(format!("{cycler_path}.main_outputs.balls")),
-            filtered_balls: nao.subscribe_value(format!(
-                "Control.additional_outputs.filtered_balls_in_image_{camera_position}",
-            )),
+            balls: nao.subscribe_value(format!("Vision.main_outputs.balls")),
+            // filtered_balls: nao.subscribe_value(format!(
+            //     "Control.additional_outputs.filtered_balls_in_image",
+            // )),
             ball_candidates: nao
-                .subscribe_value(format!("{cycler_path}.additional_outputs.ball_candidates")),
+                .subscribe_value(format!("Vision.additional_outputs.ball_candidates")),
             ball_radius_enlargement_factor: nao.subscribe_value(format!(
-                "parameters.ball_detection.{cycler_path_snake_case}.ball_radius_enlargement_factor",
+                "parameters.ball_detection.ball_radius_enlargement_factor",
             )),
         }
     }
 
     fn paint(&self, painter: &TwixPainter<Pixel>) -> Result<()> {
-        if let Some(filtered_balls) = self.filtered_balls.get_last_value()?.flatten() {
-            for circle in &filtered_balls {
-                painter.circle_stroke(circle.center, circle.radius, Stroke::new(3.0, Color32::RED));
-            }
-        }
+        // if let Some(filtered_balls) = self.filtered_balls.get_last_value()?.flatten() {
+        //     for circle in &filtered_balls {
+        //         painter.circle_stroke(circle.center, circle.radius, Stroke::new(3.0, Color32::RED));
+        //     }
+        // }
 
         if let (Some(ball_candidates), Some(ball_radius_enlargement_factor)) = (
             self.ball_candidates.get_last_value()?.flatten(),

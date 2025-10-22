@@ -1,3 +1,4 @@
+use booster::LowState;
 use color_eyre::Result;
 use context_attribute::context;
 use framework::MainOutput;
@@ -13,13 +14,12 @@ use kinematics::forward::{
 };
 use linear_algebra::Isometry3;
 use serde::{Deserialize, Serialize};
+use types::joints::Joints;
 use types::robot_kinematics::{
     RobotHeadKinematics, RobotLeftArmKinematics, RobotLeftLegKinematics, RobotRightArmKinematics,
     RobotRightLegKinematics, RobotTorsoKinematics,
 };
-use types::{
-    robot_dimensions::RobotDimensions, robot_kinematics::RobotKinematics, sensor_data::SensorData,
-};
+use types::{robot_dimensions::RobotDimensions, robot_kinematics::RobotKinematics};
 
 #[derive(Deserialize, Serialize)]
 pub struct KinematicsProvider {}
@@ -29,7 +29,7 @@ pub struct CreationContext {}
 
 #[context]
 pub struct CycleContext {
-    sensor_data: Input<SensorData, "sensor_data">,
+    sensor_data: Input<LowState, "low_state">,
 }
 
 #[context]
@@ -44,7 +44,9 @@ impl KinematicsProvider {
     }
 
     pub fn cycle(&mut self, context: CycleContext) -> Result<MainOutputs> {
-        let measured_positions = &context.sensor_data.positions;
+        todo!("do correct forward kinematics for booster");
+        let measured_positions: Joints<f32> = Default::default();
+        // let measured_positions = &context.sensor_data.positions;
         // head
         let neck_to_robot = neck_to_robot(&measured_positions.head);
         let head_to_robot = neck_to_robot * head_to_neck(&measured_positions.head);

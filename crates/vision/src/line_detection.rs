@@ -44,37 +44,31 @@ pub struct CycleContext {
     filtered_segments_output:
         AdditionalOutput<Vec<GenericSegment>, "line_detection.filtered_segments">,
 
-    use_horizontal_segments:
-        Parameter<bool, "line_detection.$cycler_instance.use_horizontal_segments">,
-    use_vertical_segments: Parameter<bool, "line_detection.$cycler_instance.use_vertical_segments">,
+    use_horizontal_segments: Parameter<bool, "line_detection.use_horizontal_segments">,
+    use_vertical_segments: Parameter<bool, "line_detection.use_vertical_segments">,
     allowed_line_length_in_field:
-        Parameter<Range<f32>, "line_detection.$cycler_instance.allowed_line_length_in_field">,
-    check_edge_types: Parameter<bool, "line_detection.$cycler_instance.check_edge_types">,
-    check_edge_gradient: Parameter<bool, "line_detection.$cycler_instance.check_edge_gradient">,
-    check_line_distance: Parameter<bool, "line_detection.$cycler_instance.check_line_distance">,
-    check_line_length: Parameter<bool, "line_detection.$cycler_instance.check_line_length">,
+        Parameter<Range<f32>, "line_detection.allowed_line_length_in_field">,
+    check_edge_types: Parameter<bool, "line_detection.check_edge_types">,
+    check_edge_gradient: Parameter<bool, "line_detection.check_edge_gradient">,
+    check_line_distance: Parameter<bool, "line_detection.check_line_distance">,
+    check_line_length: Parameter<bool, "line_detection.check_line_length">,
     check_line_segments_projection:
-        Parameter<bool, "line_detection.$cycler_instance.check_line_segments_projection">,
-    gradient_alignment: Parameter<f32, "line_detection.$cycler_instance.gradient_alignment">,
-    gradient_sobel_stride: Parameter<u32, "line_detection.$cycler_instance.gradient_sobel_stride">,
-    margin_for_point_inclusion:
-        Parameter<f32, "line_detection.$cycler_instance.margin_for_point_inclusion">,
-    maximum_distance_to_robot:
-        Parameter<f32, "line_detection.$cycler_instance.maximum_distance_to_robot">,
-    maximum_fit_distance_in_ground:
-        Parameter<f32, "line_detection.$cycler_instance.maximum_fit_distance_in_ground">,
-    maximum_gap_on_line: Parameter<f32, "line_detection.$cycler_instance.maximum_gap_on_line">,
-    maximum_merge_gap_in_pixels:
-        Parameter<u16, "line_detection.$cycler_instance.maximum_merge_gap_in_pixels">,
-    maximum_number_of_lines:
-        Parameter<usize, "line_detection.$cycler_instance.maximum_number_of_lines">,
+        Parameter<bool, "line_detection.check_line_segments_projection">,
+    gradient_alignment: Parameter<f32, "line_detection.gradient_alignment">,
+    gradient_sobel_stride: Parameter<u32, "line_detection.gradient_sobel_stride">,
+    margin_for_point_inclusion: Parameter<f32, "line_detection.margin_for_point_inclusion">,
+    maximum_distance_to_robot: Parameter<f32, "line_detection.maximum_distance_to_robot">,
+    maximum_fit_distance_in_ground: Parameter<f32, "line_detection.maximum_fit_distance_in_ground">,
+    maximum_gap_on_line: Parameter<f32, "line_detection.maximum_gap_on_line">,
+    maximum_merge_gap_in_pixels: Parameter<u16, "line_detection.maximum_merge_gap_in_pixels">,
+    maximum_number_of_lines: Parameter<usize, "line_detection.maximum_number_of_lines">,
     allowed_projected_segment_length:
-        Parameter<Range<f32>, "line_detection.$cycler_instance.allowed_projected_segment_length">,
+        Parameter<Range<f32>, "line_detection.allowed_projected_segment_length">,
     minimum_number_of_points_on_line:
-        Parameter<usize, "line_detection.$cycler_instance.minimum_number_of_points_on_line">,
-    ransac_iterations: Parameter<usize, "line_detection.$cycler_instance.ransac_iterations">,
+        Parameter<usize, "line_detection.minimum_number_of_points_on_line">,
+    ransac_iterations: Parameter<usize, "line_detection.ransac_iterations">,
 
-    camera_matrix: RequiredInput<Option<CameraMatrix>, "camera_matrix?">,
+    camera_matrix: RequiredInput<Option<CameraMatrix>, "Control", "camera_matrix?">,
     filtered_segments: Input<FilteredSegments, "filtered_segments">,
     image: Input<YCbCr422Image, "image">,
 }
