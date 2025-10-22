@@ -7964,6 +7964,7 @@ checksum = "082f11ffa03bbef6c2c6ea6bea1acafaade2fd9050ae0234ab44a2153742b058"
 name = "ros2"
 version = "0.1.0"
 dependencies = [
+ "image",
  "nalgebra",
  "serde",
 ]
@@ -9859,6 +9860,7 @@ dependencies = [
  "framework",
  "geometry",
  "hardware",
+ "image",
  "itertools 0.14.0",
  "linear_algebra",
  "nalgebra",

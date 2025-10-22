@@ -6,6 +6,7 @@ import click
 from mujoco import MjData, MjModel, mj_resetData, mj_step
 from mujoco_rust_server import ServerCommand, SimulationServer
 from rich.logging import RichHandler
+from dm_control import 
 
 from mujoco_simulator import (
     SceneExporter,

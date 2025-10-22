@@ -105,6 +105,16 @@ impl From<Rgb> for YCbCr444 {
     }
 }
 
+impl From<u16> for YCbCr444 {
+    fn from(value: u16) -> Self {
+        Self {
+            y: ((value as f32 / 10000.0).clamp(0.0, 1.0) * 255.0) as u8,
+            cb: 85,
+            cr: 85,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum Intensity {
     Low,

@@ -81,11 +81,11 @@
 
         <geom name="static_box" 
           type="box" 
-          size="0.2 0.2 1"   pos="2 1 0"    rgba="0.8 0.2 0.2 1"/>
+          size="0.2 0.2 1"   pos="3.0 1 0"    rgba="0.8 0.2 0.2 1"/>
 
         <geom type="sphere" 
-            size="0.2" 
-            pos="2 -1 0.2"
+            size="0.5" 
+            pos="3 -1 0.7"
             rgba="0.2 0.8 0.2 1" 
             mass="1"/>
 

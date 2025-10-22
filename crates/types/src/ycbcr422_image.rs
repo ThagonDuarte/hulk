@@ -135,6 +135,18 @@ impl From<&Ros2Image> for YCbCr422Image {
                     [left_color, right_color].into()
                 })
                 .collect(),
+            "mono16" => ros2_image
+                .data
+                .chunks(2)
+                .map(|distance_bytes| {
+                    let distance = u16::from_be_bytes(
+                        distance_bytes
+                            .try_into()
+                            .expect("failed to construct distance"),
+                    );
+                    [distance.into(), distance.into()].into()
+                })
+                .collect(),
             _ => unimplemented!("image encoding not supported"),
         };
 

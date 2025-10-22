@@ -12,7 +12,7 @@ pub fn collect_hulk_cyclers(root: impl AsRef<Path>) -> Result<Cyclers, Error> {
             CyclerManifest {
                 name: "Vision",
                 kind: CyclerKind::Perception,
-                instances: vec![""],
+                instances: vec!["Top"],
                 setup_nodes: vec!["vision::image_receiver"],
                 nodes: vec![
                     // "vision::ball_detection",

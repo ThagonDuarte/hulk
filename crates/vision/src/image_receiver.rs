@@ -4,6 +4,7 @@ use color_eyre::Result;
 use context_attribute::context;
 use framework::MainOutput;
 use hardware::{RGBDSensorsInterface, TimeInterface};
+use image::RgbImage;
 use serde::{Deserialize, Serialize};
 use types::{cycle_time::CycleTime, ycbcr422_image::YCbCr422Image};
 
@@ -23,6 +24,7 @@ pub struct CycleContext {
 #[context]
 pub struct MainOutputs {
     pub image: MainOutput<YCbCr422Image>,
+    pub depth_image: MainOutput<YCbCr422Image>,
     pub cycle_time: MainOutput<CycleTime>,
 }
 
@@ -38,7 +40,9 @@ impl ImageReceiver {
         context: CycleContext<impl RGBDSensorsInterface + TimeInterface>,
     ) -> Result<MainOutputs> {
         let rgbd_image = context.hardware_interface.read_rgbd_sensors()?;
-        let ycbcr422_image: YCbCr422Image = rgbd_image.rgb.as_ref().into();
+        let color_ycbcr422_image: YCbCr422Image = rgbd_image.rgb.as_ref().into();
+        let depth_rgb_image: RgbImage = (*rgbd_image.depth).into();
+        let depth_ycbcr422_image: YCbCr422Image = depth_rgb_image.into();
 
         let now = context.hardware_interface.get_now();
         let cycle_time = CycleTime {
@@ -50,7 +54,8 @@ impl ImageReceiver {
         self.last_cycle_start = now;
 
         Ok(MainOutputs {
-            image: ycbcr422_image.into(),
+            image: color_ycbcr422_image.into(),
+            depth_image: depth_ycbcr422_image.into(),
             cycle_time: cycle_time.into(),
         })
     }

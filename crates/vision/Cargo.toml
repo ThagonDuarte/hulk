@@ -17,6 +17,7 @@ filtering = { workspace = true }
 framework = { workspace = true }
 geometry = { workspace = true }
 hardware = { workspace = true }
+image = { workspace = true }
 itertools = { workspace = true }
 linear_algebra = { workspace = true }
 nalgebra = { workspace = true }
