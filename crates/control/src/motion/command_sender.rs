@@ -65,15 +65,15 @@ impl CommandSender {
             velocity: 0.0,
             torque: 0.0,
             kp: 45.0,
-            kd: 0.2,
+            kd: 0.4,
             weight: 1.0,
         }; 22];
         motor_commands[motor_index] = MotorCommand {
             position: time_index.sin(),
             velocity: time_index.sin(),
-            torque: 1.0,
+            torque: 0.0,
             kp: 25.0,
-            kd: 0.3,
+            kd: 0.4,
             weight: 1.0,
         };
         motor_commands
