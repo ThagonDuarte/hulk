@@ -2,9 +2,9 @@ use color_eyre::Result;
 use serde::{Deserialize, Serialize};
 
 use context_attribute::context;
-use coordinate_systems::{Field, Ground, Robot};
+use coordinate_systems::{Ground, Robot};
 use framework::MainOutput;
-use linear_algebra::{vector, Isometry3, Orientation3};
+use linear_algebra::{vector, Isometry3, Orientation3, Vector3};
 use types::{robot_kinematics::RobotKinematics, support_foot::Side};
 
 #[derive(Deserialize, Serialize)]
@@ -17,7 +17,7 @@ pub struct CreationContext {}
 pub struct CycleContext {
     robot_kinematics: Input<RobotKinematics, "robot_kinematics">,
     support_side: RequiredInput<Option<Side>, "support_foot.support_side?">,
-    robot_orientation: RequiredInput<Option<Orientation3<Field>>, "robot_orientation?">,
+    roll_pitch_yaw: RequiredInput<Option<Vector3<Robot>>, "low_state.imu_state.roll_pitch_yaw?">,
 }
 
 #[context]
@@ -36,7 +36,7 @@ impl GroundProvider {
         struct LeftSoleHorizontal;
         struct RightSoleHorizontal;
 
-        let (roll, pitch, _) = context.robot_orientation.inner.euler_angles();
+        let (roll, pitch) = (context.roll_pitch_yaw.x(), context.roll_pitch_yaw.y());
         let imu_orientation = Orientation3::from_euler_angles(roll, pitch, 0.0).mirror();
 
         let left_sole_horizontal_to_robot = Isometry3::from_parts(

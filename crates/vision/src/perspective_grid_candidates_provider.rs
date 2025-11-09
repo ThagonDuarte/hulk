@@ -27,7 +27,7 @@ pub struct CreationContext {}
 pub struct CycleContext {
     camera_matrix: RequiredInput<Option<CameraMatrix>,"Control", "camera_matrix?">,
     filtered_segments: Input<FilteredSegments, "filtered_segments">,
-    line_data: RequiredInput<Option<LineData>, "line_data?">,
+    // line_data: RequiredInput<Option<LineData>, "line_data?">,
     image: Input<YCbCr422Image, "image">,
 
     minimum_radius:
@@ -52,7 +52,7 @@ impl PerspectiveGridCandidatesProvider {
 
     pub fn cycle(&mut self, mut context: CycleContext) -> Result<MainOutputs> {
         let vertical_scanlines = &context.filtered_segments.scan_grid.vertical_scan_lines;
-        let skip_segments = &context.line_data.used_segments;
+        // let skip_segments = &context.line_data.used_segments;
         let image_size = vector![context.image.width() as f32, context.image.height() as f32];
 
         let perspective_grid_ball_sizes = generate_rows(
@@ -66,7 +66,7 @@ impl PerspectiveGridCandidatesProvider {
             context.camera_matrix,
             context.image,
             vertical_scanlines,
-            skip_segments,
+            // skip_segments,
             &perspective_grid_ball_sizes,
             *context.minimum_number_of_segments_per_circle,
             *context.ball_radius,
@@ -128,7 +128,7 @@ fn generate_candidates(
     camera_matrix: &CameraMatrix,
     image: &YCbCr422Image,
     vertical_scanlines: &[ScanLine],
-    skip_segments: &HashSet<Point2<Pixel, u16>>,
+    // skip_segments: &HashSet<Point2<Pixel, u16>>,
     rows: &[Row],
     minimum_number_of_segments_per_circle: usize,
     ball_radius: f32,
@@ -137,9 +137,9 @@ fn generate_candidates(
 
     for scan_line in vertical_scanlines {
         for segment in &scan_line.segments {
-            if skip_segments.contains(&point![scan_line.position, segment.start]) {
-                continue;
-            }
+            // if skip_segments.contains(&point![scan_line.position, segment.start]) {
+            //     continue;
+            // }
 
             let (row_index, row) = match find_matching_row(rows, segment) {
                 Some(result) => result,
