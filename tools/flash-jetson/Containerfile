@@ -1,0 +1,23 @@
+FROM docker.io/ubuntu:22.04
+
+RUN apt-get update && apt-get install --no-install-recommends --yes \
+    qemu-user-static sshpass abootimg nfs-kernel-server libxml2-utils binutils curl ca-certificates
+
+RUN curl 'https://seeedstudio88-my.sharepoint.com/personal/youjiang_yu_seeedstudio88_onmicrosoft_com/_layouts/15/download.aspx?SourceUrl=%2Fpersonal%2Fyoujiang%5Fyu%5Fseeedstudio88%5Fonmicrosoft%5Fcom%2FDocuments%2FJetson%2DImages%2FreComputer%2DJ401%2Fjp6%2E2%2Fmfi%5Frecomputer%2Dorin%2Dnano%2D8g%2Dj401%2D6%2E2%2D36%2E4%2E3%2D2025%2D04%2D07%2Etar%2Egz' \
+    -H 'User-Agent: Mozilla/5.0 (X11; Linux x86_64; rv:146.0) Gecko/20100101 Firefox/146.0' \
+    -H 'Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8' \
+    -H 'Accept-Language: en-US,en;q=0.5' \
+    -H 'Accept-Encoding: gzip, deflate, br, zstd' \
+    -H 'Referer: https://seeedstudio88-my.sharepoint.com/personal/youjiang_yu_seeedstudio88_onmicrosoft_com/_layouts/15/onedrive.aspx?id=%2Fpersonal%2Fyoujiang%5Fyu%5Fseeedstudio88%5Fonmicrosoft%5Fcom%2FDocuments%2FJetson%2DImages%2FreComputer%2DJ401%2Fjp6%2E2%2Fmfi%5Frecomputer%2Dorin%2Dnano%2D8g%2Dj401%2D6%2E2%2D36%2E4%2E3%2D2025%2D04%2D07%2Etar%2Egz&parent=%2Fpersonal%2Fyoujiang%5Fyu%5Fseeedstudio88%5Fonmicrosoft%5Fcom%2FDocuments%2FJetson%2DImages%2FreComputer%2DJ401%2Fjp6%2E2&ga=1' \
+    -H 'Sec-GPC: 1' \
+    -H 'Upgrade-Insecure-Requests: 1' \
+    -H 'Sec-Fetch-Dest: iframe' \
+    -H 'Sec-Fetch-Mode: navigate' \
+    -H 'Sec-Fetch-Site: same-origin' \
+    -H 'Connection: keep-alive' \
+    -H 'Cookie: MicrosoftApplicationsTelemetryDeviceId=39f1b3fc-836d-4a32-884e-2f4ed19cbbf4; MSFPC=GUID=94c1a60898164eb681b4c9b20cca0e9e&HASH=94c1&LV=202512&V=4&LU=1766151390551; FedAuth=77u/PD94bWwgdmVyc2lvbj0iMS4wIiBlbmNvZGluZz0idXRmLTgiPz48U1A+VjE0LDBoLmZ8bWVtYmVyc2hpcHx1cm4lM2FzcG8lM2F0ZW5hbnRhbm9uIzc2MWVkNjA2LTZhMjItNGU5Yi1iM2MxLWUxZTQyNjI1Y2Q3NywwIy5mfG1lbWJlcnNoaXB8dXJuJTNhc3BvJTNhdGVuYW50YW5vbiM3NjFlZDYwNi02YTIyLTRlOWItYjNjMS1lMWU0MjYyNWNkNzcsMTM0MTA2MjUyODYwMDAwMDAwLDAsMTM0MTA3MTEzODY3NzQxMjAwLDAuMC4wLjAsMjU4LDc2MWVkNjA2LTZhMjItNGU5Yi1iM2MxLWUxZTQyNjI1Y2Q3NywsLDA0OTBlNGExLWIwZGMtNTAwMC01ZDdmLTg3ODJiYzQ3OTQ3OCwwNDkwZTRhMS1iMGRjLTUwMDAtNWQ3Zi04NzgyYmM0Nzk0NzgsUi9OL3U5Q0IxRUNUYU5HeGJraGV3dywwLDAsMCwsLCwyNjUwNDY3NzQzOTk5OTk5OTk5LDAsLCwsLCwsMCwsMTk3MTIzLGxmWWhCQ2loNFZ2V0tyRGMtcWptbW1ySjBXZywsbXBpWUVMdmJEeVZlSUJXd2VhQk9zNlpVSG5KSEdjTHJVdmg4KzVBWVlmbkhiMlpEZVJpdXY2M25yTnowL1RIMy9FaUZxWEpMcHRqbHQvWFZDYit0MHhvWUZkZUxVbHp3OVVLNWplRGh3SndKQkxWQVZqTzZEekJVbUpzdjZPRG1HS3hrUnpMdlFmOVFkZjZKb0MrbG56dWszdS9TOWJoSGVuVjFGVVJlV3FMQ05Sa0t1K3RLT0lKM2xncC9CZHBLK2dvTlJMN3BnUU1mTEh3dldidGpQdk01YS9qTWdWU1lYOGs4dHZYZ05zdi8yYlBONXA1REFnVEJMMS81eXRFeUplSStsUlQzN29YOVZzRmp5TEhXQXpNQVJrdVUrRHVBMDgwT0oyYkZYVUlMNUxFNzA4TEtvV2Zob2xWQzc5Zm1PRzhQQTNnODQ2Z2JDbk5pcHkvSWxnPT08L1NQPg==; FeatureOverrides_experiments=[]; msal.cache.encryption=%7B%22id%22%3A%22019b36d3-7d29-7427-b87f-427cc5241576%22%2C%22key%22%3A%22pjAFavVeGE97QUVcKsU4RuY5UNgp1humAadMenNuyHc%22%7D; SPA_RT=; ai_session=OBNd7HluuxVxbflTGAXPVp|1766155463567|1766155463567' --output mfi_recomputer-orin-nano-8g-j401-6.2-36.4.3-2025-04-07.tar.gz
+
+RUN tar xpf mfi_recomputer-orin-nano-8g-j401-6.2-36.4.3-2025-04-07.tar.gz && \
+    cd mfi_recomputer-orin-j401
+
+ENTRYPOINT [ "bash", "-c", "./tools/kernel_flash/l4t_initrd_flash.sh --flash-only --massflash 1 --network usb0 --showlogs" ]
