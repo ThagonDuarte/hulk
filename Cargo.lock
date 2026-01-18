@@ -6871,6 +6871,7 @@ dependencies = [
  "image",
  "itertools 0.14.0",
  "linear_algebra",
+ "log",
  "nalgebra",
  "ndarray 0.16.1",
  "openvino",
@@ -8680,7 +8681,7 @@ dependencies = [
  "socketpair",
  "speedy",
  "static_assertions",
- "thiserror 2.0.17",
+ "thiserror 2.0.18",
 ]
 
 [[package]]
