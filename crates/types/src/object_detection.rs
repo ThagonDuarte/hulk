@@ -6,7 +6,7 @@ use crate::bounding_box::BoundingBox;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PathIntrospect, PathSerialize, PathDeserialize)]
 pub struct Detection {
-    pub label: YOLOv8ObjectDetectionLabel,
+    pub label: NaoLabelPartyObjectDetectionLabel,
     pub bounding_box: BoundingBox,
 }
 
@@ -267,6 +267,49 @@ impl From<YOLOv8ObjectDetectionLabel> for String {
             YOLOv8ObjectDetectionLabel::Teddybear => "Teddybear",
             YOLOv8ObjectDetectionLabel::Hairdrier => "Hairdrier",
             YOLOv8ObjectDetectionLabel::Toothbrush => "Toothbrush",
+        }
+        .to_string()
+    }
+}
+
+#[derive(
+    Debug, Clone, Serialize, Deserialize, PathIntrospect, PathSerialize, PathDeserialize, PartialEq,
+)]
+pub enum NaoLabelPartyObjectDetectionLabel {
+    Ball = 0,
+    GoalPost = 1,
+    LSpot = 2,
+    PenaltySpot = 3,
+    Robot = 4,
+    TSpot = 5,
+    XSpot = 6,
+}
+
+impl NaoLabelPartyObjectDetectionLabel {
+    pub fn from_index(index: usize) -> Self {
+        match index {
+            0 => Self::Ball,
+            1 => Self::GoalPost,
+            2 => Self::LSpot,
+            3 => Self::PenaltySpot,
+            4 => Self::Robot,
+            5 => Self::TSpot,
+            6 => Self::XSpot,
+            _ => unimplemented!(),
+        }
+    }
+}
+
+impl From<NaoLabelPartyObjectDetectionLabel> for String {
+    fn from(label: NaoLabelPartyObjectDetectionLabel) -> Self {
+        match label {
+            NaoLabelPartyObjectDetectionLabel::Ball => "Ball",
+            NaoLabelPartyObjectDetectionLabel::GoalPost => "GoalPost",
+            NaoLabelPartyObjectDetectionLabel::LSpot => "LSpot",
+            NaoLabelPartyObjectDetectionLabel::PenaltySpot => "PenaltySpot",
+            NaoLabelPartyObjectDetectionLabel::Robot => "Robot",
+            NaoLabelPartyObjectDetectionLabel::TSpot => "TSpot",
+            NaoLabelPartyObjectDetectionLabel::XSpot => "XSpot",
         }
         .to_string()
     }

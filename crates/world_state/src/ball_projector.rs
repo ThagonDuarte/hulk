@@ -10,7 +10,7 @@ use types::{
     ball_detection::BallPercept,
     field_dimensions::FieldDimensions,
     multivariate_normal_distribution::MultivariateNormalDistribution,
-    object_detection::{Detection, YOLOv8ObjectDetectionLabel},
+    object_detection::{Detection, NaoLabelPartyObjectDetectionLabel, YOLOv8ObjectDetectionLabel},
     parameters::BallProjectionParameters,
 };
 
@@ -51,7 +51,7 @@ impl BallProjector {
                     .copied()
                     .flatten()
                     .flat_map(|detection| {
-                        if detection.label != YOLOv8ObjectDetectionLabel::Sportsball {
+                        if detection.label != NaoLabelPartyObjectDetectionLabel::Ball {
                             return None;
                         }
 

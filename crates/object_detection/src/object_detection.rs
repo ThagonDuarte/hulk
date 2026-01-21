@@ -16,7 +16,7 @@ use ros2::sensor_msgs::{camera_info::CameraInfo, image::Image};
 use serde::{Deserialize, Serialize};
 use types::{
     bounding_box::BoundingBox,
-    object_detection::{Detection, YOLOv8ObjectDetectionLabel},
+    object_detection::{Detection, NaoLabelPartyObjectDetectionLabel, YOLOv8ObjectDetectionLabel},
     parameters::ObjectDetectionParameters,
 };
 
@@ -55,7 +55,9 @@ impl ObjectDetection {
                 TensorRTExecutionProvider::default().build(),
                 CUDAExecutionProvider::default().build(),
             ])?
-            .commit_from_file(neural_network_folder.join("yolo11n-544x448.onnx"))?;
+            .commit_from_file(
+                neural_network_folder.join("teamfahrt-label-party-yolo11m-544x448.onnx"),
+            )?;
 
         Ok(Self { session })
     }
@@ -104,7 +106,7 @@ impl ObjectDetection {
                 if *confidence < context.parameters.confidence_threshold {
                     return None;
                 }
-                let label = YOLOv8ObjectDetectionLabel::from_index(class_id);
+                let label = NaoLabelPartyObjectDetectionLabel::from_index(class_id);
                 Some(Detection {
                     bounding_box: BoundingBox {
                         area: Rectangle::new_with_center_and_size(
