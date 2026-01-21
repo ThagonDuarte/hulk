@@ -327,7 +327,7 @@
     "goal_depth": 0.5
   },
   "object_detection": {
-    "enable": true,
+    "enable": false,
     "maximum_intersection_over_union": 0.7,
     "confidence_threshold": 0.5
   },
@@ -341,5 +341,12 @@
   },
   "cycler_frequencies": {
     "world_state": 100
+  },
+  "image_receiver": {
+    "image_rectified": "Rectified",
+    "image_right_rectified": "RightRectified",
+    "image_right_raw": "RightRaw",
+    "image_stereonet_depth": "StereonetDepth",
+    "image_stereonet_visual": "StereonetVisual"
   }
 }
