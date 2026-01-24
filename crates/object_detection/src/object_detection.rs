@@ -59,7 +59,7 @@ impl ObjectDetection {
                 CUDAExecutionProvider::default().build(),
             ])?
             .commit_from_file(
-                neural_network_folder.join("teamfahrt-label-party-yolo11m-640x480.onnx"),
+                neural_network_folder.join("teamfahrt-label-party-yolo11m-1088x896.onnx"),
             )?;
 
         Ok(Self { session })

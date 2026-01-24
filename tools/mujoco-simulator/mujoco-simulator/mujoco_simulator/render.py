@@ -41,8 +41,8 @@ class CameraRenderer:
         *,
         model: MjModel,
         camera_name: str,
-        width: int = 640,
-        height: int = 480,
+        width: int = 1088,
+        height: int = 896,
         ngeom: int = 250,
     ) -> None:
         self.gl_context = setup_offscreen_rendering_gl_context(width, height)

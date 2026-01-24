@@ -145,7 +145,7 @@ impl Widget for &mut ImagePanel {
         });
         let (response, mut painter) = TwixPainter::allocate(
             ui,
-            vector![640.0, 480.0],
+            vector![1088.0, 896.0],
             point![0.0, 0.0],
             Orientation::LeftHanded,
         );
@@ -212,7 +212,7 @@ impl ImagePanel {
                     .try_load_texture(
                         &image_identifier,
                         TextureOptions::NEAREST,
-                        SizeHint::Size(640, 480),
+                        SizeHint::Size(1088, 896),
                     )?
                     .texture_id()
                     .unwrap()
@@ -223,7 +223,7 @@ impl ImagePanel {
             image,
             Rectangle {
                 min: point!(0.0, 0.0),
-                max: point!(640.0, 480.0),
+                max: point!(1088.0, 896.0),
             },
         );
         Ok(())
