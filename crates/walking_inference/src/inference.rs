@@ -4,7 +4,7 @@ use booster::{ImuState, MotorCommandParameters, MotorState};
 use color_eyre::Result;
 use coordinate_systems::Ground;
 use framework::deserialize_not_implemented;
-use kinematics::joints::{Joints, leg::LegJoints};
+use kinematics::joints::{Joints, arm::ArmJoints, leg::LegJoints};
 use linear_algebra::{Vector2, vector};
 use ndarray::{Array1, Axis};
 use ort::{
@@ -33,7 +33,9 @@ impl WalkingInference {
         neural_network_folder: impl AsRef<Path>,
         prepare_motor_command_parameters: &MotorCommandParameters,
     ) -> Result<Self> {
-        let neural_network_path = neural_network_folder.as_ref().join("T1.onnx");
+        let neural_network_path = neural_network_folder
+            .as_ref()
+            .join("2026-02-01_12-46-58.onnx");
 
         let session = Session::builder()?
             .with_optimization_level(GraphOptimizationLevel::Level3)?
@@ -111,7 +113,7 @@ impl WalkingInference {
         let inputs_tensor = Tensor::from_array(inputs.insert_axis(Axis(0)))?;
 
         let outputs = self.session.run(inputs![inputs_tensor])?;
-        let predictions = outputs["15"].try_extract_array::<f32>()?.squeeze();
+        let predictions = outputs["actions"].try_extract_array::<f32>()?.squeeze();
 
         predictions.clamp(
             -walking_parameters.normalization.clip_actions,
@@ -120,22 +122,38 @@ impl WalkingInference {
 
         assert!(predictions.len() == walking_parameters.number_of_actions);
 
+        // ALeft_Shoulder_Pitch,Left_Shoulder_Roll,Left_Elbow_Pitch,Left_Elbow_Yaw,
+        // ARight_Shoulder_Pitch,Right_Shoulder_Roll,Right_Elbow_Pitch,Right_Elbow_Yaw,
+        // Left_Hip_Pitch,Left_Hip_Roll,Left_Hip_Yaw,Left_Knee_Pitch,Left_Ankle_Pitch,Left_Ankle_Roll,
+        // Right_Hip_Pitch,Right_Hip_Roll,Right_Hip_Yaw,Right_Knee_Pitch,Right_Ankle_Pitch,Right_Ankle_Roll
         self.last_target_joint_positions = Joints {
+            left_arm: ArmJoints {
+                shoulder_pitch: predictions[0],
+                shoulder_roll: predictions[1],
+                elbow: predictions[2],
+                shoulder_yaw: predictions[3],
+            },
+            right_arm: ArmJoints {
+                shoulder_pitch: predictions[4],
+                shoulder_roll: predictions[5],
+                elbow: predictions[6],
+                shoulder_yaw: predictions[7],
+            },
             left_leg: LegJoints {
-                hip_pitch: predictions[0],
-                hip_roll: predictions[1],
-                hip_yaw: predictions[2],
-                knee: predictions[3],
-                ankle_up: predictions[4],
-                ankle_down: predictions[5],
+                hip_pitch: predictions[8],
+                hip_roll: predictions[9],
+                hip_yaw: predictions[10],
+                knee: predictions[11],
+                ankle_up: predictions[12],
+                ankle_down: predictions[13],
             },
             right_leg: LegJoints {
-                hip_pitch: predictions[6],
-                hip_roll: predictions[7],
-                hip_yaw: predictions[8],
-                knee: predictions[9],
-                ankle_up: predictions[10],
-                ankle_down: predictions[11],
+                hip_pitch: predictions[14],
+                hip_roll: predictions[15],
+                hip_yaw: predictions[16],
+                knee: predictions[17],
+                ankle_up: predictions[18],
+                ankle_down: predictions[19],
             },
             ..Default::default()
         };
