@@ -1,15 +1,14 @@
-use std::f32::consts::PI;
+use std::{f32::consts::PI, time::Duration};
 
 use approx::AbsDiffEq;
 use booster::{JointsMotorState, MotorCommandParameters, MotorState};
 use color_eyre::Result;
 use coordinate_systems::{Ground, Robot};
-use kinematics::joints::{Joints, body::BodyJoints};
+use kinematics::joints::Joints;
 use linear_algebra::{IntoFramed, Orientation2, Point2, Vector2, Vector3, vector};
 use path_serde::{PathDeserialize, PathIntrospect, PathSerialize};
 use serde::{Deserialize, Serialize};
 use types::{
-    cycle_time::CycleTime,
     motion_command::{MotionCommand, OrientationMode},
     parameters::RLWalkingParameters,
     path::traits::{Length, PathProgress},
@@ -25,9 +24,9 @@ pub struct WalkingInferenceInputs {
     pub angular_velocity_command: f32,
     pub gait_progress: f32,
     pub gait_process: nalgebra::Vector2<f32>,
-    pub joint_position_differences: BodyJoints,
-    pub joint_velocities: BodyJoints,
-    pub last_target_joint_positions: BodyJoints,
+    pub joint_position_differences: Joints,
+    pub joint_velocities: Joints,
+    pub last_target_joint_positions: Joints,
 }
 
 pub enum WalkCommand {
@@ -123,7 +122,7 @@ fn target_alignment_importance(
 impl WalkingInferenceInputs {
     #[allow(clippy::too_many_arguments)]
     pub fn try_new(
-        cycle_time: CycleTime,
+        last_cycle_duration: Duration,
         walk_command: &WalkCommand,
         roll_pitch_yaw: Vector3<Robot>,
         angular_velocity: Vector3<Robot>,
@@ -136,7 +135,7 @@ impl WalkingInferenceInputs {
         motor_command_parameters: &MotorCommandParameters,
     ) -> Result<Self> {
         let policy_interval =
-            cycle_time.last_cycle_duration.as_secs_f32() * walking_parameters.control.decimation;
+            last_cycle_duration.as_secs_f32() * walking_parameters.control.decimation;
 
         let (linear_velocity_command, angular_velocity_command) = match walk_command {
             WalkCommand::WalkWithVelocity {
@@ -165,7 +164,7 @@ impl WalkingInferenceInputs {
         };
 
         let stabilizing_interval_progress = last_gait_progress
-            + walking_parameters.gait_frequency * cycle_time.last_cycle_duration.as_secs_f32();
+            + walking_parameters.gait_frequency * last_cycle_duration.as_secs_f32();
 
         let is_step_finished = (stabilizing_interval_progress
             * walking_parameters.stabilizing_interval_compression_factor
@@ -192,16 +191,16 @@ impl WalkingInferenceInputs {
         } else {
             (walking_parameters.gait_frequency, last_gait_progress)
         };
-        let gait_progress =
-            last_gait_progress + gait_frequency * cycle_time.last_cycle_duration.as_secs_f32();
+        let gait_progress = last_gait_progress + gait_frequency * last_cycle_duration.as_secs_f32();
 
         let gait_process =
             nalgebra::Rotation2::new(2.0 * PI * gait_progress) * nalgebra::Vector2::x();
 
-        let joint_position_differences = current_serial_joints.positions().body()
-            - motor_command_parameters.default_positions.body();
-        let joint_velocities = current_serial_joints.velocities().body();
-        let last_target_joint_positions = last_target_joint_positions.body();
+        let current_joint_position = current_serial_joints.positions();
+        let current_joint_velocities = current_serial_joints.velocities();
+
+        let joint_position_differences =
+            current_joint_position - motor_command_parameters.default_positions;
 
         let rotation = nalgebra::Rotation3::from_euler_angles(
             roll_pitch_yaw.x(),
@@ -218,10 +217,14 @@ impl WalkingInferenceInputs {
             linear_velocity_command * walking_parameters.normalization.linear_velocity;
         let angular_velocity_command =
             angular_velocity_command * walking_parameters.normalization.angular_velocity;
-        // let joint_position_differences = joint_position_differences
-        //     .map(|elem| elem * walking_parameters.normalization.joint_position);
-        // let joint_velocities =
-        //     joint_velocities.map(|elem| elem * walking_parameters.normalization.joint_velocity);
+        let normalized_joint_position_differences = joint_position_differences
+            .into_iter()
+            .map(|elem| elem * walking_parameters.normalization.joint_position)
+            .collect();
+        let normalized_joint_velocities = current_joint_velocities
+            .into_iter()
+            .map(|elem| elem * walking_parameters.normalization.joint_velocity)
+            .collect();
 
         Ok(WalkingInferenceInputs {
             gravity,
@@ -230,13 +233,56 @@ impl WalkingInferenceInputs {
             angular_velocity_command,
             gait_progress,
             gait_process,
-            joint_position_differences,
-            joint_velocities,
+            joint_position_differences: normalized_joint_position_differences,
+            joint_velocities: normalized_joint_velocities,
             last_target_joint_positions,
         })
     }
 
-    pub fn as_vec(&self) -> Vec<f32> {
+    pub fn booster_gym_observation_vector(&self) -> Vec<f32> {
+        [
+            self.gravity.x(),
+            self.gravity.y(),
+            self.gravity.z(),
+            self.angular_velocity.x(),
+            self.angular_velocity.y(),
+            self.angular_velocity.z(),
+            self.linear_velocity_command.x(),
+            self.linear_velocity_command.y(),
+            self.angular_velocity_command,
+            self.gait_process.x,
+            self.gait_process.y,
+        ]
+        .into_iter()
+        .chain(self.joint_position_differences.body().left_leg)
+        .chain(self.joint_position_differences.body().right_leg)
+        .chain(self.joint_velocities.body().left_leg)
+        .chain(self.joint_velocities.body().right_leg)
+        .chain(self.last_target_joint_positions.body().left_leg)
+        .chain(self.last_target_joint_positions.body().right_leg)
+        .collect::<Vec<f32>>()
+    }
+
+    pub fn booster_deploy_observation_vector(&self) -> Vec<f32> {
+        [
+            self.angular_velocity.x(),
+            self.angular_velocity.y(),
+            self.angular_velocity.z(),
+            self.gravity.x(),
+            self.gravity.y(),
+            self.gravity.z(),
+            self.linear_velocity_command.x(),
+            self.linear_velocity_command.y(),
+            self.angular_velocity_command,
+        ]
+        .into_iter()
+        .chain(self.joint_position_differences.body())
+        .chain(self.joint_velocities.body())
+        .chain(self.last_target_joint_positions.body())
+        .collect::<Vec<f32>>()
+    }
+
+    pub fn mjlab_walking_policy_obersvation_vector(&self) -> Vec<f32> {
         [
             self.angular_velocity.x(),
             self.angular_velocity.y(),
@@ -245,21 +291,20 @@ impl WalkingInferenceInputs {
             self.gravity.y(),
             self.gravity.z(),
         ]
-        .iter()
-        .chain(&joints_as_array(self.joint_position_differences))
-        .chain(&joints_as_array(self.joint_velocities))
-        .chain(&joints_as_array(self.last_target_joint_positions))
-        .chain(&[
+        .into_iter()
+        .chain(joints_as_array(self.joint_position_differences))
+        .chain(joints_as_array(self.joint_velocities))
+        .chain(joints_as_array(self.last_target_joint_positions))
+        .chain([
             self.linear_velocity_command.x(),
             self.linear_velocity_command.y(),
             self.angular_velocity_command,
         ])
-        .copied()
         .collect::<Vec<f32>>()
     }
 }
 
-fn joints_as_array(joints: BodyJoints) -> [f32; 20] {
+fn joints_as_array(joints: Joints) -> [f32; 20] {
     // ALeft_Shoulder_Pitch,Left_Shoulder_Roll,Left_Elbow_Pitch,Left_Elbow_Yaw,
     // ARight_Shoulder_Pitch,Right_Shoulder_Roll,Right_Elbow_Pitch,Right_Elbow_Yaw,
     // Left_Hip_Pitch,Left_Hip_Roll,Left_Hip_Yaw,Left_Knee_Pitch,Left_Ankle_Pitch,Left_Ankle_Roll,

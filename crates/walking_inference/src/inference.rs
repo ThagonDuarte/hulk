@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::{path::Path, time::Duration};
 
 use booster::{ImuState, MotorCommandParameters, MotorState};
 use color_eyre::Result;
@@ -14,7 +14,7 @@ use ort::{
     value::Tensor,
 };
 use serde::{Deserialize, Serialize};
-use types::{cycle_time::CycleTime, parameters::RLWalkingParameters};
+use types::parameters::RLWalkingParameters;
 
 use crate::inputs::{WalkCommand, WalkingInferenceInputs};
 
@@ -54,17 +54,18 @@ impl WalkingInference {
         })
     }
 
-    fn calculate_inputs(
+    #[allow(clippy::too_many_arguments)]
+    pub fn do_inference(
         &mut self,
-        cycle_time: CycleTime,
+        last_cycle_duration: Duration,
         walk_command: &WalkCommand,
         imu_state: &ImuState,
         current_serial_joints: Joints<MotorState>,
         walking_parameters: &RLWalkingParameters,
         motor_command_parameters: &MotorCommandParameters,
-    ) -> Result<WalkingInferenceInputs> {
+    ) -> Result<Joints> {
         let walking_inference_inputs = WalkingInferenceInputs::try_new(
-            cycle_time,
+            last_cycle_duration,
             walk_command,
             imu_state.roll_pitch_yaw,
             imu_state.angular_velocity,
@@ -81,38 +82,16 @@ impl WalkingInference {
         self.last_angular_velocity_command = walking_inference_inputs.angular_velocity_command;
         self.last_gait_progress = walking_inference_inputs.gait_progress;
 
-        Ok(walking_inference_inputs)
-    }
-
-    pub fn do_inference(
-        &mut self,
-        cycle_time: CycleTime,
-        walk_command: &WalkCommand,
-        imu_state: &ImuState,
-        current_serial_joints: Joints<MotorState>,
-        walking_parameters: &RLWalkingParameters,
-        motor_command_parameters: &MotorCommandParameters,
-    ) -> Result<(WalkingInferenceInputs, Joints)> {
-        let Ok(walking_inference_inputs) = self.calculate_inputs(
-            cycle_time,
-            walk_command,
-            imu_state,
-            current_serial_joints,
-            walking_parameters,
-            motor_command_parameters,
-        ) else {
-            return Ok((
-                WalkingInferenceInputs::default(),
-                motor_command_parameters.default_positions,
-            ));
-        };
-
-        let inputs: Array1<f32> = walking_inference_inputs.as_vec().into();
+        let inputs: Array1<f32> = walking_inference_inputs
+            .mjlab_walking_policy_obersvation_vector()
+            .into();
 
         assert!(inputs.len() == walking_parameters.number_of_observations);
         let inputs_tensor = Tensor::from_array(inputs.insert_axis(Axis(0)))?;
 
-        let outputs = self.session.run(inputs![inputs_tensor])?;
+        let inference_input = inputs![inputs_tensor];
+
+        let outputs = self.session.run(inference_input)?;
         let predictions = outputs["actions"].try_extract_array::<f32>()?.squeeze();
 
         // predictions.clamp(
@@ -158,6 +137,6 @@ impl WalkingInference {
             ..Default::default()
         } * walking_parameters.control.action_scale;
 
-        Ok((walking_inference_inputs, self.last_target_joint_positions))
+        Ok(self.last_target_joint_positions)
     }
 }
