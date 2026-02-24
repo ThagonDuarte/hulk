@@ -1,7 +1,7 @@
 use booster::{ImuState, MotorState};
-use color_eyre::Result;
+use color_eyre::{eyre::bail, Result};
 use context_attribute::context;
-use framework::{AdditionalOutput, MainOutput};
+use framework::MainOutput;
 use hardware::PathsInterface;
 use serde::{Deserialize, Serialize};
 use types::{
@@ -10,7 +10,7 @@ use types::{
     motion_command::MotionCommand,
     parameters::{MotorCommandParameters, RLWalkingParameters},
 };
-use walking_inference::{inference::WalkingInference, inputs::WalkingInferenceInputs};
+use walking_inference::inference::WalkingInference;
 
 #[derive(Deserialize, Serialize)]
 pub struct RLWalking {
@@ -29,8 +29,6 @@ pub struct CreationContext {
 pub struct CycleContext {
     walking_parameters: Parameter<RLWalkingParameters, "rl_walking">,
     common_motor_command_parameters: Parameter<MotorCommandParameters, "common_motor_command">,
-
-    walking_inference_inputs: AdditionalOutput<WalkingInferenceInputs, "walking_inference_inputs">,
 
     imu_state: Input<ImuState, "imu_state">,
     serial_motor_states: Input<Joints<MotorState>, "serial_motor_states">,
@@ -62,20 +60,25 @@ impl RLWalking {
         })
     }
 
-    pub fn cycle(&mut self, mut context: CycleContext) -> Result<MainOutputs> {
-        let (walking_inference_inputs, inference_output_positions) =
-            self.walking_inference.do_inference(
-                *context.cycle_time,
-                context.motion_command,
-                context.imu_state,
-                *context.serial_motor_states,
-                context.walking_parameters,
-                context.common_motor_command_parameters,
-            )?;
+    pub fn cycle(&mut self, context: CycleContext) -> Result<MainOutputs> {
+        let MotionCommand::WalkWithVelocity {
+            velocity,
+            angular_velocity,
+            ..
+        } = context.motion_command
+        else {
+            bail!("only MotionCommand::WalkWithVelocity is supported for walking inference");
+        };
 
-        context
-            .walking_inference_inputs
-            .fill_if_subscribed(|| walking_inference_inputs.clone());
+        let inference_output_positions = self.walking_inference.do_inference(
+            context.cycle_time.last_cycle_duration,
+            *velocity,
+            *angular_velocity,
+            context.imu_state,
+            *context.serial_motor_states,
+            context.walking_parameters,
+            context.common_motor_command_parameters,
+        )?;
 
         let walking_target_joint_positions =
             context.common_motor_command_parameters.default_positions
