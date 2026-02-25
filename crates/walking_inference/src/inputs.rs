@@ -276,9 +276,17 @@ impl WalkingInferenceInputs {
             self.angular_velocity_command,
         ]
         .into_iter()
-        .chain(self.joint_position_differences.body())
-        .chain(self.joint_velocities.body())
-        .chain(self.last_target_joint_positions.body())
+        .chain(
+            self.joint_position_differences
+                .body()
+                .to_booster_deploy_joint_array(),
+        )
+        .chain(self.joint_velocities.body().to_booster_deploy_joint_array())
+        .chain(
+            self.last_target_joint_positions
+                .body()
+                .to_booster_deploy_joint_array(),
+        )
         .collect::<Vec<f32>>()
     }
 
