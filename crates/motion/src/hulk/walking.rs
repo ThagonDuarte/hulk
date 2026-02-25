@@ -1,3 +1,5 @@
+use std::time::{Duration, SystemTime};
+
 use booster::{ImuState, MotorCommandParameters, MotorState};
 use color_eyre::Result;
 use context_attribute::context;
@@ -17,6 +19,7 @@ use walking_inference::{
 pub struct RLWalking {
     walking_inference: WalkingInference,
     smoothed_target_joint_positions: Joints,
+    next_inference_time: SystemTime,
 }
 
 #[context]
@@ -60,12 +63,25 @@ impl RLWalking {
             smoothed_target_joint_positions: context
                 .prepare_motor_command_parameters
                 .default_positions,
+            next_inference_time: SystemTime::UNIX_EPOCH,
         })
     }
 
     pub fn cycle(&mut self, mut context: CycleContext) -> Result<MainOutputs> {
         let walk_command =
             WalkCommand::from_motion_command(context.motion_command, context.walking_parameters);
+
+        if context.cycle_time.start_time < self.next_inference_time {
+            return Ok(MainOutputs {
+                walking_target_joint_positions: self.smoothed_target_joint_positions.into(),
+            });
+        }
+
+        self.next_inference_time = context.cycle_time.start_time
+            + Duration::from_secs_f32(
+                context.walking_parameters.control.dt
+                    * context.walking_parameters.control.decimation,
+            );
 
         let (walking_inference_inputs, inference_output_positions) =
             self.walking_inference.do_inference(
