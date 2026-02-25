@@ -35,7 +35,7 @@ impl WalkingInference {
     ) -> Result<Self> {
         let neural_network_path = neural_network_folder
             .as_ref()
-            .join("2026-02-21_12-01-15.onnx");
+            .join("2026-02-25_11-03-50.onnx");
 
         let session = Session::builder()?
             .with_optimization_level(GraphOptimizationLevel::Level3)?
@@ -115,10 +115,10 @@ impl WalkingInference {
         let outputs = self.session.run(inputs![inputs_tensor])?;
         let predictions = outputs["actions"].try_extract_array::<f32>()?.squeeze();
 
-        predictions.clamp(
-            -walking_parameters.normalization.clip_actions,
-            walking_parameters.normalization.clip_actions,
-        );
+        // predictions.clamp(
+        //     -walking_parameters.normalization.clip_actions,
+        //     walking_parameters.normalization.clip_actions,
+        // );
 
         assert!(predictions.len() == walking_parameters.number_of_actions);
 

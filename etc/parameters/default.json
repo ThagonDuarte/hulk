@@ -45,7 +45,7 @@
       "angular_velocity": 1.0,
       "joint_position": 1.0,
       "joint_velocity": 1.0,
-      "clip_actions": 1
+      "clip_actions": 100.0
     },
     "control": {
       "dt": 0.002,
