@@ -166,20 +166,28 @@ impl WalkingInferenceInputs {
 
     pub fn booster_deploy_observation_vector(&self) -> Vec<f32> {
         [
-            self.gravity.x(),
-            self.gravity.y(),
-            self.gravity.z(),
             self.angular_velocity.x(),
             self.angular_velocity.y(),
             self.angular_velocity.z(),
+            self.gravity.x(),
+            self.gravity.y(),
+            self.gravity.z(),
             self.linear_velocity_command.x(),
             self.linear_velocity_command.y(),
             self.angular_velocity_command,
         ]
         .into_iter()
-        .chain(self.joint_position_differences.body())
-        .chain(self.joint_velocities.body())
-        .chain(self.last_target_joint_positions.body())
+        .chain(
+            self.joint_position_differences
+                .body()
+                .to_booster_deploy_joint_array(),
+        )
+        .chain(self.joint_velocities.body().to_booster_deploy_joint_array())
+        .chain(
+            self.last_target_joint_positions
+                .body()
+                .to_booster_deploy_joint_array(),
+        )
         .collect::<Vec<f32>>()
     }
 }

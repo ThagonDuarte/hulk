@@ -1,4 +1,4 @@
-use std::{path::Path, time::Duration};
+use std::{collections::VecDeque, path::Path, time::Duration};
 
 use booster::{ImuState, MotorState};
 use color_eyre::Result;
@@ -14,7 +14,7 @@ use ort::{
 };
 use serde::{Deserialize, Serialize};
 use types::{
-    joints::{leg::LegJoints, Joints},
+    joints::{body::BodyJoints, Joints},
     parameters::{MotorCommandParameters, RLWalkingParameters},
 };
 
@@ -27,7 +27,8 @@ pub struct WalkingInference {
     last_linear_velocity_command: Vector2<Ground>,
     last_angular_velocity_command: f32,
     last_gait_progress: f32,
-    pub last_target_joint_positions: Joints,
+    last_target_joint_positions: Joints,
+    input_history: VecDeque<WalkingInferenceInputs>,
 }
 
 impl WalkingInference {
@@ -35,7 +36,7 @@ impl WalkingInference {
         neural_network_folder: impl AsRef<Path>,
         prepare_motor_command_parameters: &MotorCommandParameters,
     ) -> Result<Self> {
-        let neural_network_path = neural_network_folder.as_ref().join("T1.onnx");
+        let neural_network_path = neural_network_folder.as_ref().join("t1_walk.onnx");
 
         let session = Session::builder()?
             .with_optimization_level(GraphOptimizationLevel::Level3)?
@@ -45,12 +46,18 @@ impl WalkingInference {
             ])?
             .commit_from_file(neural_network_path)?;
 
+        let mut input_history = VecDeque::with_capacity(10);
+        for _ in 0..10 {
+            input_history.push_front(Default::default());
+        }
+
         Ok(Self {
             session,
             last_linear_velocity_command: vector![0.0, 0.0],
             last_angular_velocity_command: 0.0,
             last_gait_progress: 0.0,
             last_target_joint_positions: prepare_motor_command_parameters.default_positions,
+            input_history,
         })
     }
 
@@ -84,17 +91,29 @@ impl WalkingInference {
         self.last_angular_velocity_command = walking_inference_inputs.angular_velocity_command;
         self.last_gait_progress = walking_inference_inputs.gait_progress;
 
-        let inputs: Array1<f32> = walking_inference_inputs
-            .booster_gym_observation_vector()
+        self.input_history.push_front(walking_inference_inputs);
+        self.input_history
+            .truncate(walking_parameters.observation_history_length);
+
+        let inputs: Array1<f32> = self
+            .input_history
+            .iter()
+            .rev()
+            .flat_map(|inputs| inputs.booster_deploy_observation_vector())
+            .collect::<Vec<f32>>()
             .into();
 
-        assert!(inputs.len() == walking_parameters.number_of_observations);
+        assert!(
+            inputs.len()
+                == walking_parameters.number_of_observations
+                    * walking_parameters.observation_history_length
+        );
         let inputs_tensor = Tensor::from_array(inputs.insert_axis(Axis(0)))?;
 
         let inference_input = inputs![inputs_tensor];
 
         let outputs = self.session.run(inference_input)?;
-        let predictions = outputs["15"].try_extract_array::<f32>()?.squeeze();
+        let predictions = outputs["21"].try_extract_array::<f32>()?.squeeze();
 
         predictions.clamp(
             -walking_parameters.normalization.clip_actions,
@@ -103,25 +122,12 @@ impl WalkingInference {
 
         assert!(predictions.len() == walking_parameters.number_of_actions);
 
-        self.last_target_joint_positions = Joints {
-            left_leg: LegJoints {
-                hip_pitch: predictions[0],
-                hip_roll: predictions[1],
-                hip_yaw: predictions[2],
-                knee: predictions[3],
-                ankle_up: predictions[4],
-                ankle_down: predictions[5],
-            },
-            right_leg: LegJoints {
-                hip_pitch: predictions[6],
-                hip_roll: predictions[7],
-                hip_yaw: predictions[8],
-                knee: predictions[9],
-                ankle_up: predictions[10],
-                ankle_down: predictions[11],
-            },
-            ..Default::default()
-        };
+        self.last_target_joint_positions = Joints::from_head_and_body(
+            Default::default(),
+            BodyJoints::from_booster_deploy_joint_array(
+                predictions.as_slice().unwrap().try_into()?,
+            ),
+        );
 
         Ok(self.last_target_joint_positions)
     }
