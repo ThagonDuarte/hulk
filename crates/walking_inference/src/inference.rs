@@ -156,7 +156,7 @@ impl WalkingInference {
                 ankle_down: predictions[19],
             },
             ..Default::default()
-        };
+        } * walking_parameters.control.action_scale;
 
         Ok((walking_inference_inputs, self.last_target_joint_positions))
     }

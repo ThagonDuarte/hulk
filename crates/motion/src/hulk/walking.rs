@@ -83,7 +83,7 @@ impl RLWalking {
                     * context.walking_parameters.control.decimation,
             );
 
-        let (walking_inference_inputs, inference_output_positions) =
+        let (walking_inference_inputs, scaled_inference_output_positions) =
             self.walking_inference.do_inference(
                 *context.cycle_time,
                 &walk_command,
@@ -99,7 +99,7 @@ impl RLWalking {
 
         let walking_target_joint_positions =
             context.common_motor_command_parameters.default_positions
-                + inference_output_positions * context.walking_parameters.control.action_scale;
+                + scaled_inference_output_positions;
 
         self.smoothed_target_joint_positions = self.smoothed_target_joint_positions
             * context.walking_parameters.joint_position_smoothing_factor
