@@ -22,6 +22,7 @@ pub struct RLWalking {
 #[context]
 pub struct CreationContext {
     prepare_motor_command_parameters: Parameter<MotorCommandParameters, "prepare_motor_command">,
+    walking_parameters: Parameter<RLWalkingParameters, "rl_walking">,
 
     hardware_interface: HardwareInterface,
 }
@@ -51,6 +52,7 @@ impl RLWalking {
         let walking_inference = WalkingInference::new(
             &neural_network_folder,
             context.prepare_motor_command_parameters,
+            context.walking_parameters.observation_history_length,
         )?;
 
         Ok(Self {

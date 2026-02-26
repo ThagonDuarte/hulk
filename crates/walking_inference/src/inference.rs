@@ -26,17 +26,18 @@ pub struct WalkingInference {
     last_angular_velocity_command: f32,
     last_gait_progress: f32,
     last_target_joint_positions: Joints,
-    input_history: VecDeque<WalkingInferenceInputs>,
+    input_history: VecDeque<Option<WalkingInferenceInputs>>,
 }
 
 impl WalkingInference {
     pub fn new(
         neural_network_folder: impl AsRef<Path>,
         prepare_motor_command_parameters: &MotorCommandParameters,
+        history_length: usize,
     ) -> Result<Self> {
         let neural_network_path = neural_network_folder
             .as_ref()
-            .join("2026-02-26_18-09-07-1000.onnx");
+            .join("2026-02-26_18-09-07-2000.onnx");
 
         let session = Session::builder()?
             .with_optimization_level(GraphOptimizationLevel::Level3)?
@@ -46,8 +47,8 @@ impl WalkingInference {
             ])?
             .commit_from_file(neural_network_path)?;
 
-        let mut input_history = VecDeque::with_capacity(10);
-        for _ in 0..10 {
+        let mut input_history = VecDeque::with_capacity(history_length);
+        for _ in 0..history_length {
             input_history.push_front(Default::default());
         }
 
@@ -56,7 +57,7 @@ impl WalkingInference {
             last_linear_velocity_command: vector![0.0, 0.0],
             last_angular_velocity_command: 0.0,
             last_gait_progress: 0.0,
-            last_target_joint_positions: prepare_motor_command_parameters.default_positions,
+            last_target_joint_positions: Default::default(),
             input_history,
         })
     }
@@ -89,17 +90,66 @@ impl WalkingInference {
         self.last_angular_velocity_command = walking_inference_inputs.angular_velocity_command;
         self.last_gait_progress = walking_inference_inputs.gait_progress;
 
-        self.input_history.push_front(walking_inference_inputs);
+        if self.input_history.iter().any(|elem| elem.is_none()) {
+            for _ in 0..self.input_history.len() {
+                self.input_history
+                    .push_front(Some(walking_inference_inputs.clone()));
+            }
+        } else {
+            self.input_history
+                .push_front(Some(walking_inference_inputs));
+        }
         self.input_history
             .truncate(walking_parameters.observation_history_length);
 
-        let inputs: Array1<f32> = self
-            .input_history
-            .iter()
-            .rev()
-            .flat_map(|inputs| inputs.mjlab_walking_policy_obersvation_vector())
-            .collect::<Vec<f32>>()
-            .into();
+        let inputs: Array1<f32> = Vec::from_iter(
+            history(
+                &self.input_history,
+                walking_parameters.observation_history_length,
+                |i: &WalkingInferenceInputs| {
+                    [
+                        i.angular_velocity.x(),
+                        i.angular_velocity.y(),
+                        i.angular_velocity.z(),
+                    ]
+                },
+            )
+            .chain(history(
+                &self.input_history,
+                walking_parameters.observation_history_length,
+                |i: &WalkingInferenceInputs| {
+                    [i.gravity.x(), i.gravity.y(), i.gravity.z()].into_iter()
+                },
+            ))
+            .chain(history(
+                &self.input_history,
+                walking_parameters.observation_history_length,
+                |i: &WalkingInferenceInputs| joints_as_array(i.joint_position_differences),
+            ))
+            .chain(history(
+                &self.input_history,
+                walking_parameters.observation_history_length,
+                |i: &WalkingInferenceInputs| joints_as_array(i.joint_velocities),
+            ))
+            .chain(history(
+                &self.input_history,
+                walking_parameters.observation_history_length,
+                |i: &WalkingInferenceInputs| joints_as_array(i.last_target_joint_positions),
+            ))
+            .chain(history(
+                &self.input_history,
+                walking_parameters.observation_history_length,
+                |i: &WalkingInferenceInputs| {
+                    [
+                        i.linear_velocity_command.x(),
+                        i.linear_velocity_command.y(),
+                        i.angular_velocity_command,
+                    ]
+                    .into_iter()
+                },
+            )),
+        )
+        .into();
 
         assert!(
             inputs.len()
@@ -158,4 +208,45 @@ impl WalkingInference {
 
         Ok(self.last_target_joint_positions)
     }
+}
+
+fn history<'a, T, F>(
+    input_history: &'a VecDeque<Option<WalkingInferenceInputs>>,
+    n: usize,
+    f: F,
+) -> impl Iterator<Item = f32> + use<'a, T, F>
+where
+    T: IntoIterator<Item = f32>,
+    F: FnMut(&'a WalkingInferenceInputs) -> T,
+{
+    input_history.iter().flatten().rev().take(n).flat_map(f)
+}
+
+fn joints_as_array(joints: Joints) -> [f32; 20] {
+    // ALeft_Shoulder_Pitch,Left_Shoulder_Roll,Left_Elbow_Pitch,Left_Elbow_Yaw,
+    // ARight_Shoulder_Pitch,Right_Shoulder_Roll,Right_Elbow_Pitch,Right_Elbow_Yaw,
+    // Left_Hip_Pitch,Left_Hip_Roll,Left_Hip_Yaw,Left_Knee_Pitch,Left_Ankle_Pitch,Left_Ankle_Roll,
+    // Right_Hip_Pitch,Right_Hip_Roll,Right_Hip_Yaw,Right_Knee_Pitch,Right_Ankle_Pitch,Right_Ankle_Roll
+    [
+        joints.left_arm.shoulder_pitch,
+        joints.left_arm.shoulder_roll,
+        joints.left_arm.elbow,
+        joints.left_arm.shoulder_yaw,
+        joints.right_arm.shoulder_pitch,
+        joints.right_arm.shoulder_roll,
+        joints.right_arm.elbow,
+        joints.right_arm.shoulder_yaw,
+        joints.left_leg.hip_pitch,
+        joints.left_leg.hip_roll,
+        joints.left_leg.hip_yaw,
+        joints.left_leg.knee,
+        joints.left_leg.ankle_up,
+        joints.left_leg.ankle_down,
+        joints.right_leg.hip_pitch,
+        joints.right_leg.hip_roll,
+        joints.right_leg.hip_yaw,
+        joints.right_leg.knee,
+        joints.right_leg.ankle_up,
+        joints.right_leg.ankle_down,
+    ]
 }

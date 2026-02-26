@@ -290,7 +290,7 @@ impl WalkingInferenceInputs {
         .collect::<Vec<f32>>()
     }
 
-    pub fn mjlab_walking_policy_obersvation_vector(&self) -> Vec<f32> {
+    pub fn mjlab_walking_policy_observation_vector(&self) -> Vec<f32> {
         [
             self.angular_velocity.x(),
             self.angular_velocity.y(),
