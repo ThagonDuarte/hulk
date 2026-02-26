@@ -222,7 +222,7 @@
         "hip_yaw": 80.0,
         "knee": 80.0,
         "ankle_up": 25.0,
-        "ankle_down": 60.0
+        "ankle_down": 25.0
       },
       "right_leg": {
         "hip_pitch": 80.0,
@@ -230,7 +230,7 @@
         "hip_yaw": 80.0,
         "knee": 80.0,
         "ankle_up": 25.0,
-        "ankle_down": 60.0
+        "ankle_down": 25.0
       }
     },
     "derivative_coefficients": {
