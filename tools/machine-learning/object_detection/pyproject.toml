@@ -9,4 +9,7 @@ dependencies = [
   "huggingface-hub>=0.29.1",
   "openvino==2024.6.0",
   "ultralytics",
+  "onnx",
+  "onnxslim",
+  "onnxruntime",
 ]
