@@ -16,7 +16,7 @@ use ros2::sensor_msgs::{camera_info::CameraInfo, image::Image};
 use serde::{Deserialize, Serialize};
 use types::{
     bounding_box::BoundingBox,
-    object_detection::{Detection, NaoLabelPartyObjectDetectionLabel, YOLOv8ObjectDetectionLabel},
+    object_detection::{Detection, NaoLabelPartyObjectDetectionLabel},
     parameters::ObjectDetectionParameters,
 };
 
@@ -113,7 +113,8 @@ impl ObjectDetection {
                 if *confidence < context.parameters.confidence_threshold {
                     return None;
                 }
-                let label = NaoLabelPartyObjectDetectionLabel::from_index(class_id);
+                let label: NaoLabelPartyObjectDetectionLabel =
+                    NaoLabelPartyObjectDetectionLabel::from_index(class_id);
                 Some(Detection {
                     bounding_box: BoundingBox {
                         area: Rectangle::new_with_center_and_size(
