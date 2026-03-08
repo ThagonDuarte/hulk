@@ -39,6 +39,8 @@ pub fn setup_logger() -> Result<(), fern::InitError> {
             ))
         })
         .level(log::LevelFilter::Debug)
+        .level_for("zenoh", log::LevelFilter::Warn)
+        .level_for("ort", log::LevelFilter::Warn)
         .chain(stdout())
         .apply()?;
     Ok(())
