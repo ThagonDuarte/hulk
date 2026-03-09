@@ -28,7 +28,7 @@ use crate::{
 
 #[derive(Parser)]
 struct Arguments {
-    /// Alternative repository root
+    /// Alternative hulk workspace root
     #[arg(long, default_value = "/home/booster/hulk/")]
     hulk_workspace_path: PathBuf,
 }
@@ -39,7 +39,14 @@ async fn main() -> Result<()> {
 
     let arguments = Arguments::parse();
 
-    let robot = get_robot(arguments.hulk_workspace_path).await?;
+    let output = Command::new("jetson_release")
+        .arg("-s | grep 'Serial Number:' | grep '[0-9]*$' -o")
+        .output()
+        .await?;
+
+    let id = String::from_utf8(output.stdout).unwrap();
+
+    let robot = Robot::from_team_toml_and_id(arguments.hulk_workspace_path, id).await?;
 
     let ros_context = Context::new().wrap_err("failed to create ROS context")?;
     let mut ros_node = ros_context

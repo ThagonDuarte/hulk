@@ -113,6 +113,15 @@ async fn main() -> Result<()> {
         framework_parameters.communication_addresses = Some(fallback.to_string());
     }
 
+    let output = Command::new("jetson_release")
+        .arg("-s | grep 'Serial Number:' | grep '[0-9]*$' -o")
+        .output()
+        .await?;
+
+    let id = String::from_utf8(output.stdout).unwrap();
+
+    let robot = Robot::from_team_toml_and_id(arguments.hulk_workspace_path, id).await?;
+
     let runtime_handle = tokio::runtime::Handle::current();
     let hardware_interface =
         BoosterHardwareInterface::new(runtime_handle, keep_running.clone(), hardware_parameters)
