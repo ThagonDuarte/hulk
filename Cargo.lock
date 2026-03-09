@@ -7357,6 +7357,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
+ "zenoh",
 ]
 
 [[package]]
@@ -13000,14 +13001,18 @@ version = "0.1.0"
 dependencies = [
  "booster",
  "cdr",
+ "clap",
  "color-eyre",
  "env_logger",
  "futures-util",
+ "repository",
  "ros2",
  "ros2-client",
  "serde",
+ "serde_json",
  "thiserror 2.0.18",
  "tokio",
+ "toml",
  "zenoh",
 ]
 

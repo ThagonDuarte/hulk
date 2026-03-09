@@ -1,4 +1,5 @@
 use std::{
+    io::Write,
     path::{Path, PathBuf},
     process::Stdio,
 };
@@ -13,11 +14,13 @@ use argument_parsers::RobotAddress;
 use indicatif::ProgressBar;
 use repository::{Repository, team::Team};
 use robot::{Network, Robot};
+use tempfile::NamedTempFile;
 use tokio::{
     io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
     process::Command,
     sync::watch,
 };
+use zenoh::Config;
 
 use crate::{
     cargo::{
@@ -166,10 +169,17 @@ async fn gammaray_robot(
         .ssh_with_log("installing packages", &progress_bar)
         .await?;
 
+    let ros2dds_zenoh_config = insert_into_ros2dds_zenoh_config(
+        setup.join("zenoh_bridge_ros2dds_config.json5"),
+        &team_robot.hostname,
+    )?;
+    let mut config_tempfile = NamedTempFile::new()?;
+    write!(config_tempfile, "{}", ros2dds_zenoh_config)?;
+
     robot
         .rsync_with_robot()?
         .arg("--rsync-path=sudo rsync")
-        .arg(setup.join("conf.json5"))
+        .arg(config_tempfile.into_temp_path())
         .arg(format!("{}:/etc/zenoh-bridge-ros2dds/", robot.address))
         .rsync_with_log("uploading zenoh-bridge-ros2dds config", &progress_bar)
         .await?;
@@ -454,4 +464,19 @@ method=disabled
 [proxy]
 "
     )
+}
+
+fn insert_into_ros2dds_zenoh_config(
+    ros2dds_zenoh_config_path: PathBuf,
+    robot_hostname: &str,
+) -> Result<Config> {
+    let mut config = Config::from_file(ros2dds_zenoh_config_path).map_err(|err| eyre!("{err}"))?;
+
+    config
+        .insert_json5("plugins.ros2dds.namespace", &format!("/{}", robot_hostname))
+        .unwrap();
+
+    config.insert_json5("mode", "client").unwrap();
+
+    Ok(config)
 }
