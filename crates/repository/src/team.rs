@@ -10,7 +10,7 @@ pub struct Team {
     pub robots: Vec<Robot>,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct Robot {
     pub number: u8,
     pub hostname: String,

@@ -2,11 +2,13 @@ mod bridge;
 mod error;
 mod ros;
 
-use std::fmt::Debug;
+use std::{fmt::Debug, path::PathBuf};
 
 use booster::{ButtonEventMsg, FallDownState, Kick, LowState};
-use color_eyre::eyre::{Result, WrapErr};
+use clap::Parser;
+use color_eyre::eyre::{OptionExt, Result, WrapErr};
 use futures_util::{FutureExt, future::Fuse, select};
+use repository::team::{Robot, Team};
 use ros2_client::{
     Context, DEFAULT_SUBSCRIPTION_QOS, MessageTypeName, Node, NodeName, NodeOptions, Publisher,
     Subscription,
@@ -16,7 +18,7 @@ use ros2_client::{
     },
 };
 use serde::{Serialize, de::DeserializeOwned};
-use tokio::task::JoinHandle;
+use tokio::{fs::read_to_string, process::Command, task::JoinHandle};
 use zenoh::Session;
 
 use crate::{
@@ -24,9 +26,20 @@ use crate::{
     error::Error,
 };
 
+#[derive(Parser)]
+struct Arguments {
+    /// Alternative repository root
+    #[arg(long, default_value = "/home/booster/hulk/")]
+    hulk_workspace_path: PathBuf,
+}
+
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> Result<()> {
     env_logger::init();
+
+    let arguments = Arguments::parse();
+
+    let robot = get_robot(arguments.hulk_workspace_path).await?;
 
     let ros_context = Context::new().wrap_err("failed to create ROS context")?;
     let mut ros_node = ros_context
@@ -36,7 +49,14 @@ async fn main() -> Result<()> {
         )
         .wrap_err("failed to create ROS node")?;
 
-    let zenoh_session = zenoh::open(zenoh::Config::default())
+    let mut zenoh_config = zenoh::Config::default();
+
+    zenoh_config
+        .insert_json5("namespace", &robot.hostname)
+        .unwrap();
+    zenoh_config.insert_json5("mode", "client").unwrap();
+
+    let zenoh_session = zenoh::open(zenoh_config)
         .await
         .map_err(Error::Zenoh)
         .wrap_err("failed to create Zenoh session")?;
@@ -158,4 +178,27 @@ fn spawn_zenoh_to_ros_forwarder<T: 'static + Serialize + DeserializeOwned + Send
         ros_publisher,
     ))
     .fuse())
+}
+
+async fn get_robot(hulk_workspace_path: PathBuf) -> Result<Robot> {
+    let output = Command::new("jetson_release")
+        .arg("-s | grep 'Serial Number:' | grep '[0-9]*$' -o")
+        .output()
+        .await?;
+
+    let id = String::from_utf8(output.stdout).unwrap();
+
+    let team_toml = hulk_workspace_path.join("parameters/team.toml");
+
+    let content = read_to_string(&team_toml)
+        .await
+        .wrap_err_with(|| format!("failed to read {}", team_toml.display()))?;
+
+    let team: Team = toml::from_str(&content).wrap_err("failed to parse team.toml")?;
+
+    team.robots
+        .iter()
+        .find(|robot| robot.id == id)
+        .cloned()
+        .ok_or_eyre(r#"ID "{id}" not found in team.toml"#)
 }
