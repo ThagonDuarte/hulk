@@ -37,7 +37,7 @@ impl WalkingInference {
     ) -> Result<Self> {
         let neural_network_path = neural_network_folder
             .as_ref()
-            .join("2026-02-28_15-47-05_800.onnx");
+            .join("2026-03-17_15-50-47-1800.onnx");
 
         let session = Session::builder()?
             .with_optimization_level(GraphOptimizationLevel::Level3)?
