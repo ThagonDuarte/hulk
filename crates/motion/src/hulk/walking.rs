@@ -64,9 +64,6 @@ impl RLWalking {
     }
 
     pub fn cycle(&mut self, context: CycleContext) -> Result<MainOutputs> {
-        let walk_command =
-            WalkCommand::from_motion_command(context.motion_command, context.walking_parameters);
-
         if context.cycle_time.start_time < self.next_inference_time {
             return Ok(MainOutputs {
                 walking_target_joint_positions: None.into(),
@@ -79,9 +76,12 @@ impl RLWalking {
                     * context.walking_parameters.control.decimation,
             );
 
+        let walk_command =
+            WalkCommand::from_motion_command(context.motion_command, context.walking_parameters);
+
         let scaled_inference_output_positions = self.walking_inference.do_inference(
             context.cycle_time.last_cycle_duration,
-            &WalkCommand::Stand,
+            &walk_command,
             context.imu_state,
             *context.serial_motor_states,
             context.walking_parameters,

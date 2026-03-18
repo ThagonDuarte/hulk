@@ -33,14 +33,19 @@ impl WalkingInference {
     pub fn new(neural_network_folder: impl AsRef<Path>, history_length: usize) -> Result<Self> {
         let neural_network_path = neural_network_folder
             .as_ref()
-            .join("2026-03-17_15-50-47-3000.onnx");
+            .join("2026-02-26_16-13-29-1000.onnx");
+
+        let tensor_rt = TensorRTExecutionProvider::default()
+            .with_device_id(0)
+            .with_fp16(true)
+            .with_engine_cache(true)
+            .with_engine_cache_path(neural_network_folder.as_ref().to_path_buf().display())
+            .build();
 
         let session = Session::builder()?
             .with_optimization_level(GraphOptimizationLevel::Level3)?
-            .with_execution_providers([
-                TensorRTExecutionProvider::default().build(),
-                CUDAExecutionProvider::default().build(),
-            ])?
+            .with_execution_providers([tensor_rt, CUDAExecutionProvider::default().build()])?
+            .with_intra_threads(1)?
             .commit_from_file(neural_network_path)?;
 
         let mut input_history = VecDeque::with_capacity(history_length);

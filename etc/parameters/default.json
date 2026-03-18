@@ -5,7 +5,7 @@
     "stabilizing_interval_compression_factor": 1.0,
     "number_of_actions": 20,
     "number_of_observations": 69,
-    "observation_history_length": 5,
+    "observation_history_length": 1,
     "torque_limits": {
       "head": {
         "yaw": 7,
@@ -49,7 +49,7 @@
       "clip_actions": 100.0
     },
     "control": {
-      "dt": 0.002,
+      "dt": 0.00175,
       "action_scale": 0.5,
       "decimation": 5.0
     },
@@ -391,7 +391,7 @@
         "left": 0.0,
         "turn": 0.0
       },
-      "enable": false
+      "enable": true
     },
     "path_planning": {
       "robot_radius_at_hip_height": 0.3,
@@ -582,7 +582,7 @@
   },
   "head_motion": {
     "maximum_velocity": {
-      "yaw": 0.4,
+      "yaw": 1.0,
       "pitch": 0.4
     },
     "maximum_defender_velocity": {
@@ -935,7 +935,7 @@
       "secs": 2
     },
     "quick_search_timeout": {
-      "nanos": 300000000,
+      "nanos": 800000000,
       "secs": 0
     },
     "middle_positions": {
