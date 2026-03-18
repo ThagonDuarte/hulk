@@ -41,7 +41,7 @@ pub struct CycleContext {
 #[context]
 #[derive(Default)]
 pub struct MainOutputs {
-    pub walking_target_joint_positions: MainOutput<Joints>,
+    pub walking_target_joint_positions: MainOutput<Option<Joints>>,
 }
 
 impl RLWalking {
@@ -51,7 +51,6 @@ impl RLWalking {
 
         let walking_inference = WalkingInference::new(
             &neural_network_folder,
-            context.prepare_motor_command_parameters,
             context.walking_parameters.observation_history_length,
         )?;
 
@@ -70,7 +69,7 @@ impl RLWalking {
 
         if context.cycle_time.start_time < self.next_inference_time {
             return Ok(MainOutputs {
-                walking_target_joint_positions: self.smoothed_target_joint_positions.into(),
+                walking_target_joint_positions: None.into(),
             });
         }
 
@@ -82,7 +81,7 @@ impl RLWalking {
 
         let scaled_inference_output_positions = self.walking_inference.do_inference(
             context.cycle_time.last_cycle_duration,
-            &walk_command,
+            &WalkCommand::Stand,
             context.imu_state,
             *context.serial_motor_states,
             context.walking_parameters,
@@ -99,7 +98,7 @@ impl RLWalking {
                 * (1.0 - context.walking_parameters.joint_position_smoothing_factor);
 
         Ok(MainOutputs {
-            walking_target_joint_positions: self.smoothed_target_joint_positions.into(),
+            walking_target_joint_positions: Some(self.smoothed_target_joint_positions).into(),
         })
     }
 }
