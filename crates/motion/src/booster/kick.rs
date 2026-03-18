@@ -4,7 +4,7 @@ use booster::Kick;
 use booster_sdk::types::RobotMode;
 use color_eyre::Result;
 use context_attribute::context;
-use hardware::{HighLevelInterface, MotionRuntimeInteface, VisualKickInterface};
+use hardware::{HighLevelInterface, MotionRuntimeInterface, VisualKickInterface};
 use ros2::std_msgs::header::Header;
 use serde::{Deserialize, Serialize};
 use types::{cycle_time::CycleTime, motion_command::MotionCommand, motion_runtime::MotionRuntime};
@@ -46,7 +46,7 @@ impl BoosterKick {
     pub fn cycle(
         &mut self,
         context: CycleContext<
-            impl HighLevelInterface + MotionRuntimeInteface + VisualKickInterface,
+            impl HighLevelInterface + MotionRuntimeInterface + VisualKickInterface,
         >,
     ) -> Result<MainOutputs> {
         if !matches!(
