@@ -16,15 +16,14 @@ pub struct CommandSender {
 
 #[context]
 pub struct CreationContext {
-    prepare_motor_command_parameters: Parameter<MotorCommandParameters, "prepare_motor_command">,
+    motor_command_parameters: Parameter<MotorCommandParameters, "common_motor_command">,
 }
 
 #[context]
 pub struct CycleContext {
     low_command: AdditionalOutput<LowCommand, "low_command">,
 
-    walk_motor_command_parameters: Parameter<MotorCommandParameters, "common_motor_command">,
-    _prepare_motor_command_parameters: Parameter<MotorCommandParameters, "prepare_motor_command">,
+    motor_command_parameters: Parameter<MotorCommandParameters, "common_motor_command">,
 
     collected_target_joint_positions:
         RequiredInput<Option<Joints<f32>>, "collected_target_joint_positions?">,
@@ -41,9 +40,7 @@ impl CommandSender {
         Ok(Self {
             time_index: 0.0,
             motor_index: 0,
-            filtered_target_joint_positions: context
-                .prepare_motor_command_parameters
-                .default_positions,
+            filtered_target_joint_positions: context.motor_command_parameters.default_positions,
         })
     }
 
@@ -57,7 +54,7 @@ impl CommandSender {
 
         let walk_low_command = LowCommand::new(
             context.collected_target_joint_positions,
-            context.walk_motor_command_parameters,
+            context.motor_command_parameters,
             CommandType::Serial,
         );
 

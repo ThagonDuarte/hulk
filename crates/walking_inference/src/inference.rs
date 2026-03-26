@@ -31,16 +31,19 @@ pub struct WalkingInference {
 
 impl WalkingInference {
     pub fn new(neural_network_folder: impl AsRef<Path>, history_length: usize) -> Result<Self> {
-        let neural_network_path = neural_network_folder
-            .as_ref()
-            .join("2026-03-17_15-50-47-3000.onnx");
+        let neural_network_path = neural_network_folder.as_ref().join("t1_walk.onnx");
+
+        let tensor_rt = TensorRTExecutionProvider::default()
+            .with_device_id(0)
+            .with_fp16(true)
+            .with_engine_cache(true)
+            .with_engine_cache_path(neural_network_folder.as_ref().to_path_buf().display())
+            .build();
 
         let session = Session::builder()?
             .with_optimization_level(GraphOptimizationLevel::Level3)?
-            .with_execution_providers([
-                TensorRTExecutionProvider::default().build(),
-                CUDAExecutionProvider::default().build(),
-            ])?
+            .with_execution_providers([tensor_rt, CUDAExecutionProvider::default().build()])?
+            .with_intra_threads(1)?
             .commit_from_file(neural_network_path)?;
 
         let mut input_history = VecDeque::with_capacity(history_length);
@@ -98,54 +101,7 @@ impl WalkingInference {
         self.input_history
             .truncate(walking_parameters.observation_history_length);
 
-        let inputs: Array1<f32> = Vec::from_iter(
-            history(
-                &self.input_history,
-                walking_parameters.observation_history_length,
-                |i: &WalkingInferenceInputs| {
-                    [
-                        i.angular_velocity.x(),
-                        i.angular_velocity.y(),
-                        i.angular_velocity.z(),
-                    ]
-                },
-            )
-            .chain(history(
-                &self.input_history,
-                walking_parameters.observation_history_length,
-                |i: &WalkingInferenceInputs| {
-                    [i.gravity.x(), i.gravity.y(), i.gravity.z()].into_iter()
-                },
-            ))
-            .chain(history(
-                &self.input_history,
-                walking_parameters.observation_history_length,
-                |i: &WalkingInferenceInputs| joints_as_array(i.joint_position_differences),
-            ))
-            .chain(history(
-                &self.input_history,
-                walking_parameters.observation_history_length,
-                |i: &WalkingInferenceInputs| joints_as_array(i.joint_velocities),
-            ))
-            .chain(history(
-                &self.input_history,
-                walking_parameters.observation_history_length,
-                |i: &WalkingInferenceInputs| joints_as_array(i.last_target_joint_positions),
-            ))
-            .chain(history(
-                &self.input_history,
-                walking_parameters.observation_history_length,
-                |i: &WalkingInferenceInputs| {
-                    [
-                        i.linear_velocity_command.x(),
-                        i.linear_velocity_command.y(),
-                        i.angular_velocity_command,
-                    ]
-                    .into_iter()
-                },
-            )),
-        )
-        .into();
+        let inputs: Array1<f32> = self.time_major_inputs();
 
         assert!(
             inputs.len()
@@ -157,7 +113,7 @@ impl WalkingInference {
         let inference_input = inputs![inputs_tensor];
 
         let outputs = self.session.run(inference_input)?;
-        let predictions = outputs["actions"].try_extract_array::<f32>()?.squeeze();
+        let predictions = outputs["21"].try_extract_array::<f32>()?.squeeze();
 
         // predictions.clamp(
         //     -walking_parameters.normalization.clip_actions,
@@ -204,9 +160,68 @@ impl WalkingInference {
 
         Ok(self.last_target_joint_positions)
     }
+
+    fn time_major_inputs(&self) -> Array1<f32> {
+        self.input_history
+            .iter()
+            .flatten()
+            .flat_map(|input| input.booster_deploy_observation_vector())
+            .collect()
+    }
+
+    fn _term_major_inputs(&self, walking_parameters: &RLWalkingParameters) -> Array1<f32> {
+        Vec::from_iter(
+            _history(
+                &self.input_history,
+                walking_parameters.observation_history_length,
+                |i: &WalkingInferenceInputs| {
+                    [
+                        i.angular_velocity.x(),
+                        i.angular_velocity.y(),
+                        i.angular_velocity.z(),
+                    ]
+                },
+            )
+            .chain(_history(
+                &self.input_history,
+                walking_parameters.observation_history_length,
+                |i: &WalkingInferenceInputs| {
+                    [i.gravity.x(), i.gravity.y(), i.gravity.z()].into_iter()
+                },
+            ))
+            .chain(_history(
+                &self.input_history,
+                walking_parameters.observation_history_length,
+                |i: &WalkingInferenceInputs| _joints_as_array(i.joint_position_differences),
+            ))
+            .chain(_history(
+                &self.input_history,
+                walking_parameters.observation_history_length,
+                |i: &WalkingInferenceInputs| _joints_as_array(i.joint_velocities),
+            ))
+            .chain(_history(
+                &self.input_history,
+                walking_parameters.observation_history_length,
+                |i: &WalkingInferenceInputs| _joints_as_array(i.last_target_joint_positions),
+            ))
+            .chain(_history(
+                &self.input_history,
+                walking_parameters.observation_history_length,
+                |i: &WalkingInferenceInputs| {
+                    [
+                        i.linear_velocity_command.x(),
+                        i.linear_velocity_command.y(),
+                        i.angular_velocity_command,
+                    ]
+                    .into_iter()
+                },
+            )),
+        )
+        .into()
+    }
 }
 
-fn history<'a, T, F>(
+fn _history<'a, T, F>(
     input_history: &'a VecDeque<Option<WalkingInferenceInputs>>,
     n: usize,
     f: F,
@@ -218,7 +233,7 @@ where
     input_history.iter().flatten().rev().take(n).flat_map(f)
 }
 
-fn joints_as_array(joints: Joints) -> [f32; 20] {
+fn _joints_as_array(joints: Joints) -> [f32; 20] {
     // ALeft_Shoulder_Pitch,Left_Shoulder_Roll,Left_Elbow_Pitch,Left_Elbow_Yaw,
     // ARight_Shoulder_Pitch,Right_Shoulder_Roll,Right_Elbow_Pitch,Right_Elbow_Yaw,
     // Left_Hip_Pitch,Left_Hip_Roll,Left_Hip_Yaw,Left_Knee_Pitch,Left_Ankle_Pitch,Left_Ankle_Roll,

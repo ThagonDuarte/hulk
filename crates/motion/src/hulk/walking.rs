@@ -21,7 +21,7 @@ pub struct RLWalking {
 
 #[context]
 pub struct CreationContext {
-    prepare_motor_command_parameters: Parameter<MotorCommandParameters, "prepare_motor_command">,
+    motor_command_parameters: Parameter<MotorCommandParameters, "common_motor_command">,
     walking_parameters: Parameter<RLWalkingParameters, "rl_walking">,
 
     hardware_interface: HardwareInterface,
@@ -30,7 +30,7 @@ pub struct CreationContext {
 #[context]
 pub struct CycleContext {
     walking_parameters: Parameter<RLWalkingParameters, "rl_walking">,
-    common_motor_command_parameters: Parameter<MotorCommandParameters, "common_motor_command">,
+    motor_command_parameters: Parameter<MotorCommandParameters, "common_motor_command">,
 
     imu_state: Input<ImuState, "imu_state">,
     serial_motor_states: Input<Joints<MotorState>, "serial_motor_states">,
@@ -56,17 +56,12 @@ impl RLWalking {
 
         Ok(Self {
             walking_inference,
-            smoothed_target_joint_positions: context
-                .prepare_motor_command_parameters
-                .default_positions,
+            smoothed_target_joint_positions: context.motor_command_parameters.default_positions,
             next_inference_time: SystemTime::UNIX_EPOCH,
         })
     }
 
     pub fn cycle(&mut self, context: CycleContext) -> Result<MainOutputs> {
-        let walk_command =
-            WalkCommand::from_motion_command(context.motion_command, context.walking_parameters);
-
         if context.cycle_time.start_time < self.next_inference_time {
             return Ok(MainOutputs {
                 walking_target_joint_positions: None.into(),
@@ -79,18 +74,20 @@ impl RLWalking {
                     * context.walking_parameters.control.decimation,
             );
 
+        let walk_command =
+            WalkCommand::from_motion_command(context.motion_command, context.walking_parameters);
+
         let scaled_inference_output_positions = self.walking_inference.do_inference(
             context.cycle_time.last_cycle_duration,
-            &WalkCommand::Stand,
+            &walk_command,
             context.imu_state,
             *context.serial_motor_states,
             context.walking_parameters,
-            context.common_motor_command_parameters,
+            context.motor_command_parameters,
         )?;
 
         let walking_target_joint_positions =
-            context.common_motor_command_parameters.default_positions
-                + scaled_inference_output_positions;
+            context.motor_command_parameters.default_positions + scaled_inference_output_positions;
 
         self.smoothed_target_joint_positions = self.smoothed_target_joint_positions
             * context.walking_parameters.joint_position_smoothing_factor
