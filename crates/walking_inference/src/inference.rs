@@ -33,7 +33,7 @@ impl WalkingInference {
     pub fn new(neural_network_folder: impl AsRef<Path>, history_length: usize) -> Result<Self> {
         let neural_network_path = neural_network_folder
             .as_ref()
-            .join("2026-02-26_16-13-29-1000.onnx");
+            .join("2026-03-31_09-40-26-2800.onnx");
 
         let tensor_rt = TensorRTExecutionProvider::default()
             .with_device_id(0)
