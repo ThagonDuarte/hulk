@@ -6,6 +6,7 @@ that shares one backbone across detection and pose heads.
 ## What is in this repo
 
 - `src/model/hydra.py`: assembles a shared-backbone, multi-head model.
+- `src/model/train_hydra_joint.py`: runs custom joint multi-task training.
 - `src/validation/validator.py`: validates original YOLO models and Hydra heads.
 - `src/validation/compare_results.py`: compares two saved validation runs.
 - `src/validation/predictor.py`: runs inference and saves a combined visualization.
@@ -46,6 +47,9 @@ uv run -m utils.export_yolo_to_onnx --help
 
 # Single-task training CLI help
 uv run python src/model/train.py --help
+
+# Joint multi-task training CLI help
+uv run python src/model/train_hydra_joint.py --help
 ```
 
 ## Single-task training CLI
@@ -75,8 +79,52 @@ uv run python src/model/train.py --device 0,1
 uv run python src/model/train.py --do-tuning
 ```
 
+## Joint multi-task training CLI
+
+`src/model/train_hydra_joint.py` is a Click CLI for synchronized,
+custom-loop training of the Hydra model with separate detection and pose
+datasets.
+
+- Uses a dynamic interleaved dataloader to train across disjoint task datasets.
+- Applies synchronized task accumulation so the shared backbone updates once per
+  detect+pose cycle.
+- Uses dynamic uncertainty weighting to auto-balance per-task loss scales.
+- Includes AMP, gradient clipping, EMA, cosine schedulers, validation,
+  checkpointing, and resume.
+
+Examples:
+
+```bash
+# Full joint run (defaults)
+uv run python src/model/train_hydra_joint.py \
+  --foundation-path assets/yolo26m.pt \
+  --detection-model assets/yolo26m.pt \
+  --pose-model assets/yolo26m-pose.pt \
+  --detection-data /path/to/detect.yaml \
+  --pose-data /path/to/pose.yaml
+
+# Fast dev smoke run
+uv run python src/model/train_hydra_joint.py \
+  --foundation-path assets/yolo26m.pt \
+  --detection-model assets/yolo26m.pt \
+  --pose-model assets/yolo26m-pose.pt \
+  --detection-data /path/to/detect.yaml \
+  --pose-data /path/to/pose.yaml \
+  --dev-mode
+
+# Resume from last checkpoint
+uv run python src/model/train_hydra_joint.py \
+  --foundation-path assets/yolo26m.pt \
+  --detection-model assets/yolo26m.pt \
+  --pose-model assets/yolo26m-pose.pt \
+  --detection-data /path/to/detect.yaml \
+  --pose-data /path/to/pose.yaml \
+  --resume runs/train/hydra-joint/last.pt
+```
+
 ## Notes
 
 - Validation outputs are written under `runs/val/...` with `metrics.json`, `metadata.json`, and `config.json`.
 - `src/model/train.py` supports optional tuned hyperparameter loading from `runs/tune/<name>/best_hyperparameters.yaml`.
+- Joint training outputs are written under `runs/train/<run-name>/` with `train_config.json`, `last.pt`, and `best.pt`.
 - `src/validation/predictor.py` `main()` is a local smoke example and uses a hardcoded image path.

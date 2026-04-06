@@ -1,4 +1,5 @@
 from pathlib import Path
+from typing import Any, cast
 
 import click
 import torch
@@ -13,7 +14,7 @@ def load_raw_yolo_network(model_path: Path) -> nn.Module:
 
     for module in yolo_network.modules():
         if hasattr(module, "export"):
-            module.export = True
+            cast(Any, module).export = True
 
     return yolo_network
 

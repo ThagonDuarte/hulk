@@ -1,7 +1,7 @@
 import logging
 from collections.abc import Mapping, Sequence
+from pathlib import Path
 from typing import Any, cast
-from zipfile import Path
 
 import torch
 import torch.nn as nn
@@ -72,7 +72,8 @@ class Hydra(nn.Module):
             cast(dict, foundation_root.yaml)
         )
 
-        self.foundation_name = Path(foundation_yolo.model_name).stem
+        foundation_model_name = foundation_yolo.model_name or foundation_path
+        self.foundation_name = Path(foundation_model_name).stem
         self.shared_backbone = get_backbone(foundation_root)
         self.save_backbone = cast(list[int], foundation_root.save)
 
@@ -93,7 +94,8 @@ class Hydra(nn.Module):
             self.heads[task_name] = get_head(task_root)
             self.branch_saves[task_name] = cast(list[int], task_root.save)
             self.head_class_names[task_name] = getattr(task_root, "names", {})
-            self.head_model_names[task_name] = Path(task_yolo.model_name).stem
+            task_model_name = task_yolo.model_name or model_path
+            self.head_model_names[task_name] = Path(task_model_name).stem
             stride = getattr(task_head, "stride", torch.tensor([8, 16, 32]))
             self.head_strides[task_name] = torch.as_tensor(stride)
             self.head_end2end[task_name] = bool(
@@ -116,7 +118,9 @@ class Hydra(nn.Module):
             else:
                 self.head_kpt_shapes[task_name] = None
 
-    def forward(self, x: torch.Tensor) -> dict[str, Any]:
+    def _run_backbone(
+        self, x: torch.Tensor
+    ) -> tuple[list[torch.Tensor | None], torch.Tensor]:
         y_backbone: list[torch.Tensor | None] = []
         backbone_activations: Any = x
 
@@ -136,40 +140,63 @@ class Hydra(nn.Module):
                 backbone_activations if i in self.save_backbone else None
             )
 
-        outputs: dict[str, Any] = {}
+        return y_backbone, cast(torch.Tensor, backbone_activations)
 
-        for head_name, head_module in self.heads.items():
-            head = cast(nn.ModuleList, head_module)
-            y_head = list(y_backbone)
-            head_activations: list[torch.Tensor] | torch.Tensor = (
-                backbone_activations
-            )
+    def _run_head(
+        self,
+        head_name: str,
+        y_backbone: list[torch.Tensor | None],
+        backbone_activations: torch.Tensor,
+    ) -> Any:
+        if head_name not in self.heads:
+            raise MissingHydraHeadError(head_name)
 
-            for i, m in enumerate(head):
-                module_index = i + self.backbone_length
+        head = cast(nn.ModuleList, self.heads[head_name])
+        y_head = list(y_backbone)
+        head_activations: list[torch.Tensor] | torch.Tensor = (
+            backbone_activations
+        )
 
-                from_index = cast(Any, m.f)
-                if from_index != -1:
-                    head_activations = (
-                        cast(torch.Tensor, y_head[from_index])
-                        if isinstance(from_index, int)
-                        else [
-                            cast(torch.Tensor, head_activations)
-                            if j == -1
-                            else cast(torch.Tensor, y_head[j])
-                            for j in cast(list[int], from_index)
-                        ]
-                    )
+        for i, m in enumerate(head):
+            module_index = i + self.backbone_length
 
-                head_activations = m(head_activations)
-
-                y_head.append(
-                    cast(torch.Tensor, head_activations)
-                    if module_index in self.branch_saves[head_name]
-                    else None
+            from_index = cast(Any, m.f)
+            if from_index != -1:
+                head_activations = (
+                    cast(torch.Tensor, y_head[from_index])
+                    if isinstance(from_index, int)
+                    else [
+                        cast(torch.Tensor, head_activations)
+                        if j == -1
+                        else cast(torch.Tensor, y_head[j])
+                        for j in cast(list[int], from_index)
+                    ]
                 )
 
-            outputs[head_name] = head_activations
+            head_activations = m(head_activations)
+
+            y_head.append(
+                cast(torch.Tensor, head_activations)
+                if module_index in self.branch_saves[head_name]
+                else None
+            )
+
+        return head_activations
+
+    def forward_head(self, x: torch.Tensor, head_name: str) -> Any:
+        y_backbone, backbone_activations = self._run_backbone(x)
+        return self._run_head(head_name, y_backbone, backbone_activations)
+
+    def forward(self, x: torch.Tensor) -> dict[str, Any]:
+        y_backbone, backbone_activations = self._run_backbone(x)
+        outputs: dict[str, Any] = {}
+
+        for head_name in self.heads:
+            outputs[head_name] = self._run_head(
+                head_name,
+                y_backbone,
+                backbone_activations,
+            )
 
         return outputs
 
