@@ -220,7 +220,7 @@ where
     T: IntoIterator<Item = f32>,
     F: FnMut(&'a WalkingInferenceInputs) -> T,
 {
-    input_history.iter().flatten().rev().take(n).flat_map(f)
+    input_history.iter().flatten().take(n).flat_map(f)
 }
 
 fn joints_as_array(joints: Joints) -> [f32; 12] {
