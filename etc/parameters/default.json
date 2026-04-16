@@ -3,8 +3,8 @@
     "gait_frequency": 1,
     "stabilizing_interval_completion_threshold": 0.01,
     "stabilizing_interval_compression_factor": 1.0,
-    "number_of_actions": 20,
-    "number_of_observations": 69,
+    "number_of_actions": 12,
+    "number_of_observations": 45,
     "observation_history_length": 10,
     "torque_limits": {
       "head": {

@@ -33,7 +33,7 @@ impl WalkingInference {
     pub fn new(neural_network_folder: impl AsRef<Path>, history_length: usize) -> Result<Self> {
         let neural_network_path = neural_network_folder
             .as_ref()
-            .join("2026-03-31_09-40-26-2800.onnx");
+            .join("2026-04-16_15-15-58.onnx");
 
         let tensor_rt = TensorRTExecutionProvider::default()
             .with_device_id(0)
@@ -176,33 +176,33 @@ impl WalkingInference {
         // Left_Hip_Pitch,Left_Hip_Roll,Left_Hip_Yaw,Left_Knee_Pitch,Left_Ankle_Pitch,Left_Ankle_Roll,
         // Right_Hip_Pitch,Right_Hip_Roll,Right_Hip_Yaw,Right_Knee_Pitch,Right_Ankle_Pitch,Right_Ankle_Roll
         self.last_target_joint_positions = Joints {
-            left_arm: ArmJoints {
-                shoulder_pitch: predictions[0],
-                shoulder_roll: predictions[1],
-                elbow: predictions[2],
-                shoulder_yaw: predictions[3],
-            },
-            right_arm: ArmJoints {
-                shoulder_pitch: predictions[4],
-                shoulder_roll: predictions[5],
-                elbow: predictions[6],
-                shoulder_yaw: predictions[7],
-            },
+            // left_arm: ArmJoints {
+            //     shoulder_pitch: predictions[0],
+            //     shoulder_roll: predictions[1],
+            //     elbow: predictions[2],
+            //     shoulder_yaw: predictions[3],
+            // },
+            // right_arm: ArmJoints {
+            //     shoulder_pitch: predictions[4],
+            //     shoulder_roll: predictions[5],
+            //     elbow: predictions[6],
+            //     shoulder_yaw: predictions[7],
+            // },
             left_leg: LegJoints {
-                hip_pitch: predictions[8],
-                hip_roll: predictions[9],
-                hip_yaw: predictions[10],
-                knee: predictions[11],
-                ankle_up: predictions[12],
-                ankle_down: predictions[13],
+                hip_pitch: predictions[0],
+                hip_roll: predictions[1],
+                hip_yaw: predictions[2],
+                knee: predictions[3],
+                ankle_up: predictions[4],
+                ankle_down: predictions[5],
             },
             right_leg: LegJoints {
-                hip_pitch: predictions[14],
-                hip_roll: predictions[15],
-                hip_yaw: predictions[16],
-                knee: predictions[17],
-                ankle_up: predictions[18],
-                ankle_down: predictions[19],
+                hip_pitch: predictions[6],
+                hip_roll: predictions[7],
+                hip_yaw: predictions[8],
+                knee: predictions[9],
+                ankle_up: predictions[10],
+                ankle_down: predictions[11],
             },
             ..Default::default()
         } * walking_parameters.control.action_scale;
@@ -223,20 +223,20 @@ where
     input_history.iter().flatten().rev().take(n).flat_map(f)
 }
 
-fn joints_as_array(joints: Joints) -> [f32; 20] {
+fn joints_as_array(joints: Joints) -> [f32; 12] {
     // ALeft_Shoulder_Pitch,Left_Shoulder_Roll,Left_Elbow_Pitch,Left_Elbow_Yaw,
     // ARight_Shoulder_Pitch,Right_Shoulder_Roll,Right_Elbow_Pitch,Right_Elbow_Yaw,
     // Left_Hip_Pitch,Left_Hip_Roll,Left_Hip_Yaw,Left_Knee_Pitch,Left_Ankle_Pitch,Left_Ankle_Roll,
     // Right_Hip_Pitch,Right_Hip_Roll,Right_Hip_Yaw,Right_Knee_Pitch,Right_Ankle_Pitch,Right_Ankle_Roll
     [
-        joints.left_arm.shoulder_pitch,
-        joints.left_arm.shoulder_roll,
-        joints.left_arm.elbow,
-        joints.left_arm.shoulder_yaw,
-        joints.right_arm.shoulder_pitch,
-        joints.right_arm.shoulder_roll,
-        joints.right_arm.elbow,
-        joints.right_arm.shoulder_yaw,
+        // joints.left_arm.shoulder_pitch,
+        // joints.left_arm.shoulder_roll,
+        // joints.left_arm.elbow,
+        // joints.left_arm.shoulder_yaw,
+        // joints.right_arm.shoulder_pitch,
+        // joints.right_arm.shoulder_roll,
+        // joints.right_arm.elbow,
+        // joints.right_arm.shoulder_yaw,
         joints.left_leg.hip_pitch,
         joints.left_leg.hip_roll,
         joints.left_leg.hip_yaw,
