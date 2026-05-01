@@ -10,7 +10,7 @@ mod user_data;
 mod window;
 mod worker_thread;
 
-use booster_sdk::types::RobotMode;
+use booster_sdk::types::{GaitType, RobotMode};
 use color_eyre::{
     eyre::{Ok, Result},
     install,
@@ -189,6 +189,10 @@ impl HighLevelInterface for ReplayerHardwareInterface {
     }
 
     fn reset_odometer(&self) -> Result<()> {
+        Ok(())
+    }
+
+    fn switch_gait(&self, _gait_type: GaitType) -> Result<()> {
         Ok(())
     }
 }

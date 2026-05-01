@@ -1,4 +1,4 @@
-use booster_sdk::types::RobotMode;
+use booster_sdk::types::{GaitType, RobotMode};
 use hardware::{
     HighLevelInterface, LightControlInterface, LowCommandInterface, LowStateInterface,
     MotionRuntimeInterface, NetworkInterface, PathsInterface, RecordingInterface,
@@ -147,6 +147,10 @@ impl HighLevelInterface for ExtractorHardwareInterface {
     }
 
     fn reset_odometer(&self) -> Result<()> {
+        Ok(())
+    }
+
+    fn switch_gait(&self, _gait_type: GaitType) -> Result<()> {
         Ok(())
     }
 }

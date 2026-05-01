@@ -11,7 +11,7 @@ use booster::{
     ButtonEventMsg, FallDownState, LowCommand, LowState, Odometer, RemoteControllerState,
     TransformMessage,
 };
-use booster_sdk::types::RobotMode;
+use booster_sdk::types::{GaitType, RobotMode};
 use color_eyre::{
     Result,
     eyre::{Context, Error, OptionExt, eyre},
@@ -476,6 +476,10 @@ impl HighLevelInterface for MujocoHardwareInterface {
     }
 
     fn reset_odometer(&self) -> Result<()> {
+        Ok(())
+    }
+
+    fn switch_gait(&self, _gait_type: GaitType) -> Result<()> {
         Ok(())
     }
 }

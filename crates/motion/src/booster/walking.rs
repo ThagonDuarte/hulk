@@ -3,7 +3,7 @@ use std::{
     time::{Duration, SystemTime},
 };
 
-use booster_sdk::types::RobotMode;
+use booster_sdk::types::{GaitType, RobotMode};
 use color_eyre::Result;
 use context_attribute::context;
 use coordinate_systems::Ground;
@@ -23,6 +23,7 @@ use types::{
 #[derive(Deserialize, Serialize)]
 pub struct BoosterWalking {
     last_move_robot_time: SystemTime,
+    last_motion_command: Option<MotionCommand>,
 }
 
 #[context]
@@ -51,6 +52,7 @@ impl BoosterWalking {
     pub fn new(_context: CreationContext) -> Result<Self> {
         Ok(Self {
             last_move_robot_time: SystemTime::UNIX_EPOCH,
+            last_motion_command: None,
         })
     }
 
@@ -114,16 +116,28 @@ impl BoosterWalking {
                 velocity,
                 angular_velocity,
                 ..
-            } => Step {
-                forward: velocity.x(),
-                left: velocity.y(),
-                turn: *angular_velocity,
-            },
+            } => {
+                // if !matches!(
+                //     self.last_motion_command,
+                //     Some(MotionCommand::WalkWithVelocity { .. })
+                // ) {
+                //     context
+                //         .hardware_interface
+                //         .switch_gait(booster_sdk::types::GaitType::HalfBodyHumanlikeGaitV2)?;
+                // }
+                Step {
+                    forward: velocity.x(),
+                    left: velocity.y(),
+                    turn: *angular_velocity,
+                }
+            }
             MotionCommand::Stand { .. } => Step::ZERO,
             _ => Step::ZERO,
         };
 
         context.step.fill_if_subscribed(|| step);
+
+        self.last_motion_command = Some(context.motion_command.clone());
 
         if context
             .cycle_time

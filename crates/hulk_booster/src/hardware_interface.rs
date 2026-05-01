@@ -17,7 +17,7 @@ use booster_sdk::{
         BoosterClient,
         light_control::{LightControlClient, SetLedLightColorParameter},
     },
-    types::RobotMode,
+    types::{GaitType, RobotMode},
 };
 use cdr::{CdrLe, Infinite};
 use color_eyre::{
@@ -660,9 +660,17 @@ impl HighLevelInterface for BoosterHardwareInterface {
 
         Ok(())
     }
+
     fn reset_odometer(&self) -> Result<()> {
         // The high level function currently always return errors, even though the call did what it was supposed to.
         let _ = self.run_until_cancelled(self.high_level_interface_client.reset_odometry())?;
+
+        Ok(())
+    }
+
+    fn switch_gait(&self, gait_type: GaitType) -> Result<()> {
+        let _ =
+            self.run_until_cancelled(self.high_level_interface_client.switch_gait(gait_type))?;
 
         Ok(())
     }

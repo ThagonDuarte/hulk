@@ -4,7 +4,10 @@ use booster::{
     ButtonEventMsg, FallDownState, Kick, LowCommand, LowState, Odometer, RemoteControllerState,
     TransformMessage,
 };
-use booster_sdk::{client::light_control::SetLedLightColorParameter, types::RobotMode};
+use booster_sdk::{
+    client::light_control::SetLedLightColorParameter,
+    types::{GaitType, RobotMode},
+};
 use color_eyre::eyre::Result;
 
 use hula_types::hardware::{Ids, Paths};
@@ -99,6 +102,7 @@ pub trait HighLevelInterface {
     fn exit_wbc_gait(&self) -> Result<()>;
     fn visual_kick(&self, start: bool) -> Result<()>;
     fn reset_odometer(&self) -> Result<()>;
+    fn switch_gait(&self, gait_type: GaitType) -> Result<()>;
 }
 
 pub trait MotionRuntimeInterface {
