@@ -140,7 +140,16 @@ class Hydra(nn.Module):
             else:
                 self.head_kpt_shapes[task_type] = None
 
-    def forward(self, x: torch.Tensor) -> dict[str, Any]:
+    def run_backbone(
+        self, x: torch.Tensor
+    ) -> tuple[torch.Tensor | list[torch.Tensor], list[torch.Tensor | None]]:
+        """Run the shared backbone and return (final_activations, saved_list).
+
+        The saved list mirrors Ultralytics' `y` cache pattern: each entry is
+        either a tensor (if its layer index appears in `self.save_backbone`)
+        or `None`. Used by `run_head` to resolve cross-layer connections that
+        reach back into the backbone.
+        """
         y_backbone: list[torch.Tensor | None] = []
         backbone_activations: Any = x
 
@@ -160,39 +169,60 @@ class Hydra(nn.Module):
                 backbone_activations if i in self.save_backbone else None
             )
 
-        outputs: dict[str, Any] = {}
+        return backbone_activations, y_backbone
 
-        for head_name, head_module in self.heads.items():
-            head = cast(nn.ModuleList, head_module)
-            y_head = list(y_backbone)
-            head_activations: list[torch.Tensor] | torch.Tensor = (
-                backbone_activations
-            )
+    def run_head(
+        self,
+        head_name: str,
+        backbone_activations: torch.Tensor | list[torch.Tensor],
+        y_backbone: list[torch.Tensor | None],
+    ) -> Any:
+        """Run a single task head and return its raw, non-flattened output.
 
-            for i, m in enumerate(head):
-                module_index = i + self.backbone_length
+        The returned value is whatever the head's final module emits — a
+        tensor, a tuple of tensors, or a structured object (e.g. the dict
+        returned by end2end heads that `E2ELoss.parse_output` expects).
+        """
+        if head_name not in self.heads:
+            raise MissingHydraHeadError(head_name)
+        head = cast(nn.ModuleList, self.heads[head_name])
+        y_head = list(y_backbone)
+        head_activations: Any = backbone_activations
 
-                from_index = cast(Any, m.f)
-                if from_index != -1:
-                    head_activations = (
-                        cast(torch.Tensor, y_head[from_index])
-                        if isinstance(from_index, int)
-                        else [
-                            cast(torch.Tensor, head_activations)
-                            if j == -1
-                            else cast(torch.Tensor, y_head[j])
-                            for j in cast(list[int], from_index)
-                        ]
-                    )
+        for i, m in enumerate(head):
+            module_index = i + self.backbone_length
 
-                head_activations = m(head_activations)
-
-                y_head.append(
-                    cast(torch.Tensor, head_activations)
-                    if module_index in self.branch_saves[head_name]
-                    else None
+            from_index = cast(Any, m.f)
+            if from_index != -1:
+                head_activations = (
+                    cast(torch.Tensor, y_head[from_index])
+                    if isinstance(from_index, int)
+                    else [
+                        cast(torch.Tensor, head_activations)
+                        if j == -1
+                        else cast(torch.Tensor, y_head[j])
+                        for j in cast(list[int], from_index)
+                    ]
                 )
 
+            head_activations = m(head_activations)
+
+            y_head.append(
+                cast(torch.Tensor, head_activations)
+                if module_index in self.branch_saves[head_name]
+                else None
+            )
+
+        return head_activations
+
+    def forward(self, x: torch.Tensor) -> dict[str, Any]:
+        backbone_activations, y_backbone = self.run_backbone(x)
+        outputs: dict[str, Any] = {}
+
+        for head_name in self.heads:
+            head_activations = self.run_head(
+                head_name, backbone_activations, y_backbone
+            )
             task_output_names = TaskType(head_name).output_names()
             if isinstance(head_activations, torch.Tensor):
                 outputs[task_output_names[0]] = head_activations
