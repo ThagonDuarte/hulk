@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import pytest
+import torch
 from torch import nn
 
 from model.joint_loop.optim import build_param_groups
@@ -96,3 +97,35 @@ def test_warmup_factor_clamps_to_one() -> None:
     assert _warmup_factor(0, warmup=3) == pytest.approx(1.0 / 3.0)
     assert _warmup_factor(2, warmup=3) == pytest.approx(1.0)
     assert _warmup_factor(99, warmup=3) == pytest.approx(1.0)
+
+
+def test_backbone_gradient_accumulation_invariant() -> None:
+    """A synchronized step must accumulate per-task grads on the backbone."""
+    backbone = nn.Linear(4, 4, bias=False)
+    head_a = nn.Linear(4, 1, bias=False)
+    head_b = nn.Linear(4, 1, bias=False)
+
+    x = torch.randn(2, 4)
+
+    # Reference: compute each task's backbone grad in isolation, sum them.
+    manual_grads = torch.zeros_like(backbone.weight)
+    for head in (head_a, head_b):
+        backbone.zero_grad(set_to_none=True)
+        head.zero_grad(set_to_none=True)
+        out = head(backbone(x)).sum()
+        out.backward()
+        assert backbone.weight.grad is not None
+        manual_grads = manual_grads + backbone.weight.grad.detach().clone()
+
+    # Joint accumulation: zero backbone once, run both backwards back-to-back,
+    # zero each head between calls but NOT the backbone.
+    backbone.zero_grad(set_to_none=True)
+    for head in (head_a, head_b):
+        head.zero_grad(set_to_none=True)
+        out = head(backbone(x)).sum()
+        out.backward()
+
+    assert backbone.weight.grad is not None
+    assert torch.allclose(backbone.weight.grad, manual_grads, atol=1e-6), (
+        "synchronized backbone grad must equal sum of single-task grads"
+    )
