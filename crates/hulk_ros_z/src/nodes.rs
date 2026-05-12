@@ -11,6 +11,7 @@ pub mod field_border_detection;
 pub mod game_controller_filter;
 pub mod game_controller_state_filter;
 pub mod ground_provider;
+pub mod hardware_interface;
 pub mod head_motion;
 pub mod image_receiver;
 pub mod image_segmenter;

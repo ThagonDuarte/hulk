@@ -64,6 +64,7 @@ types = { workspace = true }
 vision = { workspace = true }
 walking_inference = { workspace = true }
 world_state = { workspace = true }
+x5_receiver = { workspace = true }
 zenoh = { workspace = true }
 
 [build-dependencies]

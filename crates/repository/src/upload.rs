@@ -56,5 +56,5 @@ pub fn get_hulk_binary(profile: &str) -> String {
         other => other,
     };
 
-    format!("target/aarch64-unknown-linux-gnu/{profile_directory}/hulk_booster")
+    format!("target/aarch64-unknown-linux-gnu/{profile_directory}/hulk_ros_z")
 }

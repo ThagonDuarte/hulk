@@ -5001,6 +5001,7 @@ dependencies = [
  "vision",
  "walking_inference",
  "world_state",
+ "x5_receiver",
  "zenoh",
 ]
 
@@ -5182,6 +5183,7 @@ dependencies = [
  "ball_filter",
  "booster",
  "booster_sdk",
+ "cdr",
  "clap",
  "color-eyre",
  "coordinate_systems",
@@ -5189,6 +5191,7 @@ dependencies = [
  "hsl_network_messages",
  "kinematics",
  "linear_algebra",
+ "log",
  "nalgebra",
  "ndarray",
  "projection",
@@ -5198,6 +5201,8 @@ dependencies = [
  "tokio",
  "tracing-subscriber",
  "types",
+ "x5_receiver",
+ "zenoh",
 ]
 
 [[package]]
@@ -12995,6 +13000,17 @@ dependencies = [
  "rusticata-macros",
  "thiserror 2.0.18",
  "time",
+]
+
+[[package]]
+name = "x5_receiver"
+version = "0.1.0"
+dependencies = [
+ "futures-util",
+ "log",
+ "ros2",
+ "tokio",
+ "tokio-util",
 ]
 
 [[package]]

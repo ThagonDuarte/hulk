@@ -50,12 +50,12 @@ use types::{
     samples::Samples,
     step::Step,
 };
+use x5_receiver::receiver::X5Receiver;
 
 use crate::{
     HardwareInterface,
     latest_receiver::{LatestReceiver, LatestSender, latest_channel},
     microphones::{self, Microphones},
-    x5_receiver::X5Receiver,
 };
 use zenoh::{
     Session,

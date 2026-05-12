@@ -13,7 +13,7 @@ struct Args {
     robot: String,
     #[arg(long)]
     location: String,
-    #[arg(long, default_value = "parameter/ros_z")]
+    #[arg(long, default_value = "parameters/ros_z")]
     parameter_root: PathBuf,
     #[arg(long)]
     router: Option<String>,
@@ -155,6 +155,7 @@ async fn spawn_all(ctx: Arc<Context>) -> Result<RunningStack> {
     join_set.spawn(nodes::safe_pose_checker::run(ctx.clone()));
     join_set.spawn(nodes::search_suggestor::run(ctx.clone()));
     join_set.spawn(nodes::segment_filter::run(ctx.clone()));
+    join_set.spawn(nodes::hardware_interface::run(ctx.clone()));
     join_set.spawn(nodes::sensor_data_receiver::run(ctx.clone()));
     join_set.spawn(nodes::stand_up::run(ctx.clone()));
     join_set.spawn(nodes::team_ball_receiver::run(ctx.clone()));
