@@ -12,7 +12,13 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Iterable, Iterator, Sized
+from pathlib import Path
 from typing import Any, Protocol
+
+from ultralytics.cfg import get_cfg
+from ultralytics.data.build import build_dataloader, build_yolo_dataset
+from ultralytics.data.utils import check_det_dataset
+from ultralytics.utils import DEFAULT_CFG_DICT
 
 from utils.model_naming import TaskType
 
@@ -90,3 +96,66 @@ class _CyclingIterator:
             )
             self._iter = iter(self._loader)
             return next(self._iter)
+
+
+# ---------------------------------------------------------------------------
+# Per-task dataloader factory
+# ---------------------------------------------------------------------------
+
+
+def build_task_dataloader(
+    task: TaskType,
+    dataset_yaml: Path,
+    *,
+    imgsz: int,
+    batch: int,
+    workers: int,
+    stride: int = 32,
+    mode: str = "train",
+    rect: bool = False,
+    overrides: dict[str, Any] | None = None,
+) -> tuple[Any, Any]:
+    """Build a YOLO dataloader for a single task YAML.
+
+    Returns ``(loader, dataset)``. The caller can read `len(loader)` for the
+    step count and `len(dataset)` for diagnostics. The loader is the standard
+    Ultralytics ``InfiniteDataLoader`` so iteration/restart semantics match
+    `BaseTrainer`.
+    """
+    base_overrides: dict[str, Any] = {
+        **DEFAULT_CFG_DICT,
+        "task": _ultralytics_task_name(task),
+        "imgsz": imgsz,
+        "batch": batch,
+        "workers": workers,
+        "mode": mode,
+        "rect": rect,
+        "data": str(dataset_yaml),
+    }
+    if overrides:
+        base_overrides.update(overrides)
+    args = get_cfg(overrides=base_overrides)
+
+    data = check_det_dataset(str(dataset_yaml))
+    img_path = (
+        data["train"] if mode == "train" else data.get("val", data["train"])
+    )
+
+    dataset = build_yolo_dataset(
+        args, img_path, batch, data, mode=mode, rect=rect, stride=stride
+    )
+    loader = build_dataloader(
+        dataset, batch, workers, shuffle=(mode == "train"), rank=-1
+    )
+    return loader, dataset
+
+
+_TASK_TO_ULTRALYTICS_NAME: dict[TaskType, str] = {
+    TaskType.OBJECT: "detect",
+    TaskType.POSE: "pose",
+    TaskType.SEGMENTATION: "segment",
+}
+
+
+def _ultralytics_task_name(task: TaskType) -> str:
+    return _TASK_TO_ULTRALYTICS_NAME[task]
