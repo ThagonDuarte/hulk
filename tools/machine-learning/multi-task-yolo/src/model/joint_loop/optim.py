@@ -2,11 +2,21 @@
 
 from __future__ import annotations
 
+import copy
+import math
 import re
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
+from dataclasses import dataclass
+from functools import partial
 from typing import Any
 
-from torch import nn
+import torch
+from torch import nn, optim
+from ultralytics.optim.muon import MuSGD
+
+from model.hydra import Hydra
+from model.joint_loop.weighting import UncertaintyWeighter
+from utils.model_naming import TaskType
 
 # Norm layer types - same probe Ultralytics' BaseTrainer uses.
 _BN_TYPES: tuple[type, ...] = tuple(
@@ -102,9 +112,7 @@ def build_param_groups(
         named = group.pop("params")
         p1 = [p for k, p in named.items() if pattern.search(k)]
         p2 = [p for k, p in named.items() if not pattern.search(k)]
-        # boosted (lr*3)
         boosted.append({**group, "params": p1, "lr": lr * 3})
-        # baseline (lr*1)
         boosted.append({**group, "params": p2})
     return boosted
 
@@ -123,3 +131,166 @@ def parameters_in_optimizer(opt: Any) -> Iterable[nn.Parameter]:
     """Flatten an optimizer's param groups into an iterable of parameters."""
     for group in opt.param_groups:
         yield from group["params"]
+
+
+# ---------------------------------------------------------------------------
+# Joint optimizer / scheduler / EMA / AMP wiring
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class JointOptimizers:
+    backbone: optim.Optimizer
+    heads: dict[TaskType, optim.Optimizer]
+    log_var: optim.Optimizer
+
+    def all(self) -> list[optim.Optimizer]:
+        return [self.backbone, *self.heads.values(), self.log_var]
+
+
+def _instantiate_optimizer(
+    name: str, groups: list[dict[str, Any]]
+) -> optim.Optimizer:
+    if name == "MuSGD":
+        return MuSGD(params=groups, muon=0.2, sgd=1.0)
+    if not hasattr(optim, name):
+        raise NotImplementedError(f"unsupported optimizer: {name!r}")
+    return getattr(optim, name)(groups)
+
+
+def head_last_layer_index(hydra: Hydra, task: TaskType) -> int:
+    """Index of the head's final module within the full network."""
+    head = hydra.heads[str(task)]
+    return hydra.backbone_length + len(head) - 1
+
+
+def build_joint_optimizers(
+    hydra: Hydra,
+    weighter: UncertaintyWeighter,
+    *,
+    optimizer_name: str,
+    lr_backbone: float,
+    lr_heads: float,
+    lr_logvar: float,
+    momentum: float,
+    weight_decay: float,
+) -> JointOptimizers:
+    """Build the per-module optimizer set per the spec (Section 7.2).
+
+    `opt_logvar` is always AdamW (Newton-Schulz needs ndim >= 2).
+    """
+    backbone_groups = build_param_groups(
+        hydra.shared_backbone,
+        optimizer_name=optimizer_name,
+        lr=lr_backbone,
+        momentum=momentum,
+        decay=weight_decay,
+        # The backbone has no cv3 final-layer to boost; pass an unmatchable
+        # index so the regex never fires for the backbone module.
+        head_last_layer_index=-1,
+    )
+    opt_backbone = _instantiate_optimizer(optimizer_name, backbone_groups)
+
+    heads: dict[TaskType, optim.Optimizer] = {}
+    for task_str, head_module in hydra.heads.items():
+        task = TaskType(task_str)
+        groups = build_param_groups(
+            head_module,
+            optimizer_name=optimizer_name,
+            lr=lr_heads,
+            momentum=momentum,
+            decay=weight_decay,
+            head_last_layer_index=head_last_layer_index(hydra, task),
+        )
+        heads[task] = _instantiate_optimizer(optimizer_name, groups)
+
+    opt_logvar = optim.AdamW([weighter.log_var], lr=lr_logvar, weight_decay=0.0)
+    return JointOptimizers(
+        backbone=opt_backbone, heads=heads, log_var=opt_logvar
+    )
+
+
+def build_schedulers(
+    optimizers: JointOptimizers,
+    *,
+    epochs: int,
+    warmup_epochs: int,
+) -> list[optim.lr_scheduler.LRScheduler]:
+    schedulers: list[optim.lr_scheduler.LRScheduler] = []
+    for opt in optimizers.all():
+        warmup = optim.lr_scheduler.LambdaLR(
+            opt,
+            lr_lambda=partial(_warmup_factor, warmup=max(warmup_epochs, 1)),
+        )
+        cosine = optim.lr_scheduler.CosineAnnealingLR(opt, T_max=epochs)
+        schedulers.append(optim.lr_scheduler.ChainedScheduler([warmup, cosine]))
+    return schedulers
+
+
+def _warmup_factor(epoch: int, *, warmup: int) -> float:
+    if epoch >= warmup:
+        return 1.0
+    return float(epoch + 1) / float(warmup)
+
+
+class EMAHydra:
+    """Exponential moving average of a Hydra + UncertaintyWeighter pair.
+
+    Decay schedule matches Ultralytics' `ModelEMA`:
+
+        decay(step) = 0.9999 * (1 - exp(-step / 2000))
+    """
+
+    def __init__(
+        self,
+        hydra: Hydra,
+        weighter: UncertaintyWeighter,
+        *,
+        max_decay: float = 0.9999,
+        warmup: float = 2000.0,
+    ) -> None:
+        self.hydra = copy.deepcopy(hydra).eval()
+        self.weighter = copy.deepcopy(weighter).eval()
+        for p in self.hydra.parameters():
+            p.requires_grad_(requires_grad=False)
+        for p in self.weighter.parameters():
+            p.requires_grad_(requires_grad=False)
+        self._max_decay = max_decay
+        self._warmup = warmup
+        self.updates = 0
+
+    def decay(self) -> float:
+        return self._max_decay * (1.0 - math.exp(-self.updates / self._warmup))
+
+    @torch.no_grad()
+    def update(self, hydra: Hydra, weighter: UncertaintyWeighter) -> None:
+        self.updates += 1
+        d = self.decay()
+        for ema_p, p in zip(
+            self.hydra.parameters(), hydra.parameters(), strict=True
+        ):
+            ema_p.mul_(d).add_(p.detach(), alpha=1.0 - d)
+        for ema_p, p in zip(
+            self.weighter.parameters(),
+            weighter.parameters(),
+            strict=True,
+        ):
+            ema_p.mul_(d).add_(p.detach(), alpha=1.0 - d)
+
+    def state_dict(self) -> dict[str, Any]:
+        return {
+            "updates": self.updates,
+            "hydra": self.hydra.state_dict(),
+            "weighter": self.weighter.state_dict(),
+        }
+
+    def load_state_dict(self, state: Mapping[str, Any]) -> None:
+        self.updates = int(state["updates"])
+        self.hydra.load_state_dict(state["hydra"])
+        self.weighter.load_state_dict(state["weighter"])
+
+
+def make_amp_scaler(
+    *, enabled: bool, device_type: str = "cuda"
+) -> torch.amp.GradScaler:
+    return torch.amp.GradScaler(device_type, enabled=enabled)

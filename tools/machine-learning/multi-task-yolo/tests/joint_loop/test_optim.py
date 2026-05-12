@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import pytest
 from torch import nn
 
 from model.joint_loop.optim import build_param_groups
@@ -87,3 +88,11 @@ def test_cv3_x3_sub_split_with_parameterized_index() -> None:
     assert any(id(p) in {id(q) for q in boosted_params} for p in cv3_params), (
         "cv3 params under layer index 5 should land in the lr*3 sub-group"
     )
+
+
+def test_warmup_factor_clamps_to_one() -> None:
+    from model.joint_loop.optim import _warmup_factor
+
+    assert _warmup_factor(0, warmup=3) == pytest.approx(1.0 / 3.0)
+    assert _warmup_factor(2, warmup=3) == pytest.approx(1.0)
+    assert _warmup_factor(99, warmup=3) == pytest.approx(1.0)
