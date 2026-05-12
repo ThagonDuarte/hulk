@@ -17,6 +17,7 @@ import click
 import numpy as np
 import torch
 import wandb
+from ultralytics.utils.torch_utils import select_device
 from wonderwords import RandomWord
 
 from model.hydra import Hydra
@@ -77,21 +78,6 @@ def _seed_everything(seed: int) -> None:
         torch.cuda.manual_seed_all(seed)
 
 
-def _select_device(device_str: str) -> torch.device:
-    if device_str in {"-1", "cpu"}:
-        return torch.device("cpu")
-    if (
-        device_str.startswith("cuda")
-        or device_str.isdigit()
-        or "," in device_str
-    ):
-        first = device_str.split(",")[0]
-        if first == "cuda":
-            return torch.device("cuda")
-        return torch.device(f"cuda:{int(first)}")
-    return torch.device(device_str)
-
-
 @click.command(
     context_settings={"help_option_names": ["-h", "--help"]},
     help="Joint multi-task training of a Hydra model.",
@@ -108,7 +94,7 @@ def _select_device(device_str: str) -> torch.device:
 @click.option("--assets_dir", default=Path("assets"), type=Path)
 @click.option("--runs_dir", default=Path("runs"), type=Path)
 @click.option("--joint_train_dir", default=Path("joint_train"), type=Path)
-@click.option("--device", default="0", type=str)
+@click.option("--device", default="-1", type=str)
 @click.option("--workers", default=8, type=int)
 @click.option("--seed", default=0, type=int)
 @click.option("--epochs", default=100, type=int)
@@ -206,7 +192,7 @@ def main(
 
     backbone_path = assets_dir / (hydra_model_name.backbone.name + ".pt")
     hydra = Hydra(backbone_path=str(backbone_path), task_dict=task_dict)
-    selected_device = _select_device(device)
+    selected_device = select_device(device)
 
     loaders = {}
     for task, dataset_yaml in datasets_per_task.items():
