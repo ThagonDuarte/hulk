@@ -65,6 +65,7 @@ class JointTrainConfig:
     init_log_var: dict[TaskType, float] = field(default_factory=dict)
     task_weights: dict[TaskType, float] = field(default_factory=dict)
     hyp: JointLossHyp = field(default_factory=JointLossHyp)
+    max_steps_per_epoch: int | None = None  # cap steps; useful for smoke tests
 
 
 class _Patience:
@@ -272,7 +273,8 @@ def _train_one_epoch(
         ):
             feat, y_backbone = hydra.run_backbone(batch_on_device["img"])
             pred = hydra.run_head(str(task), feat, y_backbone)
-            loss_total, _components = criteria[task](pred, batch_on_device)
+            loss_vector, _components = criteria[task](pred, batch_on_device)
+            loss_total = loss_vector.sum()
             weighted = weighter.weight_single(task, loss_total)
 
         scaler.scale(weighted).backward()
@@ -301,33 +303,60 @@ def _train_one_epoch(
             if ema is not None:
                 ema.update(hydra, weighter)
 
-            if (step // len(tasks)) % config.log_interval == 0 and wandb_run:
-                lr_log = {
-                    "lr/backbone": optimizers.backbone.param_groups[0]["lr"],
-                    "lr/logvar": optimizers.log_var.param_groups[0]["lr"],
-                    **{
-                        f"lr/heads_{t}": opt.param_groups[0]["lr"]
-                        for t, opt in optimizers.heads.items()
-                    },
-                }
-                losses_log = {
-                    f"loss/{t}": v.item() for t, v in per_task_losses.items()
-                }
-                logvar_log = {
-                    f"logvar/{t}": weighter.log_var[
-                        weighter.tasks.index(t)
-                    ].item()
-                    for t in tasks
-                }
-                wandb.log(
-                    {
-                        "epoch": epoch,
-                        "step": step // len(tasks),
-                        **lr_log,
-                        **losses_log,
-                        **logvar_log,
-                    }
-                )
+            _log_wandb_step(
+                step=step // len(tasks),
+                epoch=epoch,
+                config=config,
+                optimizers=optimizers,
+                weighter=weighter,
+                tasks=tasks,
+                per_task_losses=per_task_losses,
+                wandb_run=wandb_run,
+            )
+
+            if (
+                config.max_steps_per_epoch is not None
+                and step // len(tasks) >= config.max_steps_per_epoch
+            ):
+                break
+
+
+def _log_wandb_step(
+    *,
+    step: int,
+    epoch: int,
+    config: JointTrainConfig,
+    optimizers: JointOptimizers,
+    weighter: UncertaintyWeighter,
+    tasks: list[TaskType],
+    per_task_losses: dict[TaskType, torch.Tensor],
+    wandb_run: Any,
+) -> None:
+    """Emit per-step metrics to W&B if interval matches and run is active."""
+    if step % config.log_interval != 0 or not wandb_run:
+        return
+    lr_log = {
+        "lr/backbone": optimizers.backbone.param_groups[0]["lr"],
+        "lr/logvar": optimizers.log_var.param_groups[0]["lr"],
+        **{
+            f"lr/heads_{t}": opt.param_groups[0]["lr"]
+            for t, opt in optimizers.heads.items()
+        },
+    }
+    losses_log = {f"loss/{t}": v.item() for t, v in per_task_losses.items()}
+    logvar_log = {
+        f"logvar/{t}": weighter.log_var[weighter.tasks.index(t)].item()
+        for t in tasks
+    }
+    wandb.log(
+        {
+            "epoch": epoch,
+            "step": step,
+            **lr_log,
+            **losses_log,
+            **logvar_log,
+        }
+    )
 
 
 def _move_batch_to_device(

@@ -21,7 +21,7 @@ ASSETS_DIR = Path("assets")
 COCO_YAML = ASSETS_DIR / "datasets" / "coco.yaml"
 # dataset root declared inside coco.yaml; val split must be present for the
 # dataloader to succeed without attempting a privileged download
-_COCO_VAL_TXT = Path("/opt/data/coco/val2017.txt")
+_COCO_VAL_TXT = ASSETS_DIR / "datasets" / "coco" / "val2017.txt"
 
 pytestmark = pytest.mark.skipif(
     not (
@@ -80,6 +80,7 @@ def test_smoke_two_epochs(tmp_path: Path) -> None:
         use_amp=False,
         use_ema=False,
         hyp=JointLossHyp(epochs=2),
+        max_steps_per_epoch=5,
     )
     run_dir = tmp_path / "joint_train" / "smoke~test"
     runs_dir = tmp_path
