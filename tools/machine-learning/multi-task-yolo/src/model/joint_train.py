@@ -78,50 +78,56 @@ def _seed_everything(seed: int) -> None:
         torch.cuda.manual_seed_all(seed)
 
 
+def option(*args: object, **kwargs: object) -> object:
+    """click.option wrapper that sets show_default=True on every option."""
+    kwargs.setdefault("show_default", True)
+    return click.option(*args, **kwargs)
+
+
 @click.command(
     context_settings={"help_option_names": ["-h", "--help"]},
     help="Joint multi-task training of a Hydra model.",
 )
-@click.option(
+@option(
     "--hydra_model_name",
     required=True,
     type=HYDRA_MODEL_NAME_TYPE,
     help="Hydra model spec, e.g. yolo26m=f11+yolo26m-pose+yolo26m-seg.",
 )
-@click.option("--object_dataset_name", default="coco.yaml", type=Path)
-@click.option("--pose_dataset_name", default="coco-pose.yaml", type=Path)
-@click.option("--segmentation_dataset_name", default="coco.yaml", type=Path)
-@click.option("--assets_dir", default=Path("assets"), type=Path)
-@click.option("--runs_dir", default=Path("runs"), type=Path)
-@click.option("--joint_train_dir", default=Path("joint_train"), type=Path)
-@click.option("--device", default="-1", type=str)
-@click.option("--workers", default=8, type=int)
-@click.option("--seed", default=0, type=int)
-@click.option("--epochs", default=100, type=int)
-@click.option("--patience", default=30, type=int)
-@click.option("--warmup_epochs", default=3, type=int)
-@click.option("--val_interval", default=1, type=int)
-@click.option("--batch", default=16, type=int)
-@click.option("--imgsz", default=640, type=int)
-@click.option("--lr_backbone", default=0.001, type=float)
-@click.option("--lr_heads", default=0.01, type=float)
-@click.option("--lr_logvar", default=0.001, type=float)
-@click.option("--momentum", default=0.9, type=float)
-@click.option("--weight_decay", default=1e-5, type=float)
-@click.option("--max_grad_norm", default=10.0, type=float)
-@click.option(
+@option("--object_dataset_name", default="coco.yaml", type=Path)
+@option("--pose_dataset_name", default="coco-pose.yaml", type=Path)
+@option("--segmentation_dataset_name", default="coco.yaml", type=Path)
+@option("--assets_dir", default=Path("assets"), type=Path)
+@option("--runs_dir", default=Path("runs"), type=Path)
+@option("--joint_train_dir", default=Path("joint_train"), type=Path)
+@option("--device", default="-1", type=str)
+@option("--workers", default=8, type=int)
+@option("--seed", default=42, type=int)
+@option("--epochs", default=100, type=int)
+@option("--patience", default=30, type=int)
+@option("--warmup_epochs", default=3, type=int)
+@option("--val_interval", default=1, type=int)
+@option("--batch", default=16, type=int)
+@option("--imgsz", default=640, type=int)
+@option("--lr_backbone", default=0.001, type=float)
+@option("--lr_heads", default=0.01, type=float)
+@option("--lr_logvar", default=0.001, type=float)
+@option("--momentum", default=0.9, type=float)
+@option("--weight_decay", default=1e-5, type=float)
+@option("--max_grad_norm", default=10.0, type=float)
+@option(
     "--optimizer",
     type=click.Choice(["MuSGD", "AdamW"], case_sensitive=False),
     default="MuSGD",
 )
-@click.option("--init_log_var", multiple=True, type=str)
-@click.option("--task_weight", multiple=True, type=str)
-@click.option("--amp/--no_amp", default=True)
-@click.option("--ema/--no_ema", default=True)
-@click.option("--clip_heads", is_flag=True, default=False)
-@click.option("--resume", is_flag=True, default=False)
-@click.option("--log_interval", default=50, type=int)
-@click.option("--wandb_project", default="multi-task-yolo", type=str)
+@option("--init_log_var", multiple=True, type=str)
+@option("--task_weight", multiple=True, type=str)
+@option("--amp/--no_amp", default=True)
+@option("--ema/--no_ema", default=True)
+@option("--clip_heads", is_flag=True, default=False)
+@option("--resume", is_flag=True, default=False)
+@option("--log_interval", default=50, type=int)
+@option("--wandb_project", default="multi-task-yolo", type=str)
 def main(
     *,
     hydra_model_name: HydraModelName,
