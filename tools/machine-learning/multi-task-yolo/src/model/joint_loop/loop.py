@@ -110,6 +110,10 @@ def train_joint(
     Per-task `.pt` files land in `<run_dir>/<task>/last.pt` and `best.pt`.
     """
     hydra.to(device)
+    # Ensure all parameters are trainable; YOLO checkpoints may load some
+    # layers with requires_grad=False from single-task fine-tuning.
+    for p in hydra.parameters():
+        p.requires_grad_(requires_grad=True)
     tasks: list[TaskType] = sorted(
         (TaskType(k) for k in hydra.heads), key=lambda t: t.value
     )
@@ -239,6 +243,47 @@ def train_joint(
             break
 
 
+def _step_all_optimizers(
+    *,
+    optimizers: JointOptimizers,
+    scaler: torch.amp.GradScaler,
+    hydra: Hydra,
+    config: JointTrainConfig,
+) -> None:
+    """Unscale, clip, and step all optimizers, then update the GradScaler.
+
+    GradScaler.step() asserts that unscale_() recorded at least one gradient.
+    Optimizers whose parameter groups all have grad=None (e.g. when the backbone
+    was loaded with requires_grad=False) are stepped directly to avoid that
+    assertion. Fix 1 (requires_grad_(True) in train_joint) prevents this in
+    normal usage; this is a belt-and-suspenders guard.
+    """
+    with_grads = {
+        id(o): any(
+            p.grad is not None for g in o.param_groups for p in g["params"]
+        )
+        for o in optimizers.all()
+    }
+    for o in optimizers.all():
+        if with_grads[id(o)]:
+            scaler.unscale_(o)
+    clip_grad_norm_(
+        hydra.shared_backbone.parameters(), max_norm=config.max_grad_norm
+    )
+    if config.clip_heads:
+        for o in optimizers.heads.values():
+            clip_grad_norm_(
+                list(parameters_in_optimizer(o)),
+                max_norm=config.max_grad_norm,
+            )
+    for o in optimizers.all():
+        if with_grads[id(o)]:
+            scaler.step(o)
+        else:
+            o.step()
+    scaler.update()
+
+
 def _train_one_epoch(
     *,
     hydra: Hydra,
@@ -282,24 +327,12 @@ def _train_one_epoch(
 
         step += 1  # noqa: SIM113
         if step % len(tasks) == 0:
-            scaler.unscale_(optimizers.backbone)
-            clip_grad_norm_(
-                hydra.shared_backbone.parameters(),
-                max_norm=config.max_grad_norm,
+            _step_all_optimizers(
+                optimizers=optimizers,
+                scaler=scaler,
+                hydra=hydra,
+                config=config,
             )
-            for opt in optimizers.all():
-                if opt is optimizers.backbone:
-                    # backbone already unscaled above; skip redundant unscale
-                    scaler.step(opt)
-                else:
-                    scaler.unscale_(opt)
-                    if config.clip_heads and opt in optimizers.heads.values():
-                        clip_grad_norm_(
-                            list(parameters_in_optimizer(opt)),
-                            max_norm=config.max_grad_norm,
-                        )
-                    scaler.step(opt)
-            scaler.update()
             if ema is not None:
                 ema.update(hydra, weighter)
 
