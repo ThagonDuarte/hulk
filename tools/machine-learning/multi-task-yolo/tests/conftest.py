@@ -1,9 +1,11 @@
 """Shared pytest fixtures for the multi-task YOLO test suite."""
+
 from __future__ import annotations
 
 from pathlib import Path
 
 import pytest
+
 
 @pytest.fixture
 def tmp_run_dir(tmp_path: Path) -> Path:
