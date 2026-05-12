@@ -22,6 +22,8 @@
 - Hydra ONNX/TorchScript export help: `uv run -m utils.export_hydra --help`
 - Single-task training CLI help: `uv run python src/model/train.py --help`
 - Backbone-swap CLI help: `uv run python src/model/cross.py --help`
+- Joint training CLI help: `uv run python src/model/joint_train.py --help`
+- Run the joint-training test suite: `uv run pytest tests/`
 
 ## Code Layout (what actually runs)
 
@@ -33,6 +35,8 @@
 - `src/utils/export_hydra.py`: Click CLI that wraps a `Hydra` model in `HydraWrapper` / `HydraNv12Wrapper` (optionally prepending NV12 preprocessing) and exports it to ONNX or TorchScript.
 - `src/utils/model_naming.py`: defines `TaskType` (object/pose/segmentation) and `ModelName` helpers, including ONNX `output_specs()` / `output_names()` used by exports.
 - `src/utils/nv12_to_rgb.py`: `NV12ToRgb` `nn.Module` that converts NV12 byte tensors to RGB, with optional chroma subsample mode.
+- `src/model/joint_train.py`: Click CLI for joint multi-task finetuning of a Hydra model. Drives the engine in `src/model/joint_loop/`.
+- `src/model/joint_loop/`: package hosting the joint training engine (`loop.py`, `dataloaders.py`, `criteria.py`, `weighting.py`, `optim.py`, `validation.py`, `checkpoints.py`).
 
 ## Repo-Specific Gotchas
 
@@ -44,3 +48,7 @@
 - `src/model/cross.py` is argparse-based (unlike most other entrypoints, which use Click) and defaults to `assets/yolo26m.pt` for the backbone and `assets/yolo26m-pose.pt` for both the head and the output, so it will overwrite the head checkpoint in-place if `--output` is left as default.
 - `src/utils/export_hydra.py` infers task selection from filename prefixes via `utils.model_naming.ModelName.task_type()` (`yolo26m-pose` → pose, `yolo26m-seg` → segmentation, otherwise object detection), so the model filename matters for export wiring.
 - Large/generated artifacts are intentionally ignored (`runs/`, `assets/datasets/`, `assets/output/`, most `*.pt` weights).
+- `src/model/joint_train.py` is a separate engine from `src/model/train.py`; it owns a custom PyTorch loop with synchronized cross-task gradient accumulation. It deliberately does not use `YOLO().train()`.
+- `Hydra.forward()` flattens head outputs into a `<task>_output` dict for export/inference; for training, use `Hydra.run_backbone()` + `Hydra.run_head()` (raw, non-flattened) which `E2ELoss.parse_output()` expects.
+- The MuSGD cv3/proto LR boost regex in `model.joint_loop.optim.build_param_groups` is parameterized by head-last-layer index, not hardcoded to `23` — non-yolo26m scales work transparently.
+- `tests/` is run via `uv run pytest tests/`; `pyproject.toml` includes a `[tool.pytest.ini_options]` block with `pythonpath = ["src"]`.
