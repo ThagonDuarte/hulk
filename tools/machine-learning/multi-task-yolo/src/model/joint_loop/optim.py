@@ -216,21 +216,34 @@ def build_schedulers(
     epochs: int,
     warmup_epochs: int,
 ) -> list[optim.lr_scheduler.LRScheduler]:
+    """Build per-optimizer LR schedulers (linear warmup + cosine decay).
+
+    ``LambdaLR`` calls ``step()`` on construction (last_epoch -1 → 0), so
+    the warmup factor is applied to the optimizer before epoch-0 training.
+    """
     schedulers: list[optim.lr_scheduler.LRScheduler] = []
     for opt in optimizers.all():
-        warmup = optim.lr_scheduler.LambdaLR(
+        sched = optim.lr_scheduler.LambdaLR(
             opt,
-            lr_lambda=partial(_warmup_factor, warmup=max(warmup_epochs, 1)),
+            lr_lambda=partial(
+                _lr_schedule, warmup=max(warmup_epochs, 1), total=epochs
+            ),
         )
-        cosine = optim.lr_scheduler.CosineAnnealingLR(opt, T_max=epochs)
-        schedulers.append(optim.lr_scheduler.ChainedScheduler([warmup, cosine]))
+        schedulers.append(sched)
     return schedulers
 
 
-def _warmup_factor(epoch: int, *, warmup: int) -> float:
-    if epoch >= warmup:
-        return 1.0
-    return float(epoch + 1) / float(warmup)
+def _lr_schedule(epoch: int, *, warmup: int, total: int) -> float:
+    """Linear warmup (epochs 0..warmup-1) then cosine decay to 0.
+
+    ``ChainedScheduler([LambdaLR, CosineAnnealingLR])`` does NOT compose —
+    the cosine scheduler overwrites the warmup LR on every step.  A single
+    ``LambdaLR`` with this combined function is the correct approach.
+    """
+    if epoch < warmup:
+        return (epoch + 1) / warmup
+    progress = (epoch - warmup) / max(total - warmup, 1)
+    return 0.5 * (1.0 + math.cos(math.pi * progress))
 
 
 class EMAHydra:

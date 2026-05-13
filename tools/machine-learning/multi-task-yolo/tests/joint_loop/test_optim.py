@@ -91,12 +91,16 @@ def test_cv3_x3_sub_split_with_parameterized_index() -> None:
     )
 
 
-def test_warmup_factor_clamps_to_one() -> None:
-    from model.joint_loop.optim import _warmup_factor
+def test_lr_schedule() -> None:
+    from model.joint_loop.optim import _lr_schedule
 
-    assert _warmup_factor(0, warmup=3) == pytest.approx(1.0 / 3.0)
-    assert _warmup_factor(2, warmup=3) == pytest.approx(1.0)
-    assert _warmup_factor(99, warmup=3) == pytest.approx(1.0)
+    # Linear warmup: factor ramps 1/warmup → 1.0
+    assert _lr_schedule(0, warmup=3, total=100) == pytest.approx(1.0 / 3.0)
+    assert _lr_schedule(1, warmup=3, total=100) == pytest.approx(2.0 / 3.0)
+    assert _lr_schedule(2, warmup=3, total=100) == pytest.approx(1.0)
+    # Cosine decay: immediately after warmup factor == 1.0; at end == 0.0
+    assert _lr_schedule(3, warmup=3, total=100) == pytest.approx(1.0)
+    assert _lr_schedule(100, warmup=3, total=100) == pytest.approx(0.0)
 
 
 def test_backbone_gradient_accumulation_invariant() -> None:
