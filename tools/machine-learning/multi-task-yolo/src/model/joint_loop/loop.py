@@ -17,6 +17,7 @@ import numpy as np
 import torch
 import wandb
 from torch.nn.utils import clip_grad_norm_
+from ultralytics.utils import TQDM
 
 from model.hydra import Hydra
 from model.joint_loop.checkpoints import (
@@ -156,6 +157,7 @@ def train_joint(
 
     for epoch in range(config.epochs):
         interleaved.set_epoch(epoch)
+        logger.info("epoch %d/%d", epoch + 1, config.epochs)
         _train_one_epoch(
             hydra=hydra,
             weighter=weighter,
@@ -284,6 +286,29 @@ def _step_all_optimizers(
     scaler.update()
 
 
+def _epoch_rounds(
+    interleaved: InterleavedTaskDataloader,
+    tasks: list[TaskType],
+    config: JointTrainConfig,
+) -> int | None:
+    """Total full gradient-update rounds in one epoch.
+
+    Capped by ``max_steps_per_epoch`` when set.
+    """
+    n = (
+        len(interleaved) // len(tasks)
+        if hasattr(interleaved, "__len__")
+        else None
+    )
+    if config.max_steps_per_epoch is not None:
+        return (
+            min(n, config.max_steps_per_epoch)
+            if n is not None
+            else config.max_steps_per_epoch
+        )
+    return n
+
+
 def _cast_to_fp32(
     pred: torch.Tensor | list[Any] | tuple[Any, ...],
 ) -> torch.Tensor | list[Any] | tuple[Any, ...]:
@@ -319,59 +344,72 @@ def _train_one_epoch(
     weighter.train()
 
     step = 0
-    for task, batch in interleaved:
-        if step % len(tasks) == 0:
-            for opt in optimizers.all():
-                opt.zero_grad(set_to_none=True)
-            per_task_losses: dict[TaskType, torch.Tensor] = {}
+    n_rounds = _epoch_rounds(interleaved, tasks, config)
+    with TQDM(total=n_rounds, desc=f"  epoch {epoch + 1}", unit="step") as pbar:
+        for task, batch in interleaved:
+            if step % len(tasks) == 0:
+                for opt in optimizers.all():
+                    opt.zero_grad(set_to_none=True)
+                per_task_losses: dict[TaskType, torch.Tensor] = {}
 
-        batch_on_device = _move_batch_to_device(batch, device)
+            batch_on_device = _move_batch_to_device(batch, device)
 
-        with torch.amp.autocast(
-            device_type=device.type,
-            dtype=torch.float16,
-            enabled=config.use_amp and device.type == "cuda",
-        ):
-            feat, y_backbone = hydra.run_backbone(batch_on_device["img"])
-            pred = hydra.run_head(str(task), feat, y_backbone)
-        # Loss runs outside autocast at fp32: PoseLoss26 uses a normalizing-flow
-        # (RLE) whose MultivariateNormal.log_prob produces NaN in fp16.
-        loss_vector, _components = criteria[task](
-            _cast_to_fp32(pred), batch_on_device
-        )
-        loss_total = loss_vector.sum()
-        weighted = weighter.weight_single(task, loss_total)
-
-        scaler.scale(weighted).backward()
-        per_task_losses[task] = loss_total.detach()
-
-        step += 1  # noqa: SIM113
-        if step % len(tasks) == 0:
-            _step_all_optimizers(
-                optimizers=optimizers,
-                scaler=scaler,
-                hydra=hydra,
-                config=config,
-            )
-            if ema is not None:
-                ema.update(hydra, weighter)
-
-            _log_wandb_step(
-                step=step // len(tasks),
-                epoch=epoch,
-                config=config,
-                optimizers=optimizers,
-                weighter=weighter,
-                tasks=tasks,
-                per_task_losses=per_task_losses,
-                wandb_run=wandb_run,
-            )
-
-            if (
-                config.max_steps_per_epoch is not None
-                and step // len(tasks) >= config.max_steps_per_epoch
+            with torch.amp.autocast(
+                device_type=device.type,
+                dtype=torch.float16,
+                enabled=config.use_amp and device.type == "cuda",
             ):
-                break
+                feat, y_backbone = hydra.run_backbone(batch_on_device["img"])
+                pred = hydra.run_head(str(task), feat, y_backbone)
+            # Loss outside autocast (fp32): PoseLoss26 uses a normalizing-flow
+            # (RLE) whose MultivariateNormal.log_prob produces NaN in fp16.
+            loss_vector, _components = criteria[task](
+                _cast_to_fp32(pred), batch_on_device
+            )
+            loss_total = loss_vector.sum()
+            weighted = weighter.weight_single(task, loss_total)
+
+            scaler.scale(weighted).backward()
+            per_task_losses[task] = loss_total.detach()
+
+            step += 1
+            if step % len(tasks) == 0:
+                _step_all_optimizers(
+                    optimizers=optimizers,
+                    scaler=scaler,
+                    hydra=hydra,
+                    config=config,
+                )
+                if ema is not None:
+                    ema.update(hydra, weighter)
+
+                mem = (
+                    f"{torch.cuda.memory_reserved() / 1e9:.3g}G"
+                    if device.type == "cuda"
+                    else ""
+                )
+                task_losses = {
+                    str(t): f"{per_task_losses[t].item():.3f}" for t in tasks
+                }
+                pbar.set_postfix(mem=mem, **task_losses)
+                pbar.update(1)
+
+                _log_wandb_step(
+                    step=step // len(tasks),
+                    epoch=epoch,
+                    config=config,
+                    optimizers=optimizers,
+                    weighter=weighter,
+                    tasks=tasks,
+                    per_task_losses=per_task_losses,
+                    wandb_run=wandb_run,
+                )
+
+                if (
+                    config.max_steps_per_epoch is not None
+                    and step // len(tasks) >= config.max_steps_per_epoch
+                ):
+                    break
 
 
 def _log_wandb_step(
