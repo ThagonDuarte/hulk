@@ -50,7 +50,7 @@ logger = logging.getLogger(__name__)
 class JointTrainConfig:
     epochs: int = 100
     patience: int = 30
-    warmup_epochs: int = 3
+    warmup_epochs: int = 10
     val_interval: int = 1
     log_interval: int = 50
     optimizer_name: str = "MuSGD"
@@ -62,7 +62,7 @@ class JointTrainConfig:
     max_grad_norm: float = 10.0
     use_amp: bool = True
     use_ema: bool = True
-    clip_heads: bool = False
+    clip_heads: bool = True
     init_log_var: dict[TaskType, float] = field(default_factory=dict)
     task_weights: dict[TaskType, float] = field(default_factory=dict)
     hyp: JointLossHyp = field(default_factory=JointLossHyp)
@@ -155,10 +155,11 @@ def train_joint(
         },
     )
 
+    global_step = 0
     for epoch in range(config.epochs):
         interleaved.set_epoch(epoch)
         logger.info("epoch %d/%d", epoch + 1, config.epochs)
-        _train_one_epoch(
+        global_step = _train_one_epoch(
             hydra=hydra,
             weighter=weighter,
             interleaved=interleaved,
@@ -171,6 +172,7 @@ def train_joint(
             config=config,
             epoch=epoch,
             wandb_run=wandb_run,
+            global_step=global_step,
         )
 
         epoch_update(criteria)
@@ -205,7 +207,8 @@ def train_joint(
                     "val/score": score,
                     **{f"val/{t}": v for t, v in per_task.items()},
                     "epoch": epoch,
-                }
+                },
+                step=global_step,
             )
 
         for task in tasks:
@@ -339,7 +342,8 @@ def _train_one_epoch(
     config: JointTrainConfig,
     epoch: int,
     wandb_run: Any | None,
-) -> None:
+    global_step: int,
+) -> int:
     hydra.train()
     weighter.train()
 
@@ -396,6 +400,7 @@ def _train_one_epoch(
 
                 _log_wandb_step(
                     step=step // len(tasks),
+                    global_step=global_step + step // len(tasks),
                     epoch=epoch,
                     config=config,
                     optimizers=optimizers,
@@ -410,11 +415,13 @@ def _train_one_epoch(
                     and step // len(tasks) >= config.max_steps_per_epoch
                 ):
                     break
+    return global_step + step // len(tasks)
 
 
 def _log_wandb_step(
     *,
     step: int,
+    global_step: int,
     epoch: int,
     config: JointTrainConfig,
     optimizers: JointOptimizers,
@@ -446,7 +453,8 @@ def _log_wandb_step(
             **lr_log,
             **losses_log,
             **logvar_log,
-        }
+        },
+        step=global_step,
     )
 
 
