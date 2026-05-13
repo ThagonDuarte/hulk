@@ -17,7 +17,7 @@ import click
 import numpy as np
 import torch
 import wandb
-from ultralytics.utils.torch_utils import select_device
+from ultralytics.utils.autodevice import GPUInfo
 from wonderwords import RandomWord
 
 from model.hydra import Hydra
@@ -82,6 +82,48 @@ def option(*args: object, **kwargs: object) -> object:
     """click.option wrapper that sets show_default=True on every option."""
     kwargs.setdefault("show_default", True)
     return click.option(*args, **kwargs)
+
+
+def _cuda_index_from_device_arg(raw: str) -> int:
+    if "," in raw:
+        msg = "joint_train supports a single CUDA device, not multi-GPU"
+        raise click.ClickException(msg)
+    if raw == "-1":
+        selected_ids = GPUInfo().select_idle_gpu(
+            count=1, min_memory_fraction=0.2
+        )
+        if not selected_ids:
+            msg = "no idle CUDA device met the auto-selection criteria"
+            raise click.ClickException(msg)
+        return selected_ids[0]
+    if raw in {"", "cuda"}:
+        return 0
+    if raw.isdigit():
+        return int(raw)
+    msg = f"invalid device {raw!r}; use cpu, mps, -1, or CUDA index"
+    raise click.ClickException(msg)
+
+
+def _select_training_device(device: str | torch.device) -> torch.device:
+    """Select one device without CUDA_VISIBLE_DEVICES remapping."""
+    if isinstance(device, torch.device):
+        selected = device
+    else:
+        raw = str(device).lower().replace("cuda:", "").strip()
+        if raw in {"cpu", "none"}:
+            return torch.device("cpu")
+        if raw in {"mps", "mps:0"}:
+            return torch.device("mps")
+        selected = torch.device(f"cuda:{_cuda_index_from_device_arg(raw)}")
+
+    if selected.type == "cuda":
+        idx = selected.index or 0
+        if not torch.cuda.is_available() or idx >= torch.cuda.device_count():
+            msg = f"CUDA device {idx} is not available"
+            raise click.ClickException(msg)
+        torch.cuda.set_device(idx)
+        logger.info("Using CUDA:%d (%s)", idx, torch.cuda.get_device_name(idx))
+    return selected
 
 
 @click.command(
@@ -196,9 +238,9 @@ def main(
             assets_dir,
         )
 
+    selected_device = _select_training_device(device)
     backbone_path = assets_dir / (hydra_model_name.backbone.name + ".pt")
     hydra = Hydra(backbone_path=str(backbone_path), task_dict=task_dict)
-    selected_device = select_device(device)
 
     loaders = {}
     for task, dataset_yaml in datasets_per_task.items():
