@@ -38,6 +38,19 @@ def test_steps_per_epoch_is_max_loader_len() -> None:
     assert len(iter_loader) == 5
 
 
+def test_epoch_rounds_matches_interleaved_steps_per_epoch() -> None:
+    from model.joint_loop.loop import JointTrainConfig, _epoch_rounds
+
+    loaders = {
+        TaskType.OBJECT: _FakeLoader("o", 3),
+        TaskType.POSE: _FakeLoader("p", 5),
+        TaskType.SEGMENTATION: _FakeLoader("s", 4),
+    }
+    iter_loader = InterleavedTaskDataloader(loaders)
+
+    assert _epoch_rounds(iter_loader, JointTrainConfig()) == 5
+
+
 def test_iteration_yields_one_batch_per_task_per_step() -> None:
     loaders = {
         TaskType.OBJECT: _FakeLoader("o", 3),

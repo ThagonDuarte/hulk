@@ -291,18 +291,13 @@ def _step_all_optimizers(
 
 def _epoch_rounds(
     interleaved: InterleavedTaskDataloader,
-    tasks: list[TaskType],
     config: JointTrainConfig,
 ) -> int | None:
     """Total full gradient-update rounds in one epoch.
 
     Capped by ``max_steps_per_epoch`` when set.
     """
-    n = (
-        len(interleaved) // len(tasks)
-        if hasattr(interleaved, "__len__")
-        else None
-    )
+    n = len(interleaved) if hasattr(interleaved, "__len__") else None
     if config.max_steps_per_epoch is not None:
         return (
             min(n, config.max_steps_per_epoch)
@@ -348,7 +343,7 @@ def _train_one_epoch(
     weighter.train()
 
     step = 0
-    n_rounds = _epoch_rounds(interleaved, tasks, config)
+    n_rounds = _epoch_rounds(interleaved, config)
     with TQDM(total=n_rounds, desc=f"  epoch {epoch + 1}", unit="step") as pbar:
         for task, batch in interleaved:
             if step % len(tasks) == 0:
