@@ -284,6 +284,22 @@ def _step_all_optimizers(
     scaler.update()
 
 
+def _cast_to_fp32(
+    pred: torch.Tensor | list[Any] | tuple[Any, ...],
+) -> torch.Tensor | list[Any] | tuple[Any, ...]:
+    """Recursively cast tensors to fp32.
+
+    PoseLoss26 uses a normalizing-flow (RLE) whose MultivariateNormal.log_prob
+    is numerically unstable in fp16; running the loss at full precision avoids
+    NaN regardless of AMP setting.
+    """
+    if isinstance(pred, torch.Tensor):
+        return pred.float()
+    if isinstance(pred, (list, tuple)):
+        return type(pred)(_cast_to_fp32(p) for p in pred)
+    return pred
+
+
 def _train_one_epoch(
     *,
     hydra: Hydra,
@@ -318,9 +334,13 @@ def _train_one_epoch(
         ):
             feat, y_backbone = hydra.run_backbone(batch_on_device["img"])
             pred = hydra.run_head(str(task), feat, y_backbone)
-            loss_vector, _components = criteria[task](pred, batch_on_device)
-            loss_total = loss_vector.sum()
-            weighted = weighter.weight_single(task, loss_total)
+        # Loss runs outside autocast at fp32: PoseLoss26 uses a normalizing-flow
+        # (RLE) whose MultivariateNormal.log_prob produces NaN in fp16.
+        loss_vector, _components = criteria[task](
+            _cast_to_fp32(pred), batch_on_device
+        )
+        loss_total = loss_vector.sum()
+        weighted = weighter.weight_single(task, loss_total)
 
         scaler.scale(weighted).backward()
         per_task_losses[task] = loss_total.detach()
