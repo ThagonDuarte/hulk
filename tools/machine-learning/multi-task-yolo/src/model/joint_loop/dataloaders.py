@@ -42,7 +42,11 @@ class InterleavedTaskDataloader:
     W&B run logs.
     """
 
-    def __init__(self, loaders: dict[TaskType, _SizedIterable]) -> None:
+    def __init__(
+        self,
+        loaders: dict[TaskType, _SizedIterable],
+        epoch_size_strategy: str | int = "max",
+    ) -> None:
         if not loaders:
             raise ValueError(  # noqa: TRY003
                 "InterleavedTaskDataloader requires at least one loader"
@@ -51,7 +55,24 @@ class InterleavedTaskDataloader:
         self._sorted_tasks: list[TaskType] = sorted(
             loaders.keys(), key=lambda t: t.value
         )
-        self._steps_per_epoch = max(len(loaders[t]) for t in self._sorted_tasks)
+        if isinstance(epoch_size_strategy, int):
+            if epoch_size_strategy <= 0:
+                raise ValueError(  # noqa: TRY003
+                    "epoch_size_strategy as an integer must be positive"
+                )
+            self._steps_per_epoch = epoch_size_strategy
+        elif epoch_size_strategy == "max":
+            self._steps_per_epoch = max(
+                len(loaders[t]) for t in self._sorted_tasks
+            )
+        elif epoch_size_strategy == "min":
+            self._steps_per_epoch = min(
+                len(loaders[t]) for t in self._sorted_tasks
+            )
+        else:
+            raise ValueError(  # noqa: TRY003
+                f"unsupported epoch_size_strategy: {epoch_size_strategy!r}"
+            )
 
     def __len__(self) -> int:
         return self._steps_per_epoch

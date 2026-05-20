@@ -170,6 +170,7 @@ def _select_training_device(device: str | torch.device) -> torch.device:
 @option("--resume", is_flag=True, default=False)
 @option("--log_interval", default=50, type=int)
 @option("--wandb_project", default="multi-task-yolo", type=str)
+@option("--epoch_size_strategy", default="max", type=str)
 def main(
     *,
     hydra_model_name: HydraModelName,
@@ -203,6 +204,7 @@ def main(
     resume: bool,
     log_interval: int,
     wandb_project: str,
+    epoch_size_strategy: str,
 ) -> None:
     logging.basicConfig(
         level=logging.INFO,
@@ -252,7 +254,11 @@ def main(
             workers=workers,
         )
         loaders[task] = loader
-    interleaved = InterleavedTaskDataloader(loaders)
+    parsed_strategy: str | int = (
+        int(epoch_size_strategy)
+        if epoch_size_strategy.isdigit()
+        else epoch_size_strategy
+    )
 
     config = JointTrainConfig(
         epochs=epochs,
@@ -273,6 +279,10 @@ def main(
         init_log_var=_parse_kv_floats(init_log_var),
         task_weights=_parse_kv_floats(task_weight),
         hyp=JointLossHyp(epochs=epochs),
+        epoch_size_strategy=parsed_strategy,
+    )
+    interleaved = InterleavedTaskDataloader(
+        loaders, epoch_size_strategy=config.epoch_size_strategy
     )
 
     wandb_run = wandb.init(project=wandb_project, name=run_id)

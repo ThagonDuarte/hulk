@@ -120,3 +120,41 @@ def test_set_epoch_tolerates_loaders_without_set_epoch() -> None:
 def test_empty_loaders_raises() -> None:
     with pytest.raises(ValueError):
         InterleavedTaskDataloader({})
+
+
+def test_epoch_size_strategy_max() -> None:
+    loaders = {
+        TaskType.OBJECT: _FakeLoader("o", 3),
+        TaskType.POSE: _FakeLoader("p", 7),
+    }
+    loader = InterleavedTaskDataloader(loaders, epoch_size_strategy="max")
+    assert len(loader) == 7
+
+
+def test_epoch_size_strategy_min() -> None:
+    loaders = {
+        TaskType.OBJECT: _FakeLoader("o", 3),
+        TaskType.POSE: _FakeLoader("p", 7),
+    }
+    loader = InterleavedTaskDataloader(loaders, epoch_size_strategy="min")
+    assert len(loader) == 3
+
+
+def test_epoch_size_strategy_integer() -> None:
+    loaders = {
+        TaskType.OBJECT: _FakeLoader("o", 3),
+        TaskType.POSE: _FakeLoader("p", 7),
+    }
+    loader = InterleavedTaskDataloader(loaders, epoch_size_strategy=12)
+    assert len(loader) == 12
+
+
+def test_epoch_size_strategy_invalid() -> None:
+    loaders = {
+        TaskType.OBJECT: _FakeLoader("o", 3),
+    }
+    with pytest.raises(ValueError, match="unsupported epoch_size_strategy"):
+        InterleavedTaskDataloader(loaders, epoch_size_strategy="invalid_strat")
+    
+    with pytest.raises(ValueError, match="must be positive"):
+        InterleavedTaskDataloader(loaders, epoch_size_strategy=0)

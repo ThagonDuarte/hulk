@@ -67,6 +67,7 @@ class JointTrainConfig:
     task_weights: dict[TaskType, float] = field(default_factory=dict)
     hyp: JointLossHyp = field(default_factory=JointLossHyp)
     max_steps_per_epoch: int | None = None  # cap steps; useful for smoke tests
+    epoch_size_strategy: str | int = "max"
 
 
 class _Patience:
