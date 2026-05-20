@@ -89,6 +89,37 @@ def test_cv3_x3_sub_split_with_parameterized_index() -> None:
     assert any(id(p) in {id(q) for q in boosted_params} for p in cv3_params), (
         "cv3 params under layer index 5 should land in the lr*3 sub-group"
     )
+class _FakeHeadWithCv3MultipleLayers(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.layer_5 = _Cv3Block()
+        self.layer_15 = _Cv3Block()
+
+
+def test_cv3_x3_sub_split_bounds_exact_index() -> None:
+    head = _FakeHeadWithCv3MultipleLayers()
+    groups = build_param_groups(
+        head,
+        optimizer_name="MuSGD",
+        lr=0.01,
+        momentum=0.9,
+        decay=1e-5,
+        head_last_layer_index=5,
+    )
+    boosted = [g for g in groups if g.get("lr", 0) == 0.03]
+    boosted_params = {id(p) for g in boosted for p in g["params"]}
+
+    # Layer 5 parameters should be boosted
+    layer_5_params = list(head.layer_5.cv3.parameters())
+    assert all(id(p) in boosted_params for p in layer_5_params), (
+        "layer_5 cv3 params should land in the lr*3 sub-group"
+    )
+
+    # Layer 15 parameters should NOT be boosted
+    layer_15_params = list(head.layer_15.cv3.parameters())
+    assert not any(id(p) in boosted_params for p in layer_15_params), (
+        "layer_15 cv3 params should NOT land in the lr*3 sub-group"
+    )
 
 
 def test_lr_schedule() -> None:

@@ -30,7 +30,7 @@ def _cv3_proto_regex(head_last_layer_index: int) -> re.Pattern[str]:
     Mirrors Ultralytics' hardcoded ``(?=.*23)(?=.*cv3)|proto\\.semseg`` but
     with the layer index parameterized so non-yolo26m scales also match.
     """
-    return re.compile(rf"(?=.*{head_last_layer_index})(?=.*cv3)|proto\.semseg")
+    return re.compile(rf"(?:^|[\._]){head_last_layer_index}\.(?=cv3)|proto\.semseg")
 
 
 def build_param_groups(
