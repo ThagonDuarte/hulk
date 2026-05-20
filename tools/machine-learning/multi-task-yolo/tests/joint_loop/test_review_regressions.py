@@ -192,21 +192,22 @@ def test_step_all_optimizers_skips_optimizers_without_gradients() -> None:
 
 
 def test_log_wandb_step_gating(monkeypatch: pytest.MonkeyPatch) -> None:
-    from model.joint_loop.loop import _log_wandb_step, JointTrainConfig
+    from model.joint_loop.loop import JointTrainConfig, _log_wandb_step
     from model.joint_loop.optim import JointOptimizers
     from model.joint_loop.weighting import UncertaintyWeighter
-    
+
     logged_payloads = []
     logged_steps = []
-    
+
     class FakeWandb:
         def log(self, payload: dict[str, Any], step: int) -> None:
             logged_payloads.append(payload)
             logged_steps.append(step)
-            
+
     import wandb
+
     monkeypatch.setattr(wandb, "log", FakeWandb().log)
-    
+
     # Setup dummy objects
     backbone_opt = SimpleNamespace(param_groups=[{"lr": 0.001}])
     head_opt = SimpleNamespace(param_groups=[{"lr": 0.01}])
@@ -216,36 +217,42 @@ def test_log_wandb_step_gating(monkeypatch: pytest.MonkeyPatch) -> None:
         heads={TaskType.OBJECT: head_opt},
         log_var=logvar_opt,
     )
-    
+
     weighter = UncertaintyWeighter([TaskType.OBJECT])
-    
+
     config = JointTrainConfig(log_interval=10)
     per_task_losses = {TaskType.OBJECT: torch.tensor(1.5)}
-    
+
+    per_task_decomposed = {TaskType.OBJECT: {"box_loss": 0.5, "cls_loss": 1.0}}
+
     # 1. Test when global_step % log_interval != 0
     _log_wandb_step(
         step=5,
-        global_step=15, # not a multiple of 10
+        global_step=15,  # not a multiple of 10
         epoch=1,
         config=config,
         optimizers=optimizers,
         weighter=weighter,
         tasks=[TaskType.OBJECT],
         per_task_losses=per_task_losses,
-        wandb_run=True, # truthy to enable logging
+        per_task_decomposed=per_task_decomposed,
+        wandb_run=True,  # truthy to enable logging
     )
-    assert len(logged_payloads) == 0, "Should not log if not a multiple of log_interval"
-    
+    assert len(logged_payloads) == 0, (
+        "Should not log if not a multiple of log_interval"
+    )
+
     # 2. Test when global_step % log_interval == 0
     _log_wandb_step(
         step=5,
-        global_step=20, # multiple of 10
+        global_step=20,  # multiple of 10
         epoch=1,
         config=config,
         optimizers=optimizers,
         weighter=weighter,
         tasks=[TaskType.OBJECT],
         per_task_losses=per_task_losses,
+        per_task_decomposed=per_task_decomposed,
         wandb_run=True,
     )
     assert len(logged_payloads) == 1
@@ -253,6 +260,10 @@ def test_log_wandb_step_gating(monkeypatch: pytest.MonkeyPatch) -> None:
     payload = logged_payloads[0]
     assert payload["epoch"] == 1
     assert payload["local_step"] == 5
-    assert "step" not in payload, "Conflict key 'step' should not be present in payload"
+    assert payload[f"loss/{TaskType.OBJECT}/box_loss"] == 0.5
+    assert payload[f"loss/{TaskType.OBJECT}/cls_loss"] == 1.0
+    assert "step" not in payload, (
+        "Conflict key 'step' should not be present in payload"
+    )
     assert payload["lr/backbone"] == 0.001
     assert payload[f"loss/{TaskType.OBJECT}"] == 1.5

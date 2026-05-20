@@ -347,6 +347,7 @@ def _train_one_epoch(
                 for opt in optimizers.all():
                     opt.zero_grad(set_to_none=True)
                 per_task_losses: dict[TaskType, torch.Tensor] = {}
+                per_task_decomposed: dict[TaskType, dict[str, float]] = {}
 
             batch_on_device = _move_batch_to_device(batch, device)
 
@@ -367,6 +368,16 @@ def _train_one_epoch(
 
             scaler.scale(weighted).backward()
             per_task_losses[task] = loss_total.detach()
+
+            loss_list = (
+                loss_vector.detach().cpu().tolist()
+                if loss_vector.ndim > 0
+                else [loss_vector.item()]
+            )
+            loss_names = _task_loss_names(task, len(loss_list))
+            per_task_decomposed[task] = dict(
+                zip(loss_names, loss_list, strict=True)
+            )
 
             step += 1
             if step % len(tasks) == 0:
@@ -399,6 +410,7 @@ def _train_one_epoch(
                     weighter=weighter,
                     tasks=tasks,
                     per_task_losses=per_task_losses,
+                    per_task_decomposed=per_task_decomposed,
                     wandb_run=wandb_run,
                 )
 
@@ -408,6 +420,20 @@ def _train_one_epoch(
                 ):
                     break
     return global_step + step // len(tasks)
+
+
+def _task_loss_names(task: TaskType, length: int) -> list[str]:
+    """Helper to return standard names for task loss components.
+
+    Checks lengths match for standard YOLO loss patterns.
+    """
+    if task == TaskType.OBJECT and length == 3:
+        return ["box_loss", "cls_loss", "dfl_loss"]
+    if task == TaskType.SEGMENTATION and length == 4:
+        return ["box_loss", "seg_loss", "cls_loss", "dfl_loss"]
+    if task == TaskType.POSE and length == 5:
+        return ["box_loss", "cls_loss", "dfl_loss", "kpt_loss", "kobj_loss"]
+    return [f"loss_comp_{i}" for i in range(length)]
 
 
 def _log_wandb_step(
@@ -420,6 +446,7 @@ def _log_wandb_step(
     weighter: UncertaintyWeighter,
     tasks: list[TaskType],
     per_task_losses: dict[TaskType, torch.Tensor],
+    per_task_decomposed: dict[TaskType, dict[str, float]] | None = None,
     wandb_run: Any,
 ) -> None:
     """Emit per-step metrics to W&B if interval matches and run is active."""
@@ -434,6 +461,11 @@ def _log_wandb_step(
         },
     }
     losses_log = {f"loss/{t}": v.item() for t, v in per_task_losses.items()}
+    decomposed_log = {}
+    if per_task_decomposed:
+        for t, decomp in per_task_decomposed.items():
+            for name, val in decomp.items():
+                decomposed_log[f"loss/{t}/{name}"] = val
     logvar_log = {
         f"logvar/{t}": weighter.log_var[weighter.tasks.index(t)].item()
         for t in tasks
@@ -444,6 +476,7 @@ def _log_wandb_step(
             "local_step": step,
             **lr_log,
             **losses_log,
+            **decomposed_log,
             **logvar_log,
         },
         step=global_step,
