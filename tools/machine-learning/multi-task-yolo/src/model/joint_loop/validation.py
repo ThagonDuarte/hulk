@@ -40,22 +40,31 @@ def run_validation(
     batch: int,
     device: str,
     task_weights: Mapping[TaskType, float],
-) -> tuple[float, dict[TaskType, float]]:
-    """Validate every task on EMA weights and return (score, per_task_metric).
+) -> tuple[
+    float,
+    dict[TaskType, float],
+    dict[TaskType, dict[str, float]],
+    dict[TaskType, list[Path]],
+]:
+    """Validate every task on EMA weights and return validation outputs.
 
-    `score = sum(task_weights[t] * metric[t] for t in tasks)`.
+    Returns:
+        score: Combined weighted score.
+        per_task_metric: Primary metric per task.
+        all_metrics: All parsed metrics per task.
+        task_visuals: Paths to validation images/curves per task.
     """
     per_task_metric: dict[TaskType, float] = {}
+    all_metrics: dict[TaskType, dict[str, float]] = {}
+    task_visuals: dict[TaskType, list[Path]] = {}
 
     with tempfile.TemporaryDirectory() as tmpdir:
         assets_dir = Path(tmpdir)
 
         for head in hydra_model.heads:
             task = head.task_type()
-            head_pt_name = head.name + ".pt"
-            head_pt_path = assets_dir / head_pt_name
-            backbone_pt_name = hydra_model.backbone.name + ".pt"
-            backbone_pt_path = assets_dir / backbone_pt_name
+            head_pt_path = assets_dir / f"{head.name}.pt"
+            backbone_pt_path = assets_dir / f"{hydra_model.backbone.name}.pt"
 
             # validate_hydra_model extracts backbone and head from separate
             # filenames, so both files must contain the trained EMA snapshot.
@@ -88,6 +97,8 @@ def run_validation(
                     "validation failed for task %s; recording NaN", task
                 )
                 per_task_metric[task] = float("nan")
+                all_metrics[task] = {}
+                task_visuals[task] = []
                 continue
 
             metrics_path = (
@@ -96,12 +107,23 @@ def run_validation(
             primary = _read_primary_metric(metrics_path, task)
             per_task_metric[task] = primary
 
+            task_metrics = _read_task_metrics(metrics_path)
+            if (
+                not _is_nan(primary)
+                and _PRIMARY_METRIC_KEY[task] not in task_metrics
+            ):
+                task_metrics[_PRIMARY_METRIC_KEY[task]] = primary
+            all_metrics[task] = task_metrics
+
+            val_dir = runs_dir / "val" / str(single_task_hydra)
+            task_visuals[task] = _gather_validation_assets(val_dir)
+
     score = sum(
         task_weights.get(t, 1.0) * v
         for t, v in per_task_metric.items()
         if not _is_nan(v)
     )
-    return score, per_task_metric
+    return score, per_task_metric, all_metrics, task_visuals
 
 
 def _read_primary_metric(metrics_path: Path, task: TaskType) -> float:
@@ -120,6 +142,35 @@ def _read_primary_metric(metrics_path: Path, task: TaskType) -> float:
         )
         return float("nan")
     return float(metrics[key])
+
+
+def _read_task_metrics(metrics_path: Path) -> dict[str, float]:
+    """Read metrics dictionary from the metrics JSON file."""
+    if not metrics_path.exists():
+        return {}
+    try:
+        with metrics_path.open() as f:
+            return dict(json.load(f))
+    except Exception:
+        logger.exception("Failed to load metrics from %s", metrics_path)
+        return {}
+
+
+def _gather_validation_assets(val_dir: Path) -> list[Path]:
+    """Scan validation directory for prediction plots and curves.
+
+    Looks for predictions, confusion matrices, and curve plots.
+    """
+    visuals: list[Path] = []
+    if val_dir.is_dir():
+        for p in val_dir.glob("val_batch*_pred.jpg"):
+            visuals.append(p)
+        for p in val_dir.glob("confusion_matrix*.png"):
+            visuals.append(p)
+        for p in val_dir.glob("*curve.png"):
+            visuals.append(p)
+    visuals.sort(key=lambda p: p.name)
+    return visuals
 
 
 def _is_nan(value: float) -> bool:

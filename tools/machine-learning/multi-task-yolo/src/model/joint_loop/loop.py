@@ -190,27 +190,20 @@ def train_joint(
         validation_target = (
             ema if ema is not None else _ema_passthrough(hydra, weighter)
         )
-        score, per_task = run_validation(
-            ema=validation_target,
+        score, _per_task = _validate_epoch(
+            epoch=epoch,
+            global_step=global_step,
+            validation_target=validation_target,
             hydra_model=hydra_model,
             datasets_per_task=datasets_per_task,
             head_source_paths=head_source_paths,
             runs_dir=runs_dir,
             imgsz=imgsz,
             batch=batch,
-            device=device_str,
-            task_weights=config.task_weights,
+            device_str=device_str,
+            config=config,
+            wandb_run=wandb_run,
         )
-        logger.info("epoch %d: score=%.4f per_task=%s", epoch, score, per_task)
-        if wandb_run is not None:
-            wandb.log(
-                {
-                    "val/score": score,
-                    **{f"val/{t}": v for t, v in per_task.items()},
-                    "epoch": epoch,
-                },
-                step=global_step,
-            )
 
         for task in tasks:
             write_per_task_checkpoint(
@@ -536,3 +529,60 @@ class _PassthroughEMA:
 
 def _ema_passthrough(hydra: Hydra, weighter: UncertaintyWeighter) -> Any:
     return _PassthroughEMA(hydra, weighter)
+
+
+def _validate_epoch(
+    *,
+    epoch: int,
+    global_step: int,
+    validation_target: Any,
+    hydra_model: HydraModelName,
+    datasets_per_task: Mapping[TaskType, Path],
+    head_source_paths: Mapping[TaskType, Path],
+    runs_dir: Path,
+    imgsz: int,
+    batch: int,
+    device_str: str,
+    config: JointTrainConfig,
+    wandb_run: Any,
+) -> tuple[float, dict[TaskType, float]]:
+    """Validate model checkpoints and upload metrics/plots to W&B."""
+    score, per_task, all_metrics, task_visuals = run_validation(
+        ema=validation_target,
+        hydra_model=hydra_model,
+        datasets_per_task=datasets_per_task,
+        head_source_paths=head_source_paths,
+        runs_dir=runs_dir,
+        imgsz=imgsz,
+        batch=batch,
+        device=device_str,
+        task_weights=config.task_weights,
+    )
+    logger.info("epoch %d: score=%.4f per_task=%s", epoch, score, per_task)
+    if wandb_run is not None:
+        val_metrics_log = {
+            "val/score": score,
+            **{f"val/{t}": v for t, v in per_task.items()},
+            "epoch": epoch,
+        }
+        for task, metrics in all_metrics.items():
+            for metric_name, val in metrics.items():
+                val_metrics_log[f"val/{task}/{metric_name}"] = val
+
+        for task, paths in task_visuals.items():
+            for path in paths:
+                asset_name = f"val/{task}/{path.stem}"
+                try:
+                    val_metrics_log[asset_name] = wandb.Image(
+                        str(path), caption=path.name
+                    )
+                except Exception:
+                    logger.exception(
+                        "Failed to convert %s to wandb.Image", path
+                    )
+
+        wandb.log(
+            val_metrics_log,
+            step=global_step,
+        )
+    return score, per_task

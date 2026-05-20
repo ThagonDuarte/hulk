@@ -87,7 +87,7 @@ def test_validation_materializes_trained_checkpoint_for_head_and_backbone(
     )
     monkeypatch.setattr(validation, "_read_primary_metric", lambda *_: 0.5)
 
-    score, metrics = validation.run_validation(
+    score, metrics, all_metrics, task_visuals = validation.run_validation(
         ema=SimpleNamespace(),
         hydra_model=hydra_model,
         datasets_per_task={TaskType.POSE: tmp_path / "data.yaml"},
@@ -101,6 +101,8 @@ def test_validation_materializes_trained_checkpoint_for_head_and_backbone(
 
     assert score == 0.5
     assert metrics == {TaskType.POSE: 0.5}
+    assert all_metrics == {TaskType.POSE: {validation._PRIMARY_METRIC_KEY[TaskType.POSE]: 0.5}}
+    assert task_visuals == {TaskType.POSE: []}
 
 
 class _FakeSegmentHead(nn.Module):
