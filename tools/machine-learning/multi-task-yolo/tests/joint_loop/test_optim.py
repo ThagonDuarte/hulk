@@ -158,9 +158,9 @@ def test_backbone_gradient_accumulation_invariant() -> None:
     for head in (head_a, head_b):
         head.zero_grad(set_to_none=True)
         out = head(backbone(x)).sum()
-        out.backward()
+        (out / 2.0).backward()
 
     assert backbone.weight.grad is not None
-    assert torch.allclose(backbone.weight.grad, manual_grads, atol=1e-6), (
-        "synchronized backbone grad must equal sum of single-task grads"
+    assert torch.allclose(backbone.weight.grad, manual_grads / 2.0, atol=1e-6), (
+        "synchronized backbone grad must equal average of single-task grads"
     )

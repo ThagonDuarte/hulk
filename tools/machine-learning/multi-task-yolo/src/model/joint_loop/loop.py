@@ -362,7 +362,7 @@ def _train_one_epoch(
                 _cast_to_fp32(pred), batch_on_device
             )
             loss_total = loss_vector.sum()
-            weighted = weighter.weight_single(task, loss_total)
+            weighted = weighter.weight_single(task, loss_total) / len(tasks)
 
             scaler.scale(weighted).backward()
             per_task_losses[task] = loss_total.detach()
