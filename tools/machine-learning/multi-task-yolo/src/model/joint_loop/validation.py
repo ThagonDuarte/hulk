@@ -24,7 +24,7 @@ logger = logging.getLogger(__name__)
 
 _PRIMARY_METRIC_KEY: dict[TaskType, str] = {
     TaskType.OBJECT: "metrics/mAP50-95(B)",
-    TaskType.SEGMENTATION: "metrics/mAP50-95(B)",
+    TaskType.SEGMENTATION: "metrics/mAP50-95(M)",
     TaskType.POSE: "metrics/mAP50-95(P)",
 }
 
@@ -54,19 +54,11 @@ def run_validation(
             task = head.task_type()
             head_pt_name = head.name + ".pt"
             head_pt_path = assets_dir / head_pt_name
-            # validate_hydra_model loads `assets_dir / <head>.pt` directly, so
-            # we copy the original head checkpoint into the temp dir.
-            shutil.copy(head_source_paths[task], head_pt_path)
-
             backbone_pt_name = hydra_model.backbone.name + ".pt"
             backbone_pt_path = assets_dir / backbone_pt_name
 
-            # Materialise the EMA backbone+head as a single per-task .pt
-            # under the *backbone* filename. validate_hydra_model only
-            # extracts the backbone slice from this file (its head slice is
-            # discarded and re-derived from `head_pt_path`), so the file is
-            # effectively the EMA backbone wrapped in YOLO's checkpoint
-            # format.
+            # validate_hydra_model extracts backbone and head from separate
+            # filenames, so both files must contain the trained EMA snapshot.
             single_task_hydra = HydraModelName(
                 backbone=hydra_model.backbone,
                 heads=[head],
@@ -76,9 +68,11 @@ def run_validation(
                 ema=ema,
                 hydra_model=single_task_hydra,
                 task=task,
-                head_yolo_path=head_pt_path,
-                output_path=backbone_pt_path,
+                head_yolo_path=head_source_paths[task],
+                output_path=head_pt_path,
             )
+            if head_pt_path != backbone_pt_path:
+                shutil.copy(head_pt_path, backbone_pt_path)
 
             config = ValidationConfig(
                 data=str(datasets_per_task[task]),

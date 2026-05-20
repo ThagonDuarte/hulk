@@ -33,11 +33,11 @@ def write_per_task_checkpoint(
     *,
     ema: EMAHydra,
     hydra_model: HydraModelName,
-    task: TaskType,  # noqa: ARG001
+    task: TaskType,
     head_yolo_path: Path,
     output_path: Path,
 ) -> None:
-    """Write a single per-task `.pt` containing the EMA backbone + this head.
+    """Write a single per-task `.pt` containing the EMA backbone + EMA head.
 
     Equivalent to `cross.py` but driven by the EMA snapshot held by `ema`.
     """
@@ -51,6 +51,8 @@ def write_per_task_checkpoint(
         hydra_model.number_of_frozen_modules,
     )
     set_backbone(head_root, ema_backbone, hydra_model.number_of_frozen_modules)
+    ema_head = ema.hydra.heads[str(task)]
+    head_root.model = torch.nn.Sequential(*list(ema_backbone), *list(ema_head))
 
     # Atomic-ish write: save to a temp path, then rename.
     tmp_path = output_path.with_suffix(output_path.suffix + ".tmp")

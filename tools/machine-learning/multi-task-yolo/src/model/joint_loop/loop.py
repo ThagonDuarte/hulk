@@ -258,10 +258,8 @@ def _step_all_optimizers(
     """Unscale, clip, and step all optimizers, then update the GradScaler.
 
     GradScaler.step() asserts that unscale_() recorded at least one gradient.
-    Optimizers whose parameter groups all have grad=None (e.g. when the backbone
-    was loaded with requires_grad=False) are stepped directly to avoid that
-    assertion. Fix 1 (requires_grad_(True) in train_joint) prevents this in
-    normal usage; this is a belt-and-suspenders guard.
+    Optimizers whose parameter groups all have grad=None are skipped because
+    stepping them can still advance optimizer-specific state.
     """
     with_grads = {
         id(o): any(
@@ -284,8 +282,6 @@ def _step_all_optimizers(
     for o in optimizers.all():
         if with_grads[id(o)]:
             scaler.step(o)
-        else:
-            o.step()
     scaler.update()
 
 

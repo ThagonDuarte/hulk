@@ -43,6 +43,7 @@ class JointLossHyp:
     epochs: int = 100
     label_smoothing: float = 0.0
     fl_gamma: float = 0.0
+    overlap_mask: bool = True
     extra: dict[str, Any] = field(default_factory=dict)
 
     def as_namespace(self) -> SimpleNamespace:
@@ -59,6 +60,7 @@ class JointLossHyp:
                     "epochs",
                     "label_smoothing",
                     "fl_gamma",
+                    "overlap_mask",
                 )
             }
         )

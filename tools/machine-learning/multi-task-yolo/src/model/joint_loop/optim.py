@@ -159,9 +159,9 @@ def _instantiate_optimizer(
 
 
 def head_last_layer_index(hydra: Hydra, task: TaskType) -> int:
-    """Index of the head's final module within the full network."""
+    """Index of the head's final module within the sliced head module."""
     head = hydra.heads[str(task)]
-    return hydra.backbone_length + len(head) - 1
+    return len(head) - 1
 
 
 def build_joint_optimizers(
