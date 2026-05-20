@@ -83,7 +83,6 @@ def test_smoke_two_epochs(tmp_path: Path) -> None:
         max_steps_per_epoch=5,
     )
     run_dir = tmp_path / "joint_train" / "smoke~test"
-    runs_dir = tmp_path
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -96,7 +95,6 @@ def test_smoke_two_epochs(tmp_path: Path) -> None:
         datasets_per_task={TaskType.OBJECT: COCO_YAML},
         head_source_paths=head_source_paths,
         run_dir=run_dir,
-        runs_dir=runs_dir,
         config=config,
         device=device,
         device_str="cpu" if device.type == "cpu" else "0",

@@ -95,15 +95,36 @@ def save_validation_results(
 
 
 def validate_hydra_model(
-    hydra_model: HydraModelName, config: ValidationConfig, assets_dir: Path
+    hydra_model: HydraModelName,
+    config: ValidationConfig,
+    assets_dir: Path,
+    *,
+    name_override: str | None = None,
 ) -> None:
-    model_val_folder = Path("val") / str(hydra_model)
+    """Run ultralytics validation for a single-head hydra model.
+
+    Args:
+        hydra_model: Single-head hydra model name.
+        config: Validation configuration (project, data, etc.).
+        assets_dir: Directory containing backbone and head .pt files.
+        name_override: If set, used as the ultralytics ``name`` kwarg
+            *and* as the sub-path under ``config.project`` for saving
+            ``metrics.json``.  When ``None`` the legacy
+            ``val/<hydra_model>`` path is used.
+    """
+    if name_override is not None:
+        model_val_folder = Path(name_override)
+    else:
+        model_val_folder = Path("val") / str(hydra_model)
     validation_run_folder = Path(config.project) / model_val_folder
 
+    backbone_path = assets_dir / (hydra_model.backbone.name + ".pt")
+    head_path = assets_dir / (hydra_model.heads[0].name + ".pt")
+
     backbone_model = cast(
-        DetectionModel, YOLO(assets_dir / hydra_model.backbone.name).model
+        DetectionModel, YOLO(backbone_path).model
     )
-    head_model_yolo_wrapper = YOLO(assets_dir / hydra_model.heads[0].name)
+    head_model_yolo_wrapper = YOLO(head_path)
     head_model = cast(DetectionModel, head_model_yolo_wrapper.model)
     backbone = get_backbone(
         backbone_model, hydra_model.number_of_frozen_modules
@@ -120,7 +141,7 @@ def validate_hydra_model(
     head_model_yolo_wrapper.eval()
 
     metrics = head_model_yolo_wrapper.val(
-        **config.to_dict(name=model_val_folder)
+        **config.to_dict(name=str(model_val_folder))
     )
     metrics = cast(DetMetrics, metrics)
 

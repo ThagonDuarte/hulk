@@ -35,7 +35,7 @@ def run_validation(
     hydra_model: HydraModelName,
     datasets_per_task: Mapping[TaskType, Path],
     head_source_paths: Mapping[TaskType, Path],
-    runs_dir: Path,
+    run_dir: Path,
     imgsz: int,
     batch: int,
     device: str,
@@ -48,6 +48,11 @@ def run_validation(
 ]:
     """Validate every task on EMA weights and return validation outputs.
 
+    Validation artifacts (metrics, plots, curves) are written into
+    ``run_dir / val / <task>``.  An **absolute** project path is passed
+    to ultralytics so that its ``get_save_dir`` does not prepend
+    ``RUNS_DIR / task /``.
+
     Returns:
         score: Combined weighted score.
         per_task_metric: Primary metric per task.
@@ -58,20 +63,25 @@ def run_validation(
     all_metrics: dict[TaskType, dict[str, float]] = {}
     task_visuals: dict[TaskType, list[Path]] = {}
 
+    # Absolute path prevents ultralytics from prepending RUNS_DIR/task.
+    abs_run_dir = run_dir.resolve()
+
     with tempfile.TemporaryDirectory() as tmpdir:
         assets_dir = Path(tmpdir)
 
         for head in hydra_model.heads:
             task = head.task_type()
             head_pt_path = assets_dir / f"{head.name}.pt"
-            backbone_pt_path = assets_dir / f"{hydra_model.backbone.name}.pt"
+            backbone_pt_path = (
+                assets_dir / f"{hydra_model.backbone.name}.pt"
+            )
 
-            # validate_hydra_model extracts backbone and head from separate
-            # filenames, so both files must contain the trained EMA snapshot.
             single_task_hydra = HydraModelName(
                 backbone=hydra_model.backbone,
                 heads=[head],
-                number_of_frozen_modules=hydra_model.number_of_frozen_modules,
+                number_of_frozen_modules=(
+                    hydra_model.number_of_frozen_modules
+                ),
             )
             write_per_task_checkpoint(
                 ema=ema,
@@ -83,27 +93,34 @@ def run_validation(
             if head_pt_path != backbone_pt_path:
                 shutil.copy(head_pt_path, backbone_pt_path)
 
+            # Ultralytics saves to project/name.  An absolute project
+            # ensures get_save_dir uses it verbatim.
+            val_name = f"val/{task}"
             config = ValidationConfig(
                 data=str(datasets_per_task[task]),
-                project=str(runs_dir),
+                project=str(abs_run_dir),
                 imgsz=imgsz,
                 batch=batch,
                 device=device,
             )
             try:
-                validate_hydra_model(single_task_hydra, config, assets_dir)
+                validate_hydra_model(
+                    single_task_hydra, config, assets_dir,
+                    name_override=val_name,
+                )
             except Exception:
                 logger.exception(
-                    "validation failed for task %s; recording NaN", task
+                    "validation failed for task %s; recording NaN",
+                    task,
                 )
                 per_task_metric[task] = float("nan")
                 all_metrics[task] = {}
                 task_visuals[task] = []
                 continue
 
-            metrics_path = (
-                runs_dir / "val" / str(single_task_hydra) / "metrics.json"
-            )
+            # Both metrics.json and ultralytics plots land here.
+            val_dir = abs_run_dir / val_name
+            metrics_path = val_dir / "metrics.json"
             primary = _read_primary_metric(metrics_path, task)
             per_task_metric[task] = primary
 
@@ -115,7 +132,6 @@ def run_validation(
                 task_metrics[_PRIMARY_METRIC_KEY[task]] = primary
             all_metrics[task] = task_metrics
 
-            val_dir = runs_dir / "val" / str(single_task_hydra)
             task_visuals[task] = _gather_validation_assets(val_dir)
 
     score = sum(

@@ -294,7 +294,6 @@ def main(
         datasets_per_task=datasets_per_task,
         head_source_paths=head_source_paths,
         run_dir=run_dir,
-        runs_dir=runs_dir,
         config=config,
         device=selected_device,
         device_str=device,

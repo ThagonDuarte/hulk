@@ -97,7 +97,6 @@ def train_joint(
     datasets_per_task: Mapping[TaskType, Path],
     head_source_paths: Mapping[TaskType, Path],
     run_dir: Path,
-    runs_dir: Path,
     config: JointTrainConfig,
     device: torch.device,
     device_str: str,
