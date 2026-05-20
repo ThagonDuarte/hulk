@@ -153,7 +153,7 @@ def _select_training_device(device: str | torch.device) -> torch.device:
 @option("--imgsz", default=640, type=int)
 @option("--lr_backbone", default=0.001, type=float)
 @option("--lr_heads", default=0.01, type=float)
-@option("--lr_logvar", default=0.001, type=float)
+@option("--lr_logvar", default=0.0001, type=float)
 @option("--momentum", default=0.9, type=float)
 @option("--weight_decay", default=1e-5, type=float)
 @option("--max_grad_norm", default=10.0, type=float)

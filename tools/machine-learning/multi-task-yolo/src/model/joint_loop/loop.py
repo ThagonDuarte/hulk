@@ -56,7 +56,7 @@ class JointTrainConfig:
     optimizer_name: str = "MuSGD"
     lr_backbone: float = 0.001
     lr_heads: float = 0.01
-    lr_logvar: float = 0.001
+    lr_logvar: float = 0.0001
     momentum: float = 0.9
     weight_decay: float = 1e-5
     max_grad_norm: float = 10.0
