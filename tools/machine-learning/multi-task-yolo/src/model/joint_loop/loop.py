@@ -422,7 +422,7 @@ def _log_wandb_step(
     wandb_run: Any,
 ) -> None:
     """Emit per-step metrics to W&B if interval matches and run is active."""
-    if step % config.log_interval != 0 or not wandb_run:
+    if global_step % config.log_interval != 0 or not wandb_run:
         return
     lr_log = {
         "lr/backbone": optimizers.backbone.param_groups[0]["lr"],
@@ -440,7 +440,7 @@ def _log_wandb_step(
     wandb.log(
         {
             "epoch": epoch,
-            "step": step,
+            "local_step": step,
             **lr_log,
             **losses_log,
             **logvar_log,
