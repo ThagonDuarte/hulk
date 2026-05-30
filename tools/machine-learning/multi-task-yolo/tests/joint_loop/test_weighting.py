@@ -85,9 +85,21 @@ def test_log_var_clamping() -> None:
     # Set log_var to a value far outside [-5, 5] range
     with torch.no_grad():
         weighter.log_var.copy_(torch.tensor([10.0]))
-    
+
     loss = torch.tensor(2.0)
     # Without clamping: exp(-10)*2 + 10 ~= 10.00009
     # With clamping: exp(-5)*2 + 5 ~= 0.00673*2 + 5 = 5.01347
     result = weighter.weight_single(TaskType.OBJECT, loss)
     assert result.item() == pytest.approx(math.exp(-5.0) * 2.0 + 5.0, rel=1e-6)
+
+
+def test_log_var_clamping_keeps_recovery_gradient() -> None:
+    weighter = UncertaintyWeighter([TaskType.OBJECT])
+    with torch.no_grad():
+        weighter.log_var.copy_(torch.tensor([-10.0]))
+
+    result = weighter.weight_single(TaskType.OBJECT, torch.tensor(2.0))
+    result.backward()
+
+    assert weighter.log_var.grad is not None
+    assert weighter.log_var.grad.item() < 0.0

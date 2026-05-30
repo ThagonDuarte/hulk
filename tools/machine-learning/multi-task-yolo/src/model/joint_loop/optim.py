@@ -8,7 +8,7 @@ import re
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from functools import partial
-from typing import Any
+from typing import Any, cast
 
 import torch
 from torch import nn, optim
@@ -31,7 +31,8 @@ def _cv3_proto_regex(head_last_layer_index: int) -> re.Pattern[str]:
     with the layer index parameterized so non-yolo26m scales also match.
     """
     return re.compile(
-        rf"(?:^|[\._]){head_last_layer_index}\.(?=cv3)|proto\.semseg"
+        rf"(?:^|[\._]){head_last_layer_index}(?:[\._].*cv3)|"
+        r"proto\.semseg"
     )
 
 
@@ -162,7 +163,7 @@ def _instantiate_optimizer(
 
 def head_last_layer_index(hydra: Hydra, task: TaskType) -> int:
     """Index of the head's final module within the sliced head module."""
-    head = hydra.heads[str(task)]
+    head = cast(nn.ModuleList, hydra.heads[str(task)])
     return len(head) - 1
 
 
@@ -216,20 +217,23 @@ def build_schedulers(
     optimizers: JointOptimizers,
     *,
     epochs: int,
-    warmup_epochs: int,
+    warmup_epochs_backbone: int,
+    warmup_epochs_heads: int,
 ) -> list[optim.lr_scheduler.LRScheduler]:
-    """Build per-optimizer LR schedulers (linear warmup + cosine decay).
-
-    ``LambdaLR`` calls ``step()`` on construction (last_epoch -1 → 0), so
-    the warmup factor is applied to the optimizer before epoch-0 training.
-    """
+    """Build per-optimizer LR schedulers with differential warmups."""
     schedulers: list[optim.lr_scheduler.LRScheduler] = []
+
     for opt in optimizers.all():
+        # Apply the longer warmup to the backbone, shorter to the heads/logvar
+        w = (
+            warmup_epochs_backbone
+            if opt is optimizers.backbone
+            else warmup_epochs_heads
+        )
+
         sched = optim.lr_scheduler.LambdaLR(
             opt,
-            lr_lambda=partial(
-                _lr_schedule, warmup=max(warmup_epochs, 1), total=epochs
-            ),
+            lr_lambda=partial(_lr_schedule, warmup=max(w, 1), total=epochs),
         )
         schedulers.append(sched)
     return schedulers
@@ -267,9 +271,9 @@ class EMAHydra:
         self.hydra = copy.deepcopy(hydra).eval()
         self.weighter = copy.deepcopy(weighter).eval()
         for p in self.hydra.parameters():
-            p.requires_grad_(requires_grad=False)
+            p.requires_grad = False
         for p in self.weighter.parameters():
-            p.requires_grad_(requires_grad=False)
+            p.requires_grad = False
         self._max_decay = max_decay
         self._warmup = warmup
         self.updates = 0
@@ -281,16 +285,8 @@ class EMAHydra:
     def update(self, hydra: Hydra, weighter: UncertaintyWeighter) -> None:
         self.updates += 1
         d = self.decay()
-        for ema_p, p in zip(
-            self.hydra.parameters(), hydra.parameters(), strict=True
-        ):
-            ema_p.mul_(d).add_(p.detach(), alpha=1.0 - d)
-        for ema_p, p in zip(
-            self.weighter.parameters(),
-            weighter.parameters(),
-            strict=True,
-        ):
-            ema_p.mul_(d).add_(p.detach(), alpha=1.0 - d)
+        _ema_update_state_dict(self.hydra, hydra, decay=d)
+        _ema_update_state_dict(self.weighter, weighter, decay=d)
 
     def state_dict(self) -> dict[str, Any]:
         return {
@@ -303,6 +299,22 @@ class EMAHydra:
         self.updates = int(state["updates"])
         self.hydra.load_state_dict(state["hydra"])
         self.weighter.load_state_dict(state["weighter"])
+
+
+def _ema_update_state_dict(
+    ema_module: nn.Module,
+    live_module: nn.Module,
+    *,
+    decay: float,
+) -> None:
+    """Update params and floating-point buffers like Ultralytics ModelEMA."""
+    live_state = live_module.state_dict()
+    for key, ema_value in ema_module.state_dict().items():
+        live_value = live_state[key].detach()
+        if ema_value.dtype.is_floating_point:
+            ema_value.mul_(decay).add_(live_value, alpha=1.0 - decay)
+        else:
+            ema_value.copy_(live_value)
 
 
 def make_amp_scaler(

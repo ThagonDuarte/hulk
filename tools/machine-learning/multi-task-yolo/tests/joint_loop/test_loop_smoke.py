@@ -70,7 +70,8 @@ def test_smoke_two_epochs(tmp_path: Path) -> None:
     config = JointTrainConfig(
         epochs=2,
         patience=999,
-        warmup_epochs=1,
+        warmup_epochs_backbone=1,
+        warmup_epochs_heads=1,
         val_interval=1,
         log_interval=1,
         optimizer_name="MuSGD" if torch.cuda.is_available() else "AdamW",

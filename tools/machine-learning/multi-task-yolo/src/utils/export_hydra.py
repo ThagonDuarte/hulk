@@ -241,6 +241,7 @@ def main(
         hydra_model = Hydra(
             backbone_path=str(backbone),
             task_dict=task_dict,
+            number_of_frozen_modules=hydra_model_name.number_of_frozen_modules,
         ).to(device)
         hydra_model.eval()
         set_export_mode(hydra_model)
@@ -273,7 +274,7 @@ def main(
                 wrapper=wrapper,
                 dummy_input=dummy_input,
                 export_path=export_folder / (str(hydra_model_name) + ".onnx"),
-                task_dict=task_dict.keys(),
+                task_dict=task_dict,
                 opset=opset,
                 with_nv12=with_nv12_layer,
             )

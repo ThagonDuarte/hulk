@@ -6,7 +6,7 @@ import pytest
 import torch
 from torch import nn
 
-from model.joint_loop.optim import build_param_groups
+from model.joint_loop.optim import _ema_update_state_dict, build_param_groups
 
 
 class _FakeBackbone(nn.Module):
@@ -89,6 +89,37 @@ def test_cv3_x3_sub_split_with_parameterized_index() -> None:
     assert any(id(p) in {id(q) for q in boosted_params} for p in cv3_params), (
         "cv3 params under layer index 5 should land in the lr*3 sub-group"
     )
+
+
+class _FakeDetectLikeFinal(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.cv3 = nn.Conv2d(4, 4, 1)
+        self.one2one_cv3 = nn.Conv2d(4, 4, 1)
+
+
+def test_cv3_x3_sub_split_includes_one2one_cv3() -> None:
+    head = nn.ModuleList(
+        [nn.Identity() for _ in range(5)] + [_FakeDetectLikeFinal()]
+    )
+    groups = build_param_groups(
+        head,
+        optimizer_name="MuSGD",
+        lr=0.01,
+        momentum=0.9,
+        decay=1e-5,
+        head_last_layer_index=5,
+    )
+    boosted_params = {
+        id(p) for g in groups if g.get("lr", 0) == 0.03 for p in g["params"]
+    }
+
+    final = head[5]
+    assert isinstance(final, _FakeDetectLikeFinal)
+    assert all(id(p) in boosted_params for p in final.cv3.parameters())
+    assert all(id(p) in boosted_params for p in final.one2one_cv3.parameters())
+
+
 class _FakeHeadWithCv3MultipleLayers(nn.Module):
     def __init__(self) -> None:
         super().__init__()
@@ -161,6 +192,25 @@ def test_backbone_gradient_accumulation_invariant() -> None:
         (out / 2.0).backward()
 
     assert backbone.weight.grad is not None
-    assert torch.allclose(backbone.weight.grad, manual_grads / 2.0, atol=1e-6), (
-        "synchronized backbone grad must equal average of single-task grads"
+    assert torch.allclose(
+        backbone.weight.grad, manual_grads / 2.0, atol=1e-6
+    ), "synchronized backbone grad must equal average of single-task grads"
+
+
+def test_ema_update_state_dict_updates_float_buffers() -> None:
+    live = nn.BatchNorm1d(2)
+    ema = nn.BatchNorm1d(2)
+
+    live.running_mean.fill_(4.0)
+    live.running_var.fill_(9.0)
+    ema.running_mean.zero_()
+    ema.running_var.fill_(1.0)
+
+    _ema_update_state_dict(ema, live, decay=0.5)
+
+    assert torch.allclose(
+        ema.running_mean, torch.full_like(ema.running_mean, 2.0)
+    )
+    assert torch.allclose(
+        ema.running_var, torch.full_like(ema.running_var, 5.0)
     )

@@ -11,7 +11,9 @@ from __future__ import annotations
 
 import logging
 import random
+from collections.abc import Callable
 from pathlib import Path
+from typing import Any, TypeVar, cast
 
 import click
 import numpy as np
@@ -35,6 +37,8 @@ from utils.model_naming import (
 from validation.validator import DatasetNotFoundError
 
 logger = logging.getLogger(__name__)
+
+F = TypeVar("F", bound=Callable[..., Any])
 
 
 def _parse_kv_floats(values: tuple[str, ...]) -> dict[TaskType, float]:
@@ -78,7 +82,46 @@ def _seed_everything(seed: int) -> None:
         torch.cuda.manual_seed_all(seed)
 
 
-def option(*args: object, **kwargs: object) -> object:
+def _validate_task_metadata(
+    hydra: Hydra,
+    task: TaskType,
+    dataset: Any,
+) -> None:
+    """Fail fast when a dataset YAML is incompatible with the loaded head."""
+    data = getattr(dataset, "data", None)
+    if not isinstance(data, dict):
+        return
+
+    head_module = cast(torch.nn.ModuleList, hydra.heads[str(task)])
+    head = head_module[-1]
+    head_nc = getattr(head, "nc", None)
+    data_nc = data.get("nc")
+    if data_nc is None and hasattr(data.get("names"), "__len__"):
+        data_nc = len(data["names"])
+    nc_mismatch = head_nc is not None and data_nc is not None
+    nc_mismatch = nc_mismatch and int(head_nc) != int(data_nc)
+    if nc_mismatch:
+        msg = (
+            f"{task} dataset declares nc={data_nc}, but loaded head has "
+            f"nc={head_nc}. Use a head checkpoint with matching classes."
+        )
+        raise click.ClickException(msg)
+
+    if task != TaskType.POSE:
+        return
+    data_kpt_shape = data.get("kpt_shape")
+    head_kpt_shape = hydra.head_kpt_shapes.get(str(task))
+    if data_kpt_shape is None or head_kpt_shape is None:
+        return
+    if tuple(data_kpt_shape[:2]) != tuple(head_kpt_shape[:2]):
+        msg = (
+            f"pose dataset declares kpt_shape={data_kpt_shape}, but loaded "
+            f"head has kpt_shape={head_kpt_shape}."
+        )
+        raise click.ClickException(msg)
+
+
+def option(*args: Any, **kwargs: Any) -> Callable[[F], F]:
     """click.option wrapper that sets show_default=True on every option."""
     kwargs.setdefault("show_default", True)
     return click.option(*args, **kwargs)
@@ -147,7 +190,9 @@ def _select_training_device(device: str | torch.device) -> torch.device:
 @option("--seed", default=42, type=int)
 @option("--epochs", default=100, type=int)
 @option("--patience", default=30, type=int)
-@option("--warmup_epochs", default=10, type=int)
+@option("--freeze_backbone_epochs", default=10, type=int)
+@option("--warmup_epochs_backbone", default=15, type=int)
+@option("--warmup_epochs_heads", default=3, type=int)
 @option("--val_interval", default=1, type=int)
 @option("--batch", default=16, type=int)
 @option("--imgsz", default=640, type=int)
@@ -157,6 +202,7 @@ def _select_training_device(device: str | torch.device) -> torch.device:
 @option("--momentum", default=0.9, type=float)
 @option("--weight_decay", default=1e-5, type=float)
 @option("--max_grad_norm", default=10.0, type=float)
+@option("--nominal_batch_size", default=64, type=int)
 @option(
     "--optimizer",
     type=click.Choice(["MuSGD", "AdamW"], case_sensitive=False),
@@ -185,7 +231,9 @@ def main(
     seed: int,
     epochs: int,
     patience: int,
-    warmup_epochs: int,
+    freeze_backbone_epochs: int,
+    warmup_epochs_backbone: int,
+    warmup_epochs_heads: int,
     val_interval: int,
     batch: int,
     imgsz: int,
@@ -195,6 +243,7 @@ def main(
     momentum: float,
     weight_decay: float,
     max_grad_norm: float,
+    nominal_batch_size: int,
     optimizer: str,
     init_log_var: tuple[str, ...],
     task_weight: tuple[str, ...],
@@ -242,17 +291,22 @@ def main(
 
     selected_device = _select_training_device(device)
     backbone_path = assets_dir / (hydra_model_name.backbone.name + ".pt")
-    hydra = Hydra(backbone_path=str(backbone_path), task_dict=task_dict)
+    hydra = Hydra(
+        backbone_path=str(backbone_path),
+        task_dict=task_dict,
+        number_of_frozen_modules=hydra_model_name.number_of_frozen_modules,
+    )
 
     loaders = {}
     for task, dataset_yaml in datasets_per_task.items():
-        loader, _dataset = build_task_dataloader(
+        loader, dataset = build_task_dataloader(
             task,
             dataset_yaml,
             imgsz=imgsz,
             batch=batch,
             workers=workers,
         )
+        _validate_task_metadata(hydra, task, dataset)
         loaders[task] = loader
     parsed_strategy: str | int = (
         int(epoch_size_strategy)
@@ -263,7 +317,9 @@ def main(
     config = JointTrainConfig(
         epochs=epochs,
         patience=patience,
-        warmup_epochs=warmup_epochs,
+        freeze_backbone_epochs=freeze_backbone_epochs,
+        warmup_epochs_backbone=warmup_epochs_backbone,
+        warmup_epochs_heads=warmup_epochs_heads,
         val_interval=val_interval,
         log_interval=log_interval,
         optimizer_name=optimizer,
@@ -273,6 +329,7 @@ def main(
         momentum=momentum,
         weight_decay=weight_decay,
         max_grad_norm=max_grad_norm,
+        nominal_batch_size=nominal_batch_size,
         use_amp=amp,
         use_ema=ema,
         clip_heads=clip_heads,
@@ -296,7 +353,7 @@ def main(
         run_dir=run_dir,
         config=config,
         device=selected_device,
-        device_str=device,
+        device_str=str(selected_device),  # Passes "cuda:1" instead of "-1"
         imgsz=imgsz,
         batch=batch,
         seed=seed,

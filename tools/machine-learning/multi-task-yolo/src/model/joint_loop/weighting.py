@@ -48,9 +48,11 @@ class UncertaintyWeighter(nn.Module):
         if task not in self._index:
             raise UnknownTaskError(task, self.tasks)
         log_var_t = self.log_var[self._index[task]]
-        # Clamp log_var to a safe range to prevent numerical instability
-        log_var_t_clamped = torch.clamp(log_var_t, -5.0, 5.0)
-        return torch.exp(-log_var_t_clamped) * loss + log_var_t_clamped
+        # Clamp the forward value for numerical safety, but use a
+        # straight-through gradient so out-of-range log-vars can recover.
+        clamped = torch.clamp(log_var_t, -5.0, 5.0)
+        safe_log_var = log_var_t + (clamped - log_var_t).detach()
+        return torch.exp(-safe_log_var) * loss + safe_log_var
 
     def forward(self, losses: Mapping[TaskType, Tensor]) -> Tensor:
         total = torch.zeros((), device=self.log_var.device)

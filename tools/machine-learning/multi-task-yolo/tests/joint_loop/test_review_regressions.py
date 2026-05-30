@@ -73,6 +73,7 @@ def test_validation_materializes_trained_checkpoint_for_head_and_backbone(
         _hydra_model: HydraModelName,
         _config: Any,
         assets_dir: Path,
+        **_kwargs: Any,
     ) -> None:
         assert (assets_dir / "yolo26m.pt").read_bytes() == b"trained"
         assert (assets_dir / "yolo26m-pose.pt").read_bytes() == b"trained"
@@ -92,7 +93,7 @@ def test_validation_materializes_trained_checkpoint_for_head_and_backbone(
         hydra_model=hydra_model,
         datasets_per_task={TaskType.POSE: tmp_path / "data.yaml"},
         head_source_paths={TaskType.POSE: source},
-        runs_dir=tmp_path / "runs",
+        run_dir=tmp_path / "runs",
         imgsz=320,
         batch=1,
         device="cpu",
@@ -101,7 +102,8 @@ def test_validation_materializes_trained_checkpoint_for_head_and_backbone(
 
     assert score == 0.5
     assert metrics == {TaskType.POSE: 0.5}
-    assert all_metrics == {TaskType.POSE: {validation._PRIMARY_METRIC_KEY[TaskType.POSE]: 0.5}}
+    metric_key = validation._PRIMARY_METRIC_KEY[TaskType.POSE]
+    assert all_metrics == {TaskType.POSE: {metric_key: 0.5}}
     assert task_visuals == {TaskType.POSE: []}
 
 
@@ -193,6 +195,37 @@ def test_step_all_optimizers_skips_optimizers_without_gradients() -> None:
     assert logvar_opt.steps == 0
 
 
+def test_step_all_optimizers_scales_only_backbone_gradients() -> None:
+    backbone = nn.Linear(1, 1, bias=False)
+    head_param = nn.Parameter(torch.ones(1))
+    log_var = nn.Parameter(torch.ones(1))
+    assert backbone.weight is not None
+    backbone.weight.grad = torch.full_like(backbone.weight, 2.0)
+    head_param.grad = torch.full_like(head_param, 2.0)
+
+    backbone_opt = _CountingOptimizer(backbone.weight)
+    head_opt = _CountingOptimizer(head_param)
+    logvar_opt = _CountingOptimizer(log_var)
+    hydra = SimpleNamespace(shared_backbone=nn.ModuleList([backbone]))
+
+    _step_all_optimizers(
+        optimizers=JointOptimizers(
+            backbone=backbone_opt,
+            heads={TaskType.OBJECT: head_opt},
+            log_var=logvar_opt,
+        ),
+        scaler=torch.amp.GradScaler(enabled=False),
+        hydra=hydra,
+        config=JointTrainConfig(clip_heads=True, max_grad_norm=100.0),
+        backbone_grad_scale=0.5,
+    )
+
+    assert torch.allclose(
+        backbone.weight.grad, torch.full_like(backbone.weight, 1.0)
+    )
+    assert torch.allclose(head_param.grad, torch.full_like(head_param, 2.0))
+
+
 def test_log_wandb_step_gating(monkeypatch: pytest.MonkeyPatch) -> None:
     from model.joint_loop.loop import JointTrainConfig, _log_wandb_step
     from model.joint_loop.optim import JointOptimizers
@@ -236,7 +269,9 @@ def test_log_wandb_step_gating(monkeypatch: pytest.MonkeyPatch) -> None:
         optimizers=optimizers,
         weighter=weighter,
         tasks=[TaskType.OBJECT],
-        per_task_losses=per_task_losses,
+        per_task_loss_raw=per_task_losses,
+        per_task_loss_per_image=per_task_losses,
+        per_task_loss_per_branch=per_task_losses,
         per_task_decomposed=per_task_decomposed,
         wandb_run=True,  # truthy to enable logging
     )
@@ -253,7 +288,9 @@ def test_log_wandb_step_gating(monkeypatch: pytest.MonkeyPatch) -> None:
         optimizers=optimizers,
         weighter=weighter,
         tasks=[TaskType.OBJECT],
-        per_task_losses=per_task_losses,
+        per_task_loss_raw=per_task_losses,
+        per_task_loss_per_image=per_task_losses,
+        per_task_loss_per_branch=per_task_losses,
         per_task_decomposed=per_task_decomposed,
         wandb_run=True,
     )
