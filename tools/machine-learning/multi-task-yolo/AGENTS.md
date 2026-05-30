@@ -10,12 +10,13 @@
 - Python is pinned to `3.13` (`.python-version`) and `pyproject.toml` requires `>=3.13`.
 - Dependencies are managed with `uv` (`uv.lock` is present). Prefer `uv run ...` over bare `python`/`pip`.
 - Lint config is in `ruff.toml` (line length `80`, broad strict rule set, tests get limited `S101`/`S603` ignores).
-- No `pytest`/`pyrightconfig`/`pre-commit`/CI config exists in this project directory, but `pyright` is available via the `dev` dependency group in `pyproject.toml`.
+- No `pyrightconfig`/`pre-commit`/CI config exists in this project directory, but `pyright`, `ty`, and `pytest` are available via the `dev` dependency group in `pyproject.toml`.
 
 ## Reliable Commands
 
 - Lint: `uv run ruff check src`
 - Format: `uv run ruff format src`
+- Type check (ty, source only): `uv run ty check`
 - Validation CLI help: `uv run -m validation.validator --help`
 - Compare validation runs help: `uv run -m validation.compare_results --help`
 - ONNX export help: `uv run -m utils.export_yolo_to_onnx --help`

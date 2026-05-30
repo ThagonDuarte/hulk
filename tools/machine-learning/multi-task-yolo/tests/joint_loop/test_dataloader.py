@@ -155,6 +155,6 @@ def test_epoch_size_strategy_invalid() -> None:
     }
     with pytest.raises(ValueError, match="unsupported epoch_size_strategy"):
         InterleavedTaskDataloader(loaders, epoch_size_strategy="invalid_strat")
-    
+
     with pytest.raises(ValueError, match="must be positive"):
         InterleavedTaskDataloader(loaders, epoch_size_strategy=0)

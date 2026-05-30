@@ -51,7 +51,7 @@ def write_per_task_checkpoint(
         hydra_model.number_of_frozen_modules,
     )
     set_backbone(head_root, ema_backbone, hydra_model.number_of_frozen_modules)
-    ema_head = ema.hydra.heads[str(task)]
+    ema_head = cast(torch.nn.ModuleList, ema.hydra.heads[str(task)])
     head_root.model = torch.nn.Sequential(*list(ema_backbone), *list(ema_head))
 
     # Atomic-ish write: save to a temp path, then rename.

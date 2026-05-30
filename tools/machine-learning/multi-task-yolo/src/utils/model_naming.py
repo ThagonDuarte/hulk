@@ -84,7 +84,7 @@ class HydraModelName:
         heads = "+".join(str(head) for head in self.heads)
         return f"{self.backbone}=f{self.number_of_frozen_modules}+{heads}"
 
-    def integrated_model_name(self, model_name: ModelName) -> str | None:
+    def integrated_model_name(self, model_name: ModelName) -> str:
         return (
             f"{self.backbone}=f{self.number_of_frozen_modules}+{model_name!s}"
         )

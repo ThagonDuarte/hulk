@@ -40,8 +40,9 @@ def main() -> None:
 
     backbone_model = cast(DetectionModel, YOLO(args.backbone).model)
     head_model = YOLO(args.head)
+    head_root = cast(DetectionModel, head_model.model)
     backbone = get_backbone(backbone_model)
-    set_backbone(head_model.model, backbone)
+    set_backbone(head_root, backbone)
 
     head_model.save(args.output)
 

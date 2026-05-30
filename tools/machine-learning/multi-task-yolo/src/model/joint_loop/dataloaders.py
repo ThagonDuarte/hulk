@@ -11,14 +11,14 @@ Two pieces:
 from __future__ import annotations
 
 import logging
-from collections.abc import Iterable, Iterator, Sized
+from collections.abc import Iterable, Iterator, Mapping, Sized
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, Protocol, cast
 
 from ultralytics.cfg import get_cfg
 from ultralytics.data.build import build_dataloader, build_yolo_dataset
 from ultralytics.data.utils import check_det_dataset
-from ultralytics.utils import DEFAULT_CFG_DICT
+from ultralytics.utils import DEFAULT_CFG_DICT, IterableSimpleNamespace
 
 from utils.model_naming import TaskType
 
@@ -44,16 +44,16 @@ class InterleavedTaskDataloader:
 
     def __init__(
         self,
-        loaders: dict[TaskType, _SizedIterable],
+        loaders: Mapping[TaskType, _SizedIterable],
         epoch_size_strategy: str | int = "max",
     ) -> None:
         if not loaders:
             raise ValueError(  # noqa: TRY003
                 "InterleavedTaskDataloader requires at least one loader"
             )
-        self._loaders = loaders
+        self._loaders = dict(loaders)
         self._sorted_tasks: list[TaskType] = sorted(
-            loaders.keys(), key=lambda t: t.value
+            self._loaders.keys(), key=lambda t: t.value
         )
         if isinstance(epoch_size_strategy, int):
             if epoch_size_strategy <= 0:
@@ -63,11 +63,11 @@ class InterleavedTaskDataloader:
             self._steps_per_epoch = epoch_size_strategy
         elif epoch_size_strategy == "max":
             self._steps_per_epoch = max(
-                len(loaders[t]) for t in self._sorted_tasks
+                len(self._loaders[t]) for t in self._sorted_tasks
             )
         elif epoch_size_strategy == "min":
             self._steps_per_epoch = min(
-                len(loaders[t]) for t in self._sorted_tasks
+                len(self._loaders[t]) for t in self._sorted_tasks
             )
         else:
             raise ValueError(  # noqa: TRY003
@@ -155,7 +155,7 @@ def build_task_dataloader(
     }
     if overrides:
         base_overrides.update(overrides)
-    args = get_cfg(overrides=base_overrides)
+    args = cast(IterableSimpleNamespace, get_cfg(overrides=base_overrides))
 
     data = check_det_dataset(str(dataset_yaml))
     img_path = (

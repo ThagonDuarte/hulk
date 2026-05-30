@@ -274,7 +274,7 @@ def compare_runs(
             raise TaskMismatchError(baseline_task, candidate_task)
         task: TaskType = baseline_task
     else:
-        task = cast(TaskType, task_arg)
+        task = task_arg
 
     matches, mismatches = _compare_configs(
         baseline_run.config,
