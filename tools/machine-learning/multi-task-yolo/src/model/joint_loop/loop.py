@@ -16,6 +16,7 @@ from typing import Any
 import numpy as np
 import torch
 from torch.nn.utils import clip_grad_norm_
+from ultralytics.utils import TQDM
 
 import wandb
 from model.hydra import Hydra
@@ -473,74 +474,98 @@ def _train_one_epoch(
         accumulate,
     )
 
-    for task_step, (task, batch) in enumerate(interleaved):
-        starts_round = task_step % len(tasks) == 0
-        if starts_round and round_step % accumulate == 0:
-            for opt in optimizers.all():
-                opt.zero_grad(set_to_none=True)
+    current_round_loss_per_image: dict[TaskType, float] = {}
+    with TQDM(
+        total=n_rounds, desc=f"  epoch {epoch + 1}", unit="round"
+    ) as pbar:
+        for task_step, (task, batch) in enumerate(interleaved):
+            starts_round = task_step % len(tasks) == 0
+            if starts_round:
+                current_round_loss_per_image = {}
+                if round_step % accumulate == 0:
+                    for opt in optimizers.all():
+                        opt.zero_grad(set_to_none=True)
 
-        batch_on_device = _move_batch_to_device(batch, device)
+            batch_on_device = _move_batch_to_device(batch, device)
 
-        with torch.amp.autocast(
-            device_type=device.type,
-            dtype=torch.float16,
-            enabled=config.use_amp and device.type == "cuda",
-        ):
-            feat, y_backbone = hydra.run_backbone(batch_on_device["img"])
-            pred = hydra.run_head(str(task), feat, y_backbone)
-        # Loss outside autocast (fp32): PoseLoss26 uses a normalizing-flow
-        # (RLE) whose MultivariateNormal.log_prob produces NaN in fp16.
-        loss_vector, _components = criteria[task](
-            _cast_to_fp32(pred), batch_on_device
-        )
-        loss_total = loss_vector.sum()
-        actual_batch_size = batch_on_device["img"].shape[0]
-        loss_per_image = loss_total / actual_batch_size
-        branch_count = 2 if hydra.head_end2end.get(str(task), False) else 1
-        loss_per_branch = loss_per_image / branch_count
-        weighted = weighter.weight_single(task, loss_total)
-
-        scaler.scale(weighted).backward()
-
-        loss_list = (
-            _components.detach().cpu().tolist()
-            if _components.ndim > 0
-            else [_components.item()]
-        )
-        loss_names = _task_loss_names(task, len(loss_list))
-        loss_accumulator.update(
-            task,
-            raw=loss_total.detach().item(),
-            per_image=loss_per_image.detach().item(),
-            per_branch=loss_per_branch.detach().item(),
-            decomposed=dict(zip(loss_names, loss_list, strict=True)),
-        )
-
-        if (task_step + 1) % len(tasks) == 0:
-            round_step += 1
-            is_last_round = n_rounds is not None and round_step >= n_rounds
-            reached_cap = (
-                config.max_steps_per_epoch is not None
-                and round_step >= config.max_steps_per_epoch
+            with torch.amp.autocast(
+                device_type=device.type,
+                dtype=torch.float16,
+                enabled=config.use_amp and device.type == "cuda",
+            ):
+                feat, y_backbone = hydra.run_backbone(batch_on_device["img"])
+                pred = hydra.run_head(str(task), feat, y_backbone)
+            # Loss outside autocast (fp32): PoseLoss26 uses a normalizing-flow
+            # (RLE) whose MultivariateNormal.log_prob produces NaN in fp16.
+            loss_vector, _components = criteria[task](
+                _cast_to_fp32(pred), batch_on_device
             )
-            should_step = (
-                round_step % accumulate == 0 or is_last_round or reached_cap
+            loss_total = loss_vector.sum()
+            actual_batch_size = batch_on_device["img"].shape[0]
+            loss_per_image = loss_total / actual_batch_size
+            branch_count = 2 if hydra.head_end2end.get(str(task), False) else 1
+            loss_per_branch = loss_per_image / branch_count
+            weighted = weighter.weight_single(task, loss_total)
+
+            scaler.scale(weighted).backward()
+            current_round_loss_per_image[task] = loss_per_image.detach().item()
+
+            loss_list = (
+                _components.detach().cpu().tolist()
+                if _components.ndim > 0
+                else [_components.item()]
+            )
+            loss_names = _task_loss_names(task, len(loss_list))
+            loss_accumulator.update(
+                task,
+                raw=loss_total.detach().item(),
+                per_image=loss_per_image.detach().item(),
+                per_branch=loss_per_branch.detach().item(),
+                decomposed=dict(zip(loss_names, loss_list, strict=True)),
             )
 
-            if should_step:
-                _step_all_optimizers(
-                    optimizers=optimizers,
-                    scaler=scaler,
-                    hydra=hydra,
-                    config=config,
-                    backbone_grad_scale=1.0 / len(tasks),
+            if (task_step + 1) % len(tasks) == 0:
+                round_step += 1
+                is_last_round = n_rounds is not None and round_step >= n_rounds
+                reached_cap = (
+                    config.max_steps_per_epoch is not None
+                    and round_step >= config.max_steps_per_epoch
                 )
-                optimizer_steps += 1
-                if ema is not None:
-                    ema.update(hydra, weighter)
+                should_step = (
+                    round_step % accumulate == 0
+                    or is_last_round
+                    or reached_cap
+                )
 
-            if reached_cap:
-                break
+                if should_step:
+                    _step_all_optimizers(
+                        optimizers=optimizers,
+                        scaler=scaler,
+                        hydra=hydra,
+                        config=config,
+                        backbone_grad_scale=1.0 / len(tasks),
+                    )
+                    optimizer_steps += 1
+                    if ema is not None:
+                        ema.update(hydra, weighter)
+
+                mem = (
+                    f"{torch.cuda.memory_reserved() / 1e9:.3g}G"
+                    if device.type == "cuda"
+                    else ""
+                )
+                pbar.set_postfix(
+                    mem=mem,
+                    **{
+                        str(t): f"{current_round_loss_per_image[t]:.3f}"
+                        for t in tasks
+                        if t in current_round_loss_per_image
+                    },
+                )
+                pbar.update(1)
+
+                if reached_cap:
+                    break
 
     train_metrics = loss_accumulator.as_metrics()
     train_metrics["train/rounds"] = float(round_step)
