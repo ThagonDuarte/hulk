@@ -1,4 +1,5 @@
 import logging
+import math
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any, cast
@@ -13,6 +14,15 @@ from utils.model_naming import TaskType
 logger = logging.getLogger(__name__)
 
 ClassNames = Mapping[int, str] | Sequence[str] | None
+
+
+def normalize_class_names(names: ClassNames) -> dict[int, str]:
+    """Return class names as an index-keyed dictionary."""
+    if names is None:
+        return {}
+    if isinstance(names, Mapping):
+        return {int(cast(Any, k)): str(v) for k, v in names.items()}
+    return {i: str(v) for i, v in enumerate(names)}
 
 
 def get_backbone_length(yaml_config: dict) -> int:
@@ -56,6 +66,126 @@ def set_backbone(
 
     nodes = list(backbone) + head[split_idx:]
     model.model = nn.Sequential(*nodes)
+
+
+def _resize_detect_class_layers(
+    head: nn.Module,
+    old_nc: int,
+    old_names: dict[int, str],
+    new_names: dict[int, str],
+) -> None:
+    """Resize Detect/Segment/Pose class convs in-place."""
+    resized = False
+    stride = torch.as_tensor(getattr(head, "stride", []), dtype=torch.float32)
+    for attr in ("cv3", "one2one_cv3"):
+        module_list = getattr(head, attr, None)
+        if isinstance(module_list, nn.ModuleList):
+            _resize_class_module_list(
+                module_list, old_names, new_names, stride=stride
+            )
+            resized = True
+
+    # YOLO26 segmentation heads also produce semantic segmentation logits.
+    proto = getattr(head, "proto", None)
+    semseg = getattr(proto, "semseg", None)
+    if isinstance(semseg, nn.Sequential) and isinstance(
+        semseg[-1], nn.Conv2d
+    ):
+        semseg[-1] = _new_class_conv(
+            semseg[-1], old_names, new_names, stride=None
+        )
+
+    if not resized:
+        raise TypeError(  # noqa: TRY003
+            f"Cannot resize class layers for head type {type(head)!r}"
+        )
+
+    new_nc = len(new_names)
+    head_any = cast(Any, head)
+    head_any.nc = new_nc
+    if hasattr(head, "no"):
+        reg_max = int(getattr(head, "reg_max", 1))
+        head_any.no = new_nc + reg_max * 4
+    logger.info(
+        "Resized class predictors from nc=%d to nc=%d", old_nc, new_nc
+    )
+
+
+def _resize_class_module_list(
+    module_list: nn.ModuleList,
+    old_names: dict[int, str],
+    new_names: dict[int, str],
+    *,
+    stride: torch.Tensor,
+) -> None:
+    for i, branch in enumerate(module_list):
+        if not isinstance(branch, nn.Sequential):
+            raise TypeError(  # noqa: TRY003
+                f"Class branch {i} must be nn.Sequential, got {type(branch)!r}"
+            )
+        final = branch[-1]
+        if not isinstance(final, nn.Conv2d):
+            raise TypeError(  # noqa: TRY003
+                f"Class branch {i} must end in Conv2d, got {type(final)!r}"
+            )
+        branch[-1] = _new_class_conv(
+            final, old_names, new_names, stride=_stride_at(stride, i)
+        )
+
+
+def _new_class_conv(
+    old: nn.Conv2d,
+    old_names: dict[int, str],
+    new_names: dict[int, str],
+    *,
+    stride: float | None,
+) -> nn.Conv2d:
+    new_nc = len(new_names)
+    new = nn.Conv2d(
+        old.in_channels,
+        new_nc,
+        cast(Any, old.kernel_size),
+        cast(Any, old.stride),
+        cast(Any, old.padding),
+        cast(Any, old.dilation),
+        old.groups,
+        old.bias is not None,
+        old.padding_mode,
+        device=old.weight.device,
+        dtype=old.weight.dtype,
+    )
+    old_by_name = {_class_name_key(v): k for k, v in old_names.items()}
+    with torch.no_grad():
+        if new.bias is not None and stride is not None:
+            new.bias.fill_(_class_prior_bias(new_nc, stride))
+        for new_idx in range(new_nc):
+            new_name = new_names.get(new_idx, str(new_idx))
+            old_idx = old_by_name.get(_class_name_key(new_name))
+            if old_idx is None or old_idx >= old.out_channels:
+                continue
+            new.weight[new_idx].copy_(old.weight[old_idx])
+            if new.bias is not None and old.bias is not None:
+                new.bias[new_idx].copy_(old.bias[old_idx])
+    return new
+
+
+def _class_name_key(name: str) -> str:
+    return name.strip().casefold()
+
+
+def _class_prior_bias(nc: int, stride: float) -> float:
+    return math.log(5 / nc / (640 / max(stride, 1e-9)) ** 2)
+
+
+def _stride_at(stride: torch.Tensor, index: int) -> float | None:
+    if stride.numel() <= index:
+        return None
+    return float(stride.flatten()[index].item())
+
+
+class EmptyClassNamesError(ValueError):
+    def __init__(self) -> None:
+        super().__init__("class_names must contain at least one class")
 
 
 class MissingHydraHeadError(KeyError):
@@ -146,6 +276,46 @@ class Hydra(nn.Module):
                 )
             else:
                 self.head_kpt_shapes[task_type] = None
+
+    def adapt_head_classes(
+        self, task: TaskType, class_names: ClassNames
+    ) -> None:
+        """Resize a task head's class predictors to match a dataset.
+
+        Ultralytics' trainer rebuilds a model with ``nc=data["nc"]`` before
+        loading weights, which skips mismatched classifier tensors. The custom
+        Hydra loop loads checkpoint modules directly, so we perform the small
+        equivalent surgery here: replace only the final class-output convs and
+        keep all shared/box/mask/keypoint weights.
+        """
+        task_key = str(task)
+        names = normalize_class_names(class_names)
+        if not names:
+            raise EmptyClassNamesError
+        if task_key not in self.heads:
+            raise MissingHydraHeadError(task_key)
+
+        head = cast(nn.ModuleList, self.heads[task_key])[-1]
+        old_names = normalize_class_names(self.head_class_names.get(task_key))
+        old_nc = int(getattr(head, "nc", len(old_names) or 0))
+        new_nc = len(names)
+
+        self.head_class_names[task_key] = names
+        if old_nc == new_nc:
+            head_any = cast(Any, head)
+            head_any.nc = new_nc
+            if hasattr(head, "no"):
+                reg_max = int(getattr(head, "reg_max", 1))
+                head_any.no = new_nc + reg_max * 4
+            return
+
+        logger.info(
+            "Adapting %s head from nc=%d to dataset nc=%d",
+            task,
+            old_nc,
+            new_nc,
+        )
+        _resize_detect_class_layers(head, old_nc, old_names, names)
 
     def run_backbone(
         self, x: torch.Tensor

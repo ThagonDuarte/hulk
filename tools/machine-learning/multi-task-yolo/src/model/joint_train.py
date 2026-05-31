@@ -22,7 +22,7 @@ from ultralytics.utils.autodevice import GPUInfo
 from wonderwords import RandomWord
 
 import wandb
-from model.hydra import Hydra
+from model.hydra import Hydra, normalize_class_names
 from model.joint_loop.criteria import JointLossHyp
 from model.joint_loop.dataloaders import (
     InterleavedTaskDataloader,
@@ -87,7 +87,7 @@ def _validate_task_metadata(
     task: TaskType,
     dataset: Any,
 ) -> None:
-    """Fail fast when a dataset YAML is incompatible with the loaded head."""
+    """Sync class metadata and fail on incompatible pose keypoints."""
     data = getattr(dataset, "data", None)
     if not isinstance(data, dict):
         return
@@ -96,16 +96,21 @@ def _validate_task_metadata(
     head = head_module[-1]
     head_nc = getattr(head, "nc", None)
     data_nc = data.get("nc")
-    if data_nc is None and hasattr(data.get("names"), "__len__"):
-        data_nc = len(data["names"])
+    data_names = normalize_class_names(data.get("names"))
+    if data_nc is None and data_names:
+        data_nc = len(data_names)
     nc_mismatch = head_nc is not None and data_nc is not None
     nc_mismatch = nc_mismatch and int(head_nc) != int(data_nc)
     if nc_mismatch:
-        msg = (
-            f"{task} dataset declares nc={data_nc}, but loaded head has "
-            f"nc={head_nc}. Use a head checkpoint with matching classes."
-        )
-        raise click.ClickException(msg)
+        if not data_names:
+            msg = (
+                f"{task} dataset declares nc={data_nc}, but no class names "
+                "were available to resize the head."
+            )
+            raise click.ClickException(msg)
+        hydra.adapt_head_classes(task, data_names)
+    elif data_names:
+        hydra.adapt_head_classes(task, data_names)
 
     if task != TaskType.POSE:
         return

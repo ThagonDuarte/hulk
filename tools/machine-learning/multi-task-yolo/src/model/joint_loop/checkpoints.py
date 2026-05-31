@@ -23,7 +23,7 @@ from torch import optim
 from ultralytics.models.yolo.model import YOLO
 from ultralytics.nn.tasks import DetectionModel
 
-from model.hydra import Hydra, get_backbone, set_backbone
+from model.hydra import Hydra, get_backbone, normalize_class_names, set_backbone
 from model.joint_loop.optim import EMAHydra, JointOptimizers
 from model.joint_loop.weighting import UncertaintyWeighter
 from utils.model_naming import HydraModelName, TaskType
@@ -53,11 +53,32 @@ def write_per_task_checkpoint(
     set_backbone(head_root, ema_backbone, hydra_model.number_of_frozen_modules)
     ema_head = cast(torch.nn.ModuleList, ema.hydra.heads[str(task)])
     head_root.model = torch.nn.Sequential(*list(ema_backbone), *list(ema_head))
+    _apply_class_metadata(head_root, ema.hydra, task)
 
     # Atomic-ish write: save to a temp path, then rename.
     tmp_path = output_path.with_suffix(output_path.suffix + ".tmp")
     head_yolo.save(str(tmp_path))
     os.replace(tmp_path, output_path)
+
+
+def _apply_class_metadata(
+    head_root: DetectionModel, hydra: Hydra, task: TaskType
+) -> None:
+    raw_names = getattr(hydra, "head_class_names", {}).get(str(task))
+    names = normalize_class_names(raw_names)
+    if not names:
+        return
+    root_any = cast(Any, head_root)
+    root_any.names = names
+    root_any.nc = len(names)
+    if isinstance(head_root.yaml, dict):
+        head_root.yaml["nc"] = len(names)
+    final = head_root.model[-1]
+    final_any = cast(Any, final)
+    final_any.nc = len(names)
+    if hasattr(final, "no"):
+        reg_max = int(getattr(final, "reg_max", 1))
+        final_any.no = len(names) + reg_max * 4
 
 
 def _ema_root_module(ema: EMAHydra, _hydra_model: HydraModelName) -> Any:
