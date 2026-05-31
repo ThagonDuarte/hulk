@@ -15,10 +15,9 @@ from typing import Any
 
 import numpy as np
 import torch
-import wandb
 from torch.nn.utils import clip_grad_norm_
-from ultralytics.utils import TQDM
 
+import wandb
 from model.hydra import Hydra
 from model.joint_loop.checkpoints import (
     write_joint_state,
@@ -54,7 +53,6 @@ class JointTrainConfig:
     warmup_epochs_backbone: int = 15
     warmup_epochs_heads: int = 3
     val_interval: int = 1
-    log_interval: int = 50
     optimizer_name: str = "MuSGD"
     lr_backbone: float = 0.001
     lr_heads: float = 0.01
@@ -203,7 +201,7 @@ def train_joint(  # noqa: C901
 
         interleaved.set_epoch(epoch)
         logger.info("epoch %d/%d", epoch + 1, config.epochs)
-        global_step = _train_one_epoch(
+        global_step, train_metrics = _train_one_epoch(
             hydra=hydra,
             weighter=weighter,
             interleaved=interleaved,
@@ -215,9 +213,17 @@ def train_joint(  # noqa: C901
             device=device,
             config=config,
             epoch=epoch,
-            wandb_run=wandb_run,
             global_step=global_step,
             batch_size=batch,
+        )
+        _log_wandb_epoch(
+            epoch=epoch,
+            global_step=global_step,
+            optimizers=optimizers,
+            weighter=weighter,
+            tasks=tasks,
+            train_metrics=train_metrics,
+            wandb_run=wandb_run,
         )
 
         epoch_update(criteria)
@@ -379,6 +385,64 @@ def _cast_to_fp32(
     return pred
 
 
+@dataclass
+class _EpochLossAccumulator:
+    counts: dict[TaskType, int]
+    raw: dict[TaskType, float]
+    per_image: dict[TaskType, float]
+    per_branch: dict[TaskType, float]
+    decomposed: dict[TaskType, dict[str, float]]
+    decomposed_counts: dict[TaskType, dict[str, int]]
+
+    @classmethod
+    def for_tasks(cls, tasks: list[TaskType]) -> _EpochLossAccumulator:
+        return cls(
+            counts=dict.fromkeys(tasks, 0),
+            raw=dict.fromkeys(tasks, 0.0),
+            per_image=dict.fromkeys(tasks, 0.0),
+            per_branch=dict.fromkeys(tasks, 0.0),
+            decomposed={task: {} for task in tasks},
+            decomposed_counts={task: {} for task in tasks},
+        )
+
+    def update(
+        self,
+        task: TaskType,
+        *,
+        raw: float,
+        per_image: float,
+        per_branch: float,
+        decomposed: dict[str, float],
+    ) -> None:
+        self.counts[task] += 1
+        self.raw[task] += raw
+        self.per_image[task] += per_image
+        self.per_branch[task] += per_branch
+        for name, value in decomposed.items():
+            self.decomposed[task][name] = (
+                self.decomposed[task].get(name, 0.0) + value
+            )
+            self.decomposed_counts[task][name] = (
+                self.decomposed_counts[task].get(name, 0) + 1
+            )
+
+    def as_metrics(self) -> dict[str, float]:
+        metrics: dict[str, float] = {}
+        for task, count in self.counts.items():
+            if count == 0:
+                continue
+            metrics[f"loss/{task}"] = self.per_image[task] / count
+            metrics[f"loss/{task}/per_image"] = self.per_image[task] / count
+            metrics[f"loss/{task}/per_image_per_branch"] = (
+                self.per_branch[task] / count
+            )
+            metrics[f"loss/{task}/raw_batch_scaled"] = self.raw[task] / count
+            for name, total in self.decomposed[task].items():
+                denom = self.decomposed_counts[task][name]
+                metrics[f"loss/{task}/{name}"] = total / denom
+        return metrics
+
+
 def _train_one_epoch(
     *,
     hydra: Hydra,
@@ -392,127 +456,100 @@ def _train_one_epoch(
     device: torch.device,
     config: JointTrainConfig,
     epoch: int,
-    wandb_run: Any | None,
     global_step: int,
     batch_size: int,
-) -> int:
+) -> tuple[int, dict[str, float]]:
     hydra.train()
     weighter.train()
 
-    task_step = 0
     round_step = 0
     optimizer_steps = 0
     n_rounds = _epoch_rounds(interleaved, config)
     accumulate = _accumulate_rounds(config, batch_size)
-    logger.info("gradient accumulation: %d synchronized rounds", accumulate)
-    per_task_loss_raw: dict[TaskType, torch.Tensor] = {}
-    per_task_loss_per_image: dict[TaskType, torch.Tensor] = {}
-    per_task_loss_per_branch: dict[TaskType, torch.Tensor] = {}
-    per_task_decomposed: dict[TaskType, dict[str, float]] = {}
+    loss_accumulator = _EpochLossAccumulator.for_tasks(tasks)
+    logger.info(
+        "epoch %d: gradient accumulation=%d synchronized rounds",
+        epoch,
+        accumulate,
+    )
 
-    with TQDM(
-        total=n_rounds, desc=f"  epoch {epoch + 1}", unit="round"
-    ) as pbar:
-        for task, batch in interleaved:
-            if task_step % len(tasks) == 0:
-                if round_step % accumulate == 0:
-                    for opt in optimizers.all():
-                        opt.zero_grad(set_to_none=True)
-                per_task_loss_raw: dict[TaskType, torch.Tensor] = {}
-                per_task_loss_per_image: dict[TaskType, torch.Tensor] = {}
-                per_task_loss_per_branch: dict[TaskType, torch.Tensor] = {}
-                per_task_decomposed: dict[TaskType, dict[str, float]] = {}
+    for task_step, (task, batch) in enumerate(interleaved):
+        starts_round = task_step % len(tasks) == 0
+        if starts_round and round_step % accumulate == 0:
+            for opt in optimizers.all():
+                opt.zero_grad(set_to_none=True)
 
-            batch_on_device = _move_batch_to_device(batch, device)
+        batch_on_device = _move_batch_to_device(batch, device)
 
-            with torch.amp.autocast(
-                device_type=device.type,
-                dtype=torch.float16,
-                enabled=config.use_amp and device.type == "cuda",
-            ):
-                feat, y_backbone = hydra.run_backbone(batch_on_device["img"])
-                pred = hydra.run_head(str(task), feat, y_backbone)
-            # Loss outside autocast (fp32): PoseLoss26 uses a normalizing-flow
-            # (RLE) whose MultivariateNormal.log_prob produces NaN in fp16.
-            loss_vector, _components = criteria[task](
-                _cast_to_fp32(pred), batch_on_device
+        with torch.amp.autocast(
+            device_type=device.type,
+            dtype=torch.float16,
+            enabled=config.use_amp and device.type == "cuda",
+        ):
+            feat, y_backbone = hydra.run_backbone(batch_on_device["img"])
+            pred = hydra.run_head(str(task), feat, y_backbone)
+        # Loss outside autocast (fp32): PoseLoss26 uses a normalizing-flow
+        # (RLE) whose MultivariateNormal.log_prob produces NaN in fp16.
+        loss_vector, _components = criteria[task](
+            _cast_to_fp32(pred), batch_on_device
+        )
+        loss_total = loss_vector.sum()
+        actual_batch_size = batch_on_device["img"].shape[0]
+        loss_per_image = loss_total / actual_batch_size
+        branch_count = 2 if hydra.head_end2end.get(str(task), False) else 1
+        loss_per_branch = loss_per_image / branch_count
+        weighted = weighter.weight_single(task, loss_total)
+
+        scaler.scale(weighted).backward()
+
+        loss_list = (
+            _components.detach().cpu().tolist()
+            if _components.ndim > 0
+            else [_components.item()]
+        )
+        loss_names = _task_loss_names(task, len(loss_list))
+        loss_accumulator.update(
+            task,
+            raw=loss_total.detach().item(),
+            per_image=loss_per_image.detach().item(),
+            per_branch=loss_per_branch.detach().item(),
+            decomposed=dict(zip(loss_names, loss_list, strict=True)),
+        )
+
+        if (task_step + 1) % len(tasks) == 0:
+            round_step += 1
+            is_last_round = n_rounds is not None and round_step >= n_rounds
+            reached_cap = (
+                config.max_steps_per_epoch is not None
+                and round_step >= config.max_steps_per_epoch
             )
-            loss_total = loss_vector.sum()
-            actual_batch_size = batch_on_device["img"].shape[0]
-            loss_per_image = loss_total / actual_batch_size
-            branch_count = 2 if hydra.head_end2end.get(str(task), False) else 1
-            loss_per_branch = loss_per_image / branch_count
-            weighted = weighter.weight_single(task, loss_total)
-
-            scaler.scale(weighted).backward()
-            per_task_loss_raw[task] = loss_total.detach()
-            per_task_loss_per_image[task] = loss_per_image.detach()
-            per_task_loss_per_branch[task] = loss_per_branch.detach()
-
-            loss_list = (
-                _components.detach().cpu().tolist()
-                if _components.ndim > 0
-                else [_components.item()]
-            )
-            loss_names = _task_loss_names(task, len(loss_list))
-            per_task_decomposed[task] = dict(
-                zip(loss_names, loss_list, strict=True)
+            should_step = (
+                round_step % accumulate == 0 or is_last_round or reached_cap
             )
 
-            task_step += 1
-            if task_step % len(tasks) == 0:
-                round_step += 1
-                is_last_round = n_rounds is not None and round_step >= n_rounds
-                reached_cap = (
-                    config.max_steps_per_epoch is not None
-                    and round_step >= config.max_steps_per_epoch
+            if should_step:
+                _step_all_optimizers(
+                    optimizers=optimizers,
+                    scaler=scaler,
+                    hydra=hydra,
+                    config=config,
+                    backbone_grad_scale=1.0 / len(tasks),
                 )
-                should_step = (
-                    round_step % accumulate == 0 or is_last_round or reached_cap
-                )
+                optimizer_steps += 1
+                if ema is not None:
+                    ema.update(hydra, weighter)
 
-                if should_step:
-                    _step_all_optimizers(
-                        optimizers=optimizers,
-                        scaler=scaler,
-                        hydra=hydra,
-                        config=config,
-                        backbone_grad_scale=1.0 / len(tasks),
-                    )
-                    optimizer_steps += 1
-                    if ema is not None:
-                        ema.update(hydra, weighter)
+            if reached_cap:
+                break
 
-                    _log_wandb_step(
-                        step=round_step,
-                        global_step=global_step + optimizer_steps,
-                        epoch=epoch,
-                        config=config,
-                        optimizers=optimizers,
-                        weighter=weighter,
-                        tasks=tasks,
-                        per_task_loss_raw=per_task_loss_raw,
-                        per_task_loss_per_image=per_task_loss_per_image,
-                        per_task_loss_per_branch=per_task_loss_per_branch,
-                        per_task_decomposed=per_task_decomposed,
-                        wandb_run=wandb_run,
-                    )
-
-                mem = (
-                    f"{torch.cuda.memory_reserved() / 1e9:.3g}G"
-                    if device.type == "cuda"
-                    else ""
-                )
-                task_losses = {
-                    str(t): f"{per_task_loss_per_image[t].item():.3f}"
-                    for t in tasks
-                }
-                pbar.set_postfix(mem=mem, **task_losses)
-                pbar.update(1)
-
-                if reached_cap:
-                    break
-    return global_step + optimizer_steps
+    train_metrics = loss_accumulator.as_metrics()
+    train_metrics["train/rounds"] = float(round_step)
+    train_metrics["train/optimizer_steps"] = float(optimizer_steps)
+    if device.type == "cuda":
+        train_metrics["train/mem_reserved_gb"] = (
+            torch.cuda.memory_reserved() / 1e9
+        )
+    return global_step + optimizer_steps, train_metrics
 
 
 def _task_loss_names(task: TaskType, length: int) -> list[str]:
@@ -544,24 +581,27 @@ def _task_loss_names(task: TaskType, length: int) -> list[str]:
     return [f"loss_comp_{i}" for i in range(length)]
 
 
-def _log_wandb_step(
+def _log_wandb_epoch(
     *,
-    step: int,
-    global_step: int,
     epoch: int,
-    config: JointTrainConfig,
+    global_step: int,
     optimizers: JointOptimizers,
     weighter: UncertaintyWeighter,
     tasks: list[TaskType],
-    per_task_loss_raw: dict[TaskType, torch.Tensor],
-    per_task_loss_per_image: dict[TaskType, torch.Tensor],
-    per_task_loss_per_branch: dict[TaskType, torch.Tensor],
-    per_task_decomposed: dict[TaskType, dict[str, float]] | None = None,
+    train_metrics: dict[str, float],
     wandb_run: Any,
 ) -> None:
-    """Emit per-step metrics to W&B if interval matches and run is active."""
-    if global_step % config.log_interval != 0 or not wandb_run:
+    """Emit one training metrics payload per epoch."""
+    summary = {
+        key: round(value, 4)
+        for key, value in train_metrics.items()
+        if key.startswith("loss/") and key.count("/") == 1
+    }
+    logger.info("epoch %d train metrics: %s", epoch, summary)
+
+    if not wandb_run:
         return
+
     lr_log = {
         "lr/backbone": optimizers.backbone.param_groups[0]["lr"],
         "lr/logvar": optimizers.log_var.param_groups[0]["lr"],
@@ -570,26 +610,6 @@ def _log_wandb_step(
             for t, opt in optimizers.heads.items()
         },
     }
-    losses_log = {
-        **{f"loss/{t}": v.item() for t, v in per_task_loss_per_image.items()},
-        **{
-            f"loss/{t}/per_image": v.item()
-            for t, v in per_task_loss_per_image.items()
-        },
-        **{
-            f"loss/{t}/per_image_per_branch": v.item()
-            for t, v in per_task_loss_per_branch.items()
-        },
-        **{
-            f"loss/{t}/raw_batch_scaled": v.item()
-            for t, v in per_task_loss_raw.items()
-        },
-    }
-    decomposed_log = {}
-    if per_task_decomposed:
-        for t, decomp in per_task_decomposed.items():
-            for name, val in decomp.items():
-                decomposed_log[f"loss/{t}/{name}"] = val
     logvar_log = {
         f"logvar/{t}": weighter.log_var[weighter.tasks.index(t)].item()
         for t in tasks
@@ -597,10 +617,8 @@ def _log_wandb_step(
     wandb.log(
         {
             "epoch": epoch,
-            "local_step": step,
             **lr_log,
-            **losses_log,
-            **decomposed_log,
+            **train_metrics,
             **logvar_log,
         },
         step=global_step,

@@ -18,10 +18,10 @@ from typing import Any, TypeVar, cast
 import click
 import numpy as np
 import torch
-import wandb
 from ultralytics.utils.autodevice import GPUInfo
 from wonderwords import RandomWord
 
+import wandb
 from model.hydra import Hydra
 from model.joint_loop.criteria import JointLossHyp
 from model.joint_loop.dataloaders import (
@@ -214,7 +214,6 @@ def _select_training_device(device: str | torch.device) -> torch.device:
 @option("--ema/--no_ema", default=True)
 @option("--clip_heads/--no_clip_heads", default=True)
 @option("--resume", is_flag=True, default=False)
-@option("--log_interval", default=50, type=int)
 @option("--wandb_project", default="multi-task-yolo", type=str)
 @option("--epoch_size_strategy", default="max", type=str)
 def main(
@@ -251,7 +250,6 @@ def main(
     ema: bool,
     clip_heads: bool,
     resume: bool,
-    log_interval: int,
     wandb_project: str,
     epoch_size_strategy: str,
 ) -> None:
@@ -321,7 +319,6 @@ def main(
         warmup_epochs_backbone=warmup_epochs_backbone,
         warmup_epochs_heads=warmup_epochs_heads,
         val_interval=val_interval,
-        log_interval=log_interval,
         optimizer_name=optimizer,
         lr_backbone=lr_backbone,
         lr_heads=lr_heads,

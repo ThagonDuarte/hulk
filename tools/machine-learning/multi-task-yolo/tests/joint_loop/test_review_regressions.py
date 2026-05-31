@@ -226,8 +226,8 @@ def test_step_all_optimizers_scales_only_backbone_gradients() -> None:
     assert torch.allclose(head_param.grad, torch.full_like(head_param, 2.0))
 
 
-def test_log_wandb_step_gating(monkeypatch: pytest.MonkeyPatch) -> None:
-    from model.joint_loop.loop import JointTrainConfig, _log_wandb_step
+def test_log_wandb_epoch(monkeypatch: pytest.MonkeyPatch) -> None:
+    from model.joint_loop.loop import _log_wandb_epoch
     from model.joint_loop.optim import JointOptimizers
     from model.joint_loop.weighting import UncertaintyWeighter
 
@@ -243,7 +243,6 @@ def test_log_wandb_step_gating(monkeypatch: pytest.MonkeyPatch) -> None:
 
     monkeypatch.setattr(wandb, "log", FakeWandb().log)
 
-    # Setup dummy objects
     backbone_opt = SimpleNamespace(param_groups=[{"lr": 0.001}])
     head_opt = SimpleNamespace(param_groups=[{"lr": 0.01}])
     logvar_opt = SimpleNamespace(param_groups=[{"lr": 0.0001}])
@@ -252,57 +251,28 @@ def test_log_wandb_step_gating(monkeypatch: pytest.MonkeyPatch) -> None:
         heads={TaskType.OBJECT: head_opt},
         log_var=logvar_opt,
     )
-
     weighter = UncertaintyWeighter([TaskType.OBJECT])
+    train_metrics = {
+        f"loss/{TaskType.OBJECT}": 1.5,
+        f"loss/{TaskType.OBJECT}/box_loss": 0.5,
+    }
 
-    config = JointTrainConfig(log_interval=10)
-    per_task_losses = {TaskType.OBJECT: torch.tensor(1.5)}
-
-    per_task_decomposed = {TaskType.OBJECT: {"box_loss": 0.5, "cls_loss": 1.0}}
-
-    # 1. Test when global_step % log_interval != 0
-    _log_wandb_step(
-        step=5,
-        global_step=15,  # not a multiple of 10
+    _log_wandb_epoch(
         epoch=1,
-        config=config,
+        global_step=20,
         optimizers=optimizers,
         weighter=weighter,
         tasks=[TaskType.OBJECT],
-        per_task_loss_raw=per_task_losses,
-        per_task_loss_per_image=per_task_losses,
-        per_task_loss_per_branch=per_task_losses,
-        per_task_decomposed=per_task_decomposed,
-        wandb_run=True,  # truthy to enable logging
-    )
-    assert len(logged_payloads) == 0, (
-        "Should not log if not a multiple of log_interval"
-    )
-
-    # 2. Test when global_step % log_interval == 0
-    _log_wandb_step(
-        step=5,
-        global_step=20,  # multiple of 10
-        epoch=1,
-        config=config,
-        optimizers=optimizers,
-        weighter=weighter,
-        tasks=[TaskType.OBJECT],
-        per_task_loss_raw=per_task_losses,
-        per_task_loss_per_image=per_task_losses,
-        per_task_loss_per_branch=per_task_losses,
-        per_task_decomposed=per_task_decomposed,
+        train_metrics=train_metrics,
         wandb_run=True,
     )
+
     assert len(logged_payloads) == 1
     assert logged_steps[0] == 20
     payload = logged_payloads[0]
     assert payload["epoch"] == 1
-    assert payload["local_step"] == 5
-    assert payload[f"loss/{TaskType.OBJECT}/box_loss"] == 0.5
-    assert payload[f"loss/{TaskType.OBJECT}/cls_loss"] == 1.0
-    assert "step" not in payload, (
-        "Conflict key 'step' should not be present in payload"
-    )
+    assert "local_step" not in payload
+    assert "step" not in payload
     assert payload["lr/backbone"] == 0.001
     assert payload[f"loss/{TaskType.OBJECT}"] == 1.5
+    assert payload[f"loss/{TaskType.OBJECT}/box_loss"] == 0.5
