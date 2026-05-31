@@ -45,7 +45,7 @@ class ValidationConfig:
     save_txt: bool = False
     project: str | Path = "runs"
     exist_ok: bool = True
-    device: int | str | list = -1
+    device: Any = -1
 
     def to_dict(self, **overrides: Any) -> dict[str, Any]:
         """

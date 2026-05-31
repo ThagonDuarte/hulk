@@ -254,7 +254,7 @@ def train_joint(  # noqa: C901
             run_dir=run_dir,
             imgsz=imgsz,
             batch=batch,
-            device_str=device_str,
+            device=device,
             config=config,
             wandb_run=wandb_run,
         )
@@ -716,7 +716,7 @@ def _validate_epoch(
     run_dir: Path,
     imgsz: int,
     batch: int,
-    device_str: str,
+    device: torch.device | str,
     config: JointTrainConfig,
     wandb_run: Any,
 ) -> tuple[float, dict[TaskType, float]]:
@@ -729,7 +729,7 @@ def _validate_epoch(
         run_dir=run_dir,
         imgsz=imgsz,
         batch=batch,
-        device=device_str,
+        device=device,
         task_weights=config.task_weights,
     )
     logger.info("epoch %d: score=%.4f per_task=%s", epoch, score, per_task)

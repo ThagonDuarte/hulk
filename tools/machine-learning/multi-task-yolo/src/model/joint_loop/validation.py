@@ -14,6 +14,7 @@ import shutil
 import tempfile
 from collections.abc import Mapping
 from pathlib import Path
+from typing import Any
 
 from model.joint_loop.checkpoints import write_per_task_checkpoint
 from model.joint_loop.optim import EMAHydra
@@ -38,7 +39,7 @@ def run_validation(
     run_dir: Path,
     imgsz: int,
     batch: int,
-    device: str,
+    device: Any,
     task_weights: Mapping[TaskType, float],
 ) -> tuple[
     float,
