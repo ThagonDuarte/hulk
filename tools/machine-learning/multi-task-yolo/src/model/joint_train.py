@@ -340,6 +340,17 @@ def main(
     )
 
     wandb_run = wandb.init(project=wandb_project, name=run_id)
+    if wandb_run is not None:
+        wandb_run.define_metric("epoch")
+        wandb_run.define_metric("global_step")
+        for metric_pattern in (
+            "loss/*",
+            "train/*",
+            "lr/*",
+            "logvar/*",
+            "val/*",
+        ):
+            wandb_run.define_metric(metric_pattern, step_metric="epoch")
 
     train_joint(
         hydra=hydra,

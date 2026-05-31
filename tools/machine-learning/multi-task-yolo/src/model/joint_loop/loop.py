@@ -624,7 +624,7 @@ def _log_wandb_epoch(
     }
     logger.info("epoch %d train metrics: %s", epoch, summary)
 
-    if not wandb_run:
+    if wandb_run is None:
         return
 
     lr_log = {
@@ -639,14 +639,14 @@ def _log_wandb_epoch(
         f"logvar/{t}": weighter.log_var[weighter.tasks.index(t)].item()
         for t in tasks
     }
-    wandb.log(
+    wandb_run.log(
         {
             "epoch": epoch,
+            "global_step": global_step,
             **lr_log,
             **train_metrics,
             **logvar_log,
         },
-        step=global_step,
     )
 
 
@@ -738,6 +738,7 @@ def _validate_epoch(
             "val/score": score,
             **{f"val/{t}": v for t, v in per_task.items()},
             "epoch": epoch,
+            "global_step": global_step,
         }
         for task, metrics in all_metrics.items():
             for metric_name, val in metrics.items():
@@ -755,8 +756,5 @@ def _validate_epoch(
                         "Failed to convert %s to wandb.Image", path
                     )
 
-        wandb.log(
-            val_metrics_log,
-            step=global_step,
-        )
+        wandb_run.log(val_metrics_log)
     return score, per_task

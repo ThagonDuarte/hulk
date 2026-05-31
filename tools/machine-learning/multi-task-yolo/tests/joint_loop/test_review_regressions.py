@@ -226,22 +226,18 @@ def test_step_all_optimizers_scales_only_backbone_gradients() -> None:
     assert torch.allclose(head_param.grad, torch.full_like(head_param, 2.0))
 
 
-def test_log_wandb_epoch(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_log_wandb_epoch() -> None:
     from model.joint_loop.loop import _log_wandb_epoch
     from model.joint_loop.optim import JointOptimizers
     from model.joint_loop.weighting import UncertaintyWeighter
 
     logged_payloads = []
-    logged_steps = []
+    logged_kwargs = []
 
-    class FakeWandb:
-        def log(self, payload: dict[str, Any], step: int) -> None:
+    class FakeWandbRun:
+        def log(self, payload: dict[str, Any], **kwargs: Any) -> None:
             logged_payloads.append(payload)
-            logged_steps.append(step)
-
-    import wandb
-
-    monkeypatch.setattr(wandb, "log", FakeWandb().log)
+            logged_kwargs.append(kwargs)
 
     backbone_opt = SimpleNamespace(param_groups=[{"lr": 0.001}])
     head_opt = SimpleNamespace(param_groups=[{"lr": 0.01}])
@@ -264,13 +260,14 @@ def test_log_wandb_epoch(monkeypatch: pytest.MonkeyPatch) -> None:
         weighter=weighter,
         tasks=[TaskType.OBJECT],
         train_metrics=train_metrics,
-        wandb_run=True,
+        wandb_run=FakeWandbRun(),
     )
 
     assert len(logged_payloads) == 1
-    assert logged_steps[0] == 20
+    assert logged_kwargs == [{}]
     payload = logged_payloads[0]
     assert payload["epoch"] == 1
+    assert payload["global_step"] == 20
     assert "local_step" not in payload
     assert "step" not in payload
     assert payload["lr/backbone"] == 0.001
