@@ -264,7 +264,7 @@ def test_log_wandb_epoch() -> None:
     )
 
     assert len(logged_payloads) == 1
-    assert logged_kwargs == [{}]
+    assert logged_kwargs == [{"commit": True}]
     payload = logged_payloads[0]
     assert payload["epoch"] == 1
     assert payload["global_step"] == 20

@@ -217,6 +217,9 @@ def train_joint(  # noqa: C901
             global_step=global_step,
             batch_size=batch,
         )
+        skip_val = (
+            epoch % config.val_interval != 0 and epoch != config.epochs - 1
+        )
         _log_wandb_epoch(
             epoch=epoch,
             global_step=global_step,
@@ -225,6 +228,7 @@ def train_joint(  # noqa: C901
             tasks=tasks,
             train_metrics=train_metrics,
             wandb_run=wandb_run,
+            commit=skip_val,
         )
 
         epoch_update(criteria)
@@ -233,10 +237,6 @@ def train_joint(  # noqa: C901
             if opt is optimizers.backbone and backbone_frozen:
                 continue
             sched.step()
-
-        skip_val = (
-            epoch % config.val_interval != 0 and epoch != config.epochs - 1
-        )
         if skip_val:
             logger.info("epoch %d: validation skipped (val_interval)", epoch)
             continue
@@ -615,6 +615,7 @@ def _log_wandb_epoch(
     tasks: list[TaskType],
     train_metrics: dict[str, float],
     wandb_run: Any,
+    commit: bool = True,
 ) -> None:
     """Emit one training metrics payload per epoch."""
     summary = {
@@ -647,6 +648,7 @@ def _log_wandb_epoch(
             **train_metrics,
             **logvar_log,
         },
+        commit=commit,
     )
 
 
@@ -756,5 +758,5 @@ def _validate_epoch(
                         "Failed to convert %s to wandb.Image", path
                     )
 
-        wandb_run.log(val_metrics_log)
+        wandb_run.log(val_metrics_log, commit=True)
     return score, per_task
