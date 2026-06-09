@@ -4,6 +4,14 @@ import torch
 from model import joint_train
 
 
+class _FakeWandbRun:
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, dict[str, object]]] = []
+
+    def define_metric(self, name: str, **kwargs: object) -> None:
+        self.calls.append((name, kwargs))
+
+
 class _FakeGPUInfo:
     def select_idle_gpu(
         self,
@@ -14,6 +22,27 @@ class _FakeGPUInfo:
         assert count == 1
         assert min_memory_fraction == 0.2
         return [1]
+
+
+def test_configure_wandb_metrics_uses_hidden_epoch_axis() -> None:
+    run = _FakeWandbRun()
+
+    joint_train._configure_wandb_metrics(run)
+
+    assert run.calls[0] == (
+        "epoch",
+        {"hidden": True, "summary": "none", "overwrite": True},
+    )
+    assert run.calls[-1] == run.calls[0]
+    axis_calls = dict(run.calls[1:-1])
+    assert axis_calls["*"] == {
+        "step_metric": "epoch",
+        "step_sync": True,
+        "overwrite": True,
+    }
+    assert axis_calls["loss/*"] == axis_calls["*"]
+    assert axis_calls["val/*"] == axis_calls["*"]
+    assert axis_calls["global_step"] == axis_calls["*"]
 
 
 def test_auto_device_selection_returns_physical_cuda_index(

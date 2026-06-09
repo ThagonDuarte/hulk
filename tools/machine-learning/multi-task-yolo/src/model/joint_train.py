@@ -132,6 +132,32 @@ def option(*args: Any, **kwargs: Any) -> Callable[[F], F]:
     return click.option(*args, **kwargs)
 
 
+def _configure_wandb_metrics(wandb_run: Any) -> None:
+    """Use epoch as the x-axis while hiding the epoch helper metric."""
+    epoch_metric = "epoch"
+    axis_kwargs = {
+        "step_metric": epoch_metric,
+        "step_sync": True,
+        "overwrite": True,
+    }
+    wandb_run.define_metric(
+        epoch_metric, hidden=True, summary="none", overwrite=True
+    )
+    for metric_pattern in (
+        "*",
+        "loss/*",
+        "train/*",
+        "lr/*",
+        "logvar/*",
+        "val/*",
+        "global_step",
+    ):
+        wandb_run.define_metric(metric_pattern, **axis_kwargs)
+    wandb_run.define_metric(
+        epoch_metric, hidden=True, summary="none", overwrite=True
+    )
+
+
 def _cuda_index_from_device_arg(raw: str) -> int:
     if "," in raw:
         msg = "joint_train supports a single CUDA device, not multi-GPU"
@@ -346,16 +372,7 @@ def main(
 
     wandb_run = wandb.init(project=wandb_project, name=run_id)
     if wandb_run is not None:
-        wandb_run.define_metric("epoch")
-        wandb_run.define_metric("global_step")
-        for metric_pattern in (
-            "loss/*",
-            "train/*",
-            "lr/*",
-            "logvar/*",
-            "val/*",
-        ):
-            wandb_run.define_metric(metric_pattern, step_metric="epoch")
+        _configure_wandb_metrics(wandb_run)
 
     train_joint(
         hydra=hydra,
