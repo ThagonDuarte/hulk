@@ -14,13 +14,11 @@ use filtering::low_pass_filter::LowPassFilter;
 use kinematics::joints::{Joints, head::HeadJoints};
 use ros_z::prelude::*;
 use types::{
-    motion_command::{HeadMotion, ImageRegion, MotionCommand},
+    motion_command::{HeadMotion, ImageRegion, MotionCommand, SequencedMotionCommand},
     parameters::HeadMotionParameters,
 };
 
 const MAX_INPUT_DRAIN_PER_TICK: usize = 10;
-const MOTION_COMMAND_TOPIC: &str = "behavior/motion_command";
-
 #[derive(Debug, Clone, Serialize, Deserialize, Message)]
 #[serde(deny_unknown_fields)]
 pub struct Parameters {
@@ -48,7 +46,7 @@ async fn run(ctx: Arc<Context>) -> Result<()> {
         .build()
         .await?;
     let motion_command_sub = node
-        .subscriber::<MotionCommand>(MOTION_COMMAND_TOPIC)?
+        .subscriber::<SequencedMotionCommand>("behavior/motion_command")?
         .build()
         .await?;
     let head_joints_command_pub = node
@@ -77,7 +75,7 @@ async fn run(ctx: Arc<Context>) -> Result<()> {
                 latest_motor_states = Some(motor_states?);
             }
             motion_command = motion_command_sub.recv() => {
-                latest_motion_command = motion_command?;
+                latest_motion_command = motion_command?.motion_command;
             }
             _ = tick.tick() => {
                 for _ in 0..MAX_INPUT_DRAIN_PER_TICK {
@@ -109,7 +107,7 @@ async fn run(ctx: Arc<Context>) -> Result<()> {
                         break;
                     }
 
-                    latest_motion_command = motion_command_sub.recv().await?;
+                    latest_motion_command = motion_command_sub.recv().await?.motion_command;
                 }
 
                 let Some(look_around_target_joints) = latest_look_around_target_joints else {

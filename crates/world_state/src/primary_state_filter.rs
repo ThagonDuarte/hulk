@@ -93,11 +93,11 @@ impl PrimaryStateFilter {
             (
                 PrimaryState::Initial,
                 Buttons {
-                    stand: Some(ButtonPressType::Long),
+                    walking: Some(ButtonPressType::Long),
                     ..
                 },
                 _,
-            ) if *context.is_safe_pose => PrimaryState::Playing,
+            ) => PrimaryState::Playing,
             (PrimaryState::Damping, _, _) => {
                 if context.hardware_interface.is_simulation()? {
                     PrimaryState::Initial

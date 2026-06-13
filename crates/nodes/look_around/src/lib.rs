@@ -16,13 +16,12 @@ use types::{
     initial_look_around::{
         BallSearchLookAround, InitialLookAround, LookAroundMode, QuickLookAround,
     },
-    motion_command::{HeadMotion, MotionCommand},
+    motion_command::{HeadMotion, MotionCommand, SequencedMotionCommand},
     parameters::LookAroundParameters,
     support_foot::Side,
 };
 
 const MAX_INPUT_DRAIN_PER_TICK: usize = 10;
-const MOTION_COMMAND_TOPIC: &str = "behavior/motion_command";
 
 pub fn run_boxed(ctx: Arc<Context>) -> Pin<Box<dyn Future<Output = Result<()>> + Send>> {
     Box::pin(run(ctx))
@@ -33,7 +32,7 @@ async fn run(ctx: Arc<Context>) -> Result<()> {
 
     let parameters = node.bind_parameter_as::<LookAroundParameters>("look_around")?;
     let motion_command_sub = node
-        .subscriber::<MotionCommand>(MOTION_COMMAND_TOPIC)?
+        .subscriber::<SequencedMotionCommand>("behavior/motion_command")?
         .build()
         .await?;
     let filtered_game_controller_state_sub = node
@@ -58,7 +57,7 @@ async fn run(ctx: Arc<Context>) -> Result<()> {
     loop {
         tokio::select! {
             motion_command = motion_command_sub.recv() => {
-                latest_motion_command = motion_command?;
+                latest_motion_command = motion_command?.motion_command;
             }
             filtered_game_controller_state = filtered_game_controller_state_sub.recv() => {
                 latest_filtered_game_controller_state = Some(filtered_game_controller_state?);
@@ -69,7 +68,7 @@ async fn run(ctx: Arc<Context>) -> Result<()> {
                         break;
                     }
 
-                    latest_motion_command = motion_command_sub.recv().await?;
+                    latest_motion_command = motion_command_sub.recv().await?.motion_command;
                 }
 
                 for _ in 0..MAX_INPUT_DRAIN_PER_TICK {
@@ -311,8 +310,10 @@ mod tests {
     #[test]
     fn entering_look_around_selects_initial_mode() {
         let now = UNIX_EPOCH + Duration::from_secs(1);
-        let mut game_controller_state = FilteredGameControllerState::default();
-        game_controller_state.global_field_side = GlobalFieldSide::Home;
+        let game_controller_state = FilteredGameControllerState {
+            global_field_side: GlobalFieldSide::Home,
+            ..Default::default()
+        };
         let mut state = LookAroundState::new();
 
         state.update_head_motion(

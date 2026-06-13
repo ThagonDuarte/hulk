@@ -49,6 +49,7 @@ pub mod point_of_interest;
 pub mod pose_detection;
 pub mod pose_kinds;
 pub mod primary_state;
+pub mod robot_mode;
 pub mod rule_obstacles;
 pub mod samples;
 pub mod step;

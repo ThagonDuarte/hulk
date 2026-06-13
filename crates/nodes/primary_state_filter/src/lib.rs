@@ -10,7 +10,8 @@ use types::{
     buttons::{ButtonPressType, Buttons},
     filtered_game_controller_state::FilteredGameControllerState,
     filtered_game_state::FilteredGameState,
-    primary_state::PrimaryState,
+    primary_state::{PrimaryState, SequencedPrimaryState},
+    robot_mode::{RobotMode, SequencedRobotMode},
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize, Message)]
@@ -45,6 +46,14 @@ async fn run(ctx: Arc<Context>) -> Result<()> {
         .subscriber::<Buttons<Option<ButtonPressType>>>("buttons")?
         .build()
         .await?;
+    let robot_mode_sub = node
+        .subscriber::<SequencedRobotMode>("robot_mode")?
+        .qos(QosProfile {
+            durability: QosDurability::TransientLocal,
+            ..Default::default()
+        })
+        .build()
+        .await?;
     let is_safe_pose_cache = node
         .create_cache::<bool>("is_safe_pose", 1)?
         .build()
@@ -58,10 +67,21 @@ async fn run(ctx: Arc<Context>) -> Result<()> {
         })
         .build()
         .await?;
+    let sequenced_primary_state_pub = node
+        .publisher::<SequencedPrimaryState>("sequenced_primary_state")?
+        .qos(QosProfile {
+            durability: QosDurability::TransientLocal,
+            ..Default::default()
+        })
+        .build()
+        .await?;
 
     let mut primary_state_filter = PrimaryStateFilter::default();
     primary_state_pub
         .publish(&primary_state_filter.primary_state)
+        .await?;
+    sequenced_primary_state_pub
+        .publish(&primary_state_filter.sequenced_primary_state())
         .await?;
 
     loop {
@@ -86,6 +106,9 @@ async fn run(ctx: Arc<Context>) -> Result<()> {
                 primary_state_filter.update_with_buttons(&buttons, *is_safe_pose);
 
             }
+            received_robot_mode = robot_mode_sub.recv() => {
+                primary_state_filter.update_with_robot_mode(received_robot_mode?);
+            }
         }
 
         if let Some(injected_primary_state) = parameters.injected_primary_state {
@@ -95,15 +118,35 @@ async fn run(ctx: Arc<Context>) -> Result<()> {
         primary_state_pub
             .publish(&primary_state_filter.primary_state)
             .await?;
+        sequenced_primary_state_pub
+            .publish(&primary_state_filter.sequenced_primary_state())
+            .await?;
     }
 }
 
 #[derive(Default)]
 struct PrimaryStateFilter {
     pub primary_state: PrimaryState,
+    pub robot_mode_sequence_number: u64,
 }
 
 impl PrimaryStateFilter {
+    fn sequenced_primary_state(&self) -> SequencedPrimaryState {
+        SequencedPrimaryState {
+            primary_state: self.primary_state,
+            robot_mode_sequence_number: self.robot_mode_sequence_number,
+        }
+    }
+
+    fn update_with_robot_mode(&mut self, robot_mode: SequencedRobotMode) {
+        self.robot_mode_sequence_number = robot_mode.sequence_number;
+        self.primary_state = match robot_mode.mode {
+            RobotMode::Damping => PrimaryState::Damping,
+            RobotMode::Prepare => PrimaryState::Prepare,
+            _ => self.primary_state,
+        };
+    }
+
     fn update_with_filtered_game_contoller_state(
         &mut self,
         filtered_game_controller_state: &FilteredGameControllerState,
@@ -150,20 +193,6 @@ impl PrimaryStateFilter {
     ) {
         self.primary_state = match (self.primary_state, buttons) {
             (
-                _,
-                Buttons {
-                    f1: Some(ButtonPressType::Short),
-                    ..
-                },
-            ) => PrimaryState::Damping,
-            (
-                _,
-                Buttons {
-                    stand: Some(ButtonPressType::Short),
-                    ..
-                },
-            ) => PrimaryState::Prepare,
-            (
                 PrimaryState::Prepare,
                 Buttons {
                     stand: Some(ButtonPressType::Long),
@@ -173,10 +202,10 @@ impl PrimaryStateFilter {
             (
                 PrimaryState::Initial,
                 Buttons {
-                    stand: Some(ButtonPressType::Long),
+                    walking: Some(ButtonPressType::Long),
                     ..
                 },
-            ) if is_safe_pose => PrimaryState::Playing,
+            ) => PrimaryState::Playing,
             _ => self.primary_state,
         }
     }
@@ -201,5 +230,77 @@ fn game_state_to_primary_state(game_state: FilteredGameState, is_penalized: bool
             FilteredGameState::Finished => PrimaryState::Finished,
             FilteredGameState::Stop => PrimaryState::Stop,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use types::robot_mode::{RobotMode, SequencedRobotMode};
+
+    #[test]
+    fn robot_mode_sets_damping_and_prepare_with_sequence_number() {
+        let mut filter = PrimaryStateFilter::default();
+
+        filter.update_with_robot_mode(SequencedRobotMode {
+            mode: RobotMode::Prepare,
+            sequence_number: 7,
+        });
+
+        assert_eq!(filter.primary_state, PrimaryState::Prepare);
+        assert_eq!(filter.robot_mode_sequence_number, 7);
+
+        filter.update_with_robot_mode(SequencedRobotMode {
+            mode: RobotMode::Damping,
+            sequence_number: 8,
+        });
+
+        assert_eq!(filter.primary_state, PrimaryState::Damping);
+        assert_eq!(filter.robot_mode_sequence_number, 8);
+    }
+
+    #[test]
+    fn buttons_only_handle_initial_and_playing_transitions() {
+        let mut filter = PrimaryStateFilter::default();
+        filter.update_with_robot_mode(SequencedRobotMode {
+            mode: RobotMode::Prepare,
+            sequence_number: 3,
+        });
+
+        filter.update_with_buttons(
+            &Buttons {
+                f1: Some(ButtonPressType::Short),
+                stand: Some(ButtonPressType::Short),
+                walking: None,
+            },
+            true,
+        );
+
+        assert_eq!(filter.primary_state, PrimaryState::Prepare);
+        assert_eq!(filter.robot_mode_sequence_number, 3);
+
+        filter.update_with_buttons(
+            &Buttons {
+                f1: None,
+                stand: Some(ButtonPressType::Long),
+                walking: None,
+            },
+            true,
+        );
+
+        assert_eq!(filter.primary_state, PrimaryState::Initial);
+        assert_eq!(filter.robot_mode_sequence_number, 3);
+
+        filter.update_with_buttons(
+            &Buttons {
+                f1: None,
+                stand: None,
+                walking: Some(ButtonPressType::Long),
+            },
+            true,
+        );
+
+        assert_eq!(filter.primary_state, PrimaryState::Playing);
+        assert_eq!(filter.robot_mode_sequence_number, 3);
     }
 }

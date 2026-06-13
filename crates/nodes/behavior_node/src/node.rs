@@ -14,13 +14,13 @@ use types::{
     field_dimensions::{FieldDimensions, Side},
     filtered_game_controller_state::FilteredGameControllerState,
     messages::OutgoingMessage,
-    motion_command::{BodyMotion, HeadMotion, MotionCommand},
+    motion_command::{BodyMotion, HeadMotion, MotionCommand, SequencedMotionCommand},
     motion_type::MotionType,
     obstacles::Obstacle,
     parameters::BehaviorParameters,
     path_obstacles::PathObstacle,
     players::Players,
-    primary_state::PrimaryState,
+    primary_state::SequencedPrimaryState,
     rule_obstacles::RuleObstacle,
     time_wrapper::TimeWrapper,
     world_state::{BallState, PlayerState, RobotState, WorldState},
@@ -28,8 +28,6 @@ use types::{
 use voronoi::VoronoiGrid;
 
 use crate::{motion_assembler::assemble_motion_command, tree::create_tree};
-
-const MOTION_COMMAND_TOPIC: &str = "behavior/motion_command";
 
 #[derive(Debug, Clone, Serialize, Deserialize, Message)]
 pub struct LastBall {
@@ -41,9 +39,9 @@ pub struct LastBall {
 
 #[cfg(test)]
 mod tests {
-    use types::{motion_command::MotionCommand, motion_type::MotionType};
-
     use super::*;
+    use types::primary_state::PrimaryState;
+    use types::{motion_command::MotionCommand, motion_type::MotionType};
 
     #[test]
     fn damping_command_maps_to_damping_motion_type() {
@@ -54,8 +52,68 @@ mod tests {
     }
 
     #[test]
-    fn motion_command_topic_matches_behavior_output() {
-        assert_eq!(MOTION_COMMAND_TOPIC, "behavior/motion_command");
+    fn motion_command_keeps_primary_state_robot_mode_sequence_number() {
+        let motion_command = MotionCommand::Prepare;
+        let primary_state = SequencedPrimaryState {
+            primary_state: PrimaryState::Prepare,
+            robot_mode_sequence_number: 42,
+        };
+
+        assert_eq!(
+            sequenced_motion_command_for(motion_command.clone(), primary_state),
+            SequencedMotionCommand {
+                motion_command,
+                robot_mode_sequence_number: 42,
+            }
+        );
+    }
+
+    #[test]
+    fn prepare_primary_state_outputs_prepare_during_motion_switch_timeout() -> Result<()> {
+        let tree = create_tree();
+        let mut blackboard = test_blackboard(PrimaryState::Prepare);
+        blackboard.last_motion_type = Some(MotionType::Walk);
+        blackboard.time_since_last_switch = Duration::ZERO;
+
+        let (status, _) = tree.tick_with_trace(&mut blackboard);
+
+        assert_eq!(
+            assemble_motion_command(&blackboard, status)?,
+            MotionCommand::Prepare
+        );
+        Ok(())
+    }
+
+    fn test_blackboard(primary_state: PrimaryState) -> Blackboard {
+        Blackboard {
+            field_dimensions: Default::default(),
+            parameters: Default::default(),
+            world_state: WorldState {
+                robot: RobotState {
+                    primary_state,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            path_obstacles_output: Vec::new(),
+            time_since_last_switch: Duration::ZERO,
+            direction_difference: 0.0,
+            voronoi_inputs: Vec::new(),
+            ball: None,
+            last_ball: None,
+            last_close_enough_to_kick: false,
+            last_kick_target: None,
+            last_motion_command: MotionCommand::default(),
+            last_motion_switch_time: Time::zero(),
+            last_motion_type: None,
+            last_sent_game_controller_return_message_time: None,
+            last_sent_hsl_message_time: None,
+            is_injected_motion_command: false,
+            walk_position: None,
+            body_motion: None,
+            head_motion: None,
+            voronoi_map: None,
+        }
     }
 }
 
@@ -149,7 +207,7 @@ pub async fn run(ctx: Arc<Context>) -> Result<()> {
         .build()
         .await?;
     let primary_state_cache = node
-        .create_cache::<PrimaryState>("primary_state", 1)?
+        .create_cache::<SequencedPrimaryState>("sequenced_primary_state", 1)?
         .with_qos(QosProfile {
             durability: QosDurability::TransientLocal,
             ..Default::default()
@@ -189,7 +247,7 @@ pub async fn run(ctx: Arc<Context>) -> Result<()> {
         .build()
         .await?;
     let motion_command_pub = node
-        .publisher::<MotionCommand>(MOTION_COMMAND_TOPIC)?
+        .publisher::<SequencedMotionCommand>("behavior/motion_command")?
         .build()
         .await?;
 
@@ -258,15 +316,17 @@ pub async fn run(ctx: Arc<Context>) -> Result<()> {
             })
             .unwrap_or_default();
 
+        let sequenced_primary_state = primary_state_cache
+            .get_latest()
+            .map(|state| *state)
+            .unwrap_or_default();
+
         blackboard.world_state.robot = RobotState {
             ground_to_field: ground_to_field_cache
                 .get_latest()
                 .map(|ground_to_field| *ground_to_field),
             player_number,
-            primary_state: primary_state_cache
-                .get_latest()
-                .map(|s| *s)
-                .unwrap_or_default(),
+            primary_state: sequenced_primary_state.primary_state,
         };
 
         blackboard.world_state.ball = ball_state_cache.get_latest().and_then(|ball| *ball);
@@ -346,7 +406,11 @@ pub async fn run(ctx: Arc<Context>) -> Result<()> {
         additional_black_board_pub
             .publish_if_subscribed(|| async { blackboard.clone() })
             .await?;
-        motion_command_pub.publish(&motion_command).await?;
+        let sequenced_motion_command =
+            sequenced_motion_command_for(motion_command, sequenced_primary_state);
+        motion_command_pub
+            .publish(&sequenced_motion_command)
+            .await?;
         timer.tick().await;
     }
 }
@@ -361,5 +425,15 @@ fn motion_type_for_command(command: &MotionCommand) -> Option<MotionType> {
         MotionCommand::Stand { .. } => Some(MotionType::Stand),
         MotionCommand::StandUp => Some(MotionType::StandUp),
         MotionCommand::Prepare => Some(MotionType::Prepare),
+    }
+}
+
+fn sequenced_motion_command_for(
+    motion_command: MotionCommand,
+    primary_state: SequencedPrimaryState,
+) -> SequencedMotionCommand {
+    SequencedMotionCommand {
+        motion_command,
+        robot_mode_sequence_number: primary_state.robot_mode_sequence_number,
     }
 }

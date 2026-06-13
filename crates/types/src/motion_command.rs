@@ -75,6 +75,23 @@ pub enum MotionCommand {
     },
 }
 
+#[derive(
+    Clone,
+    Debug,
+    Default,
+    Deserialize,
+    Serialize,
+    PathSerialize,
+    PathDeserialize,
+    PathIntrospect,
+    PartialEq,
+    Message,
+)]
+pub struct SequencedMotionCommand {
+    pub motion_command: MotionCommand,
+    pub robot_mode_sequence_number: u64,
+}
+
 impl MotionCommand {
     pub fn head_motion(&self) -> Option<HeadMotion> {
         match self {

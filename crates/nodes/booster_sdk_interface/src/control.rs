@@ -1,7 +1,7 @@
 use std::{f32::consts::PI, time::SystemTime};
 
 use booster::Kick;
-use booster_sdk::types::RobotMode as SdkRobotMode;
+use booster_sdk::types::RobotMode;
 use linear_algebra::{Orientation2, Point2};
 use ros2::std_msgs::header::Header;
 use types::{
@@ -16,27 +16,31 @@ use crate::WalkingParameters;
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum DesiredMode {
     Damping,
-    Prepare,
     Walking,
 }
 
-pub fn desired_mode_for(command: &MotionCommand, emergency_damping: bool) -> DesiredMode {
+pub fn desired_mode_for(
+    command: &Option<MotionCommand>,
+    emergency_damping: bool,
+) -> Option<DesiredMode> {
     if emergency_damping {
-        return DesiredMode::Damping;
+        return Some(DesiredMode::Damping);
     }
 
     match command {
-        MotionCommand::Damping => DesiredMode::Damping,
-        MotionCommand::Prepare | MotionCommand::StandUp => DesiredMode::Prepare,
-        MotionCommand::Stand { .. }
-        | MotionCommand::VisualKick { .. }
-        | MotionCommand::Walk { .. }
-        | MotionCommand::WalkWithVelocity { .. } => DesiredMode::Walking,
+        Some(
+            MotionCommand::Stand { .. }
+            | MotionCommand::VisualKick { .. }
+            | MotionCommand::Walk { .. }
+            | MotionCommand::WalkWithVelocity { .. },
+        ) => Some(DesiredMode::Walking),
+        Some(MotionCommand::Damping | MotionCommand::Prepare | MotionCommand::StandUp) => None,
+        None => None,
     }
 }
 
-pub fn confirmed_mode_allows_walking(mode: Option<SdkRobotMode>) -> bool {
-    matches!(mode, Some(SdkRobotMode::Walking))
+pub fn confirmed_mode_allows_walking(mode: Option<RobotMode>) -> bool {
+    matches!(mode, Some(RobotMode::Walking))
 }
 
 pub fn target_alignment_importance(
@@ -235,7 +239,10 @@ mod tests {
             angular_velocity: 0.0,
         };
 
-        assert_eq!(desired_mode_for(&command, true), DesiredMode::Damping);
+        assert_eq!(
+            desired_mode_for(&Some(command), true),
+            Some(DesiredMode::Damping)
+        );
     }
 
     #[test]
@@ -246,37 +253,26 @@ mod tests {
             angular_velocity: 0.0,
         };
 
-        assert_eq!(desired_mode_for(&command, false), DesiredMode::Walking);
-    }
-
-    #[test]
-    fn prepare_requests_prepare_mode() {
         assert_eq!(
-            desired_mode_for(&MotionCommand::Prepare, false),
-            DesiredMode::Prepare
+            desired_mode_for(&Some(command), false),
+            Some(DesiredMode::Walking)
         );
     }
 
     #[test]
-    fn stand_up_requests_prepare_mode() {
-        assert_eq!(
-            desired_mode_for(&MotionCommand::StandUp, false),
-            DesiredMode::Prepare
-        );
+    fn prepare_command_does_not_request_mode_change() {
+        assert_eq!(desired_mode_for(&Some(MotionCommand::Prepare), false), None);
     }
 
     #[test]
-    fn damping_requests_damping_mode() {
-        assert_eq!(
-            desired_mode_for(&MotionCommand::Damping, false),
-            DesiredMode::Damping
-        );
+    fn damping_command_does_not_request_mode_change() {
+        assert_eq!(desired_mode_for(&Some(MotionCommand::Damping), false), None);
     }
 
     #[test]
     fn only_confirmed_walking_allows_walking_effects() {
-        assert!(confirmed_mode_allows_walking(Some(SdkRobotMode::Walking)));
-        assert!(!confirmed_mode_allows_walking(Some(SdkRobotMode::Prepare)));
+        assert!(confirmed_mode_allows_walking(Some(RobotMode::Walking)));
+        assert!(!confirmed_mode_allows_walking(Some(RobotMode::Prepare)));
         assert!(!confirmed_mode_allows_walking(None));
     }
 
