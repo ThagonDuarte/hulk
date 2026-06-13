@@ -32,11 +32,7 @@ pub fn create_tree() -> Node<Blackboard> {
         ),
         sequence!(
             condition!(is_primary_state, PrimaryState::Prepare),
-            switch_motion_type(
-                MotionType::Prepare,
-                action!(prepare),
-                sequence!(action!(look_straight_ahead), action!(stand))
-            )
+            action!(prepare)
         ),
         sequence!(
             condition!(is_primary_state, PrimaryState::Stop),

@@ -1,13 +1,17 @@
 use std::{boxed::Box, future::Future, pin::Pin, sync::Arc};
 
-use booster_sdk::client::{BoosterClient, light_control::LightControlClient};
+use booster_sdk::{
+    client::{BoosterClient, light_control::LightControlClient},
+    types::RobotMode as SdkRobotMode,
+};
 use color_eyre::{Result, eyre::WrapErr};
 use kinematics::joints::head::HeadJoints;
-use ros_z::prelude::*;
+use ros_z::{prelude::*, qos::QosDurability};
 use serde::{Deserialize, Serialize};
 use types::{
     buttons::{ButtonPressType, Buttons},
-    motion_command::MotionCommand,
+    motion_command::{MotionCommand, SequencedMotionCommand},
+    robot_mode::{RobotMode, SequencedRobotMode},
 };
 
 mod control;
@@ -32,7 +36,8 @@ pub struct Parameters {
 }
 
 struct InterfaceState {
-    confirmed_mode: Option<booster_sdk::types::RobotMode>,
+    confirmed_mode: Option<SdkRobotMode>,
+    robot_mode: SequencedRobotMode,
     desired_mode: Option<control::DesiredMode>,
     last_mode_request: std::time::Instant,
     last_mode_poll: std::time::Instant,
@@ -40,7 +45,7 @@ struct InterfaceState {
     last_rotate_head: std::time::Instant,
     last_kick: std::time::Instant,
     last_visual_kick_attempt: Option<std::time::Instant>,
-    last_motion_command: MotionCommand,
+    last_motion_command: SequencedMotionCommand,
     visual_kick: control::VisualKickState,
     stand_up_request: StandUpRequestState,
     local_stop_toggle: bool,
@@ -51,6 +56,7 @@ impl Default for InterfaceState {
         let now = std::time::Instant::now();
         Self {
             confirmed_mode: None,
+            robot_mode: SequencedRobotMode::default(),
             desired_mode: None,
             last_mode_request: now,
             last_mode_poll: now,
@@ -58,11 +64,45 @@ impl Default for InterfaceState {
             last_rotate_head: now,
             last_kick: now,
             last_visual_kick_attempt: None,
-            last_motion_command: MotionCommand::Damping,
+            last_motion_command: SequencedMotionCommand::default(),
             visual_kick: control::VisualKickState::default(),
             stand_up_request: StandUpRequestState::default(),
             local_stop_toggle: false,
         }
+    }
+}
+
+impl InterfaceState {
+    fn update_confirmed_mode(
+        &mut self,
+        confirmed_mode: Option<SdkRobotMode>,
+    ) -> Option<SequencedRobotMode> {
+        self.confirmed_mode = confirmed_mode;
+        let confirmed_mode = confirmed_mode?;
+        let mode = robot_mode_from_sdk(confirmed_mode);
+        if self.robot_mode.mode == mode {
+            return None;
+        }
+
+        self.robot_mode = SequencedRobotMode {
+            mode,
+            sequence_number: self.robot_mode.sequence_number + 1,
+        };
+        Some(self.robot_mode)
+    }
+
+    fn accept_motion_command(&mut self, motion_command: SequencedMotionCommand) -> bool {
+        if motion_command.robot_mode_sequence_number != self.robot_mode.sequence_number {
+            return false;
+        }
+
+        self.last_motion_command = motion_command;
+        true
+    }
+
+    fn current_motion_command(&self) -> Option<&MotionCommand> {
+        (self.last_motion_command.robot_mode_sequence_number == self.robot_mode.sequence_number)
+            .then_some(&self.last_motion_command.motion_command)
     }
 }
 
@@ -143,8 +183,8 @@ async fn run(ctx: Arc<Context>) -> Result<()> {
         .wrap_err("failed to create kick ball publisher")?;
 
     let motion_command_sub = node
-        .subscriber::<MotionCommand>("motion_command")
-        .wrap_err("failed to create motion_command subscriber")?
+        .subscriber::<SequencedMotionCommand>("behavior/motion_command")
+        .wrap_err("failed to create behavior/behavior/motion_command subscriber")?
         .build()
         .await
         .wrap_err("failed to build motion_command subscriber")?;
@@ -166,8 +206,22 @@ async fn run(ctx: Arc<Context>) -> Result<()> {
         .build()
         .await
         .wrap_err("failed to build buttons subscriber")?;
+    let robot_mode_pub = node
+        .publisher::<SequencedRobotMode>("robot_mode")
+        .wrap_err("failed to create robot_mode publisher")?
+        .qos(QosProfile {
+            durability: QosDurability::TransientLocal,
+            ..Default::default()
+        })
+        .build()
+        .await
+        .wrap_err("failed to build robot_mode publisher")?;
 
     let mut state = InterfaceState::default();
+    robot_mode_pub
+        .publish(&state.robot_mode)
+        .await
+        .wrap_err("failed to publish initial robot_mode")?;
     let mut tick = tokio::time::interval(std::time::Duration::from_millis(10));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut latest_head_joints: Option<HeadJoints<f32>> = None;
@@ -178,7 +232,7 @@ async fn run(ctx: Arc<Context>) -> Result<()> {
 
         tokio::select! {
             motion_command = motion_command_sub.recv() => {
-                state.last_motion_command = motion_command?;
+                state.accept_motion_command(motion_command?);
             }
             head_joints = head_joints_sub.recv() => {
                 latest_head_joints = Some(head_joints?);
@@ -194,6 +248,11 @@ async fn run(ctx: Arc<Context>) -> Result<()> {
                 }
             }
             _ = tick.tick() => {
+                let confirmed_mode = poll_mode(&booster_client).await;
+                state.last_mode_poll = std::time::Instant::now();
+                if let Some(robot_mode) = state.update_confirmed_mode(confirmed_mode) {
+                    robot_mode_pub.publish(&robot_mode).await?;
+                }
                 let emergency_damping = state.local_stop_toggle != parameters.remote_stop_toggle;
                 drive_booster_effects(
                     &mut state,
@@ -228,17 +287,25 @@ async fn handle_led_command(
     Ok(())
 }
 
-fn sdk_mode_for(desired_mode: control::DesiredMode) -> booster_sdk::types::RobotMode {
+fn robot_mode_from_sdk(mode: SdkRobotMode) -> RobotMode {
+    match mode {
+        SdkRobotMode::Damping => RobotMode::Damping,
+        SdkRobotMode::Prepare => RobotMode::Prepare,
+        SdkRobotMode::Walking => RobotMode::Walking,
+        _ => RobotMode::Unknown,
+    }
+}
+
+fn sdk_mode_for(desired_mode: control::DesiredMode) -> SdkRobotMode {
     match desired_mode {
-        control::DesiredMode::Damping => booster_sdk::types::RobotMode::Damping,
-        control::DesiredMode::Prepare => booster_sdk::types::RobotMode::Prepare,
-        control::DesiredMode::Walking => booster_sdk::types::RobotMode::Walking,
+        control::DesiredMode::Damping => SdkRobotMode::Damping,
+        control::DesiredMode::Prepare => SdkRobotMode::Prepare,
+        control::DesiredMode::Walking => SdkRobotMode::Walking,
     }
 }
 
 fn button_requests_local_stop_toggle(buttons: &Buttons<Option<ButtonPressType>>) -> bool {
     matches!(buttons.f1, Some(ButtonPressType::Short))
-        || matches!(buttons.stand, Some(ButtonPressType::Short))
 }
 
 fn visual_kick_transition_for(
@@ -261,7 +328,7 @@ fn visual_kick_retry_due(
         .is_none_or(|last_attempt| now.saturating_duration_since(last_attempt) >= retry_interval)
 }
 
-async fn poll_mode(client: &BoosterClient) -> Option<booster_sdk::types::RobotMode> {
+async fn poll_mode(client: &BoosterClient) -> Option<SdkRobotMode> {
     match client.get_mode().await {
         Ok(mode) => mode.mode_enum(),
         Err(error) => {
@@ -288,13 +355,11 @@ async fn drive_booster_effects(
 ) {
     let mut now = std::time::Instant::now();
 
-    if now.duration_since(state.last_mode_poll) >= parameters.mode_poll_interval {
-        state.confirmed_mode = poll_mode(booster_client).await;
-        now = std::time::Instant::now();
-        state.last_mode_poll = now;
-    }
-
-    let desired_mode = control::desired_mode_for(&state.last_motion_command, emergency_damping);
+    let current_motion_command = state.current_motion_command().cloned();
+    let Some(desired_mode) = control::desired_mode_for(&current_motion_command, emergency_damping)
+    else {
+        return;
+    };
     let confirmed_desired_mode = state.confirmed_mode == Some(sdk_mode_for(desired_mode));
     if !confirmed_desired_mode
         && (state.desired_mode != Some(desired_mode)
@@ -309,9 +374,11 @@ async fn drive_booster_effects(
     let walking_allowed =
         control::confirmed_mode_allows_walking(state.confirmed_mode) && !emergency_damping;
 
-    state
-        .stand_up_request
-        .update_command(&state.last_motion_command);
+    if let Some(current_motion_command) = current_motion_command.as_ref() {
+        state
+            .stand_up_request
+            .update_command(current_motion_command);
+    }
     if state.stand_up_request.should_request(
         state.confirmed_mode,
         now,
@@ -357,9 +424,12 @@ async fn drive_booster_effects(
         return;
     }
 
+    let Some(current_motion_command) = current_motion_command.as_ref() else {
+        return;
+    };
+
     if now.duration_since(state.last_move_robot) >= parameters.move_robot_message_interval {
-        let step =
-            control::step_from_motion_command(&state.last_motion_command, &parameters.walking);
+        let step = control::step_from_motion_command(current_motion_command, &parameters.walking);
         if let Err(error) = booster_client
             .move_robot(step.forward, step.left, step.turn)
             .await
@@ -370,20 +440,20 @@ async fn drive_booster_effects(
         state.last_move_robot = now;
     }
 
-    if now.duration_since(state.last_rotate_head) >= parameters.rotate_head_message_interval {
-        if let Some(head_joints) = latest_head_joints {
-            if let Err(error) = booster_client
-                .rotate_head(head_joints.pitch, head_joints.yaw)
-                .await
-            {
-                log::error!("failed to rotate head: {error}");
-            }
-            now = std::time::Instant::now();
-            state.last_rotate_head = now;
+    if now.duration_since(state.last_rotate_head) >= parameters.rotate_head_message_interval
+        && let Some(head_joints) = latest_head_joints
+    {
+        if let Err(error) = booster_client
+            .rotate_head(head_joints.pitch, head_joints.yaw)
+            .await
+        {
+            log::error!("failed to rotate head: {error}");
         }
+        now = std::time::Instant::now();
+        state.last_rotate_head = now;
     }
 
-    let should_visual_kick = matches!(state.last_motion_command, MotionCommand::VisualKick { .. });
+    let should_visual_kick = matches!(current_motion_command, MotionCommand::VisualKick { .. });
     match visual_kick_transition_for(state.visual_kick, should_visual_kick) {
         control::VisualKickTransition::Start
             if visual_kick_retry_due(
@@ -433,17 +503,16 @@ async fn drive_booster_effects(
 
     if should_visual_kick
         && now.duration_since(state.last_kick) >= parameters.kicking.kick_message_interval
-    {
-        if let Some(kick) = control::kick_from_motion_command(
-            &state.last_motion_command,
+        && let Some(kick) = control::kick_from_motion_command(
+            current_motion_command,
             std::time::SystemTime::now(),
             &parameters.kicking,
-        ) {
-            if let Err(error) = kick_ball_publisher.publish(&kick).await {
-                log::error!("failed to publish visual kick command: {error}");
-            }
-            state.last_kick = std::time::Instant::now();
+        )
+    {
+        if let Err(error) = kick_ball_publisher.publish(&kick).await {
+            log::error!("failed to publish visual kick command: {error}");
         }
+        state.last_kick = std::time::Instant::now();
     }
 }
 
@@ -451,6 +520,10 @@ async fn drive_booster_effects(
 mod tests {
     use super::*;
     use std::time::Duration;
+    use types::{
+        motion_command::SequencedMotionCommand,
+        robot_mode::{RobotMode, SequencedRobotMode},
+    };
 
     #[test]
     fn interface_maps_desired_modes_to_sdk_modes() {
@@ -469,7 +542,7 @@ mod tests {
     }
 
     #[test]
-    fn interface_detects_short_f1_or_stand_local_stop_requests() {
+    fn interface_detects_short_f1_local_stop_requests() {
         assert!(!button_requests_local_stop_toggle(&Buttons {
             f1: None,
             stand: None,
@@ -480,7 +553,7 @@ mod tests {
             stand: None,
             walking: None,
         }));
-        assert!(button_requests_local_stop_toggle(&Buttons {
+        assert!(!button_requests_local_stop_toggle(&Buttons {
             f1: None,
             stand: Some(ButtonPressType::Short),
             walking: None,
@@ -495,6 +568,55 @@ mod tests {
             stand: None,
             walking: Some(ButtonPressType::Short),
         }));
+    }
+
+    #[test]
+    fn robot_mode_sequence_increments_when_confirmed_mode_changes() {
+        let mut state = InterfaceState::default();
+
+        assert_eq!(
+            state.update_confirmed_mode(Some(booster_sdk::types::RobotMode::Damping)),
+            Some(SequencedRobotMode {
+                mode: RobotMode::Damping,
+                sequence_number: 1,
+            })
+        );
+        assert_eq!(
+            state.update_confirmed_mode(Some(booster_sdk::types::RobotMode::Damping)),
+            None
+        );
+        assert_eq!(
+            state.update_confirmed_mode(Some(booster_sdk::types::RobotMode::Prepare)),
+            Some(SequencedRobotMode {
+                mode: RobotMode::Prepare,
+                sequence_number: 2,
+            })
+        );
+    }
+
+    #[test]
+    fn interface_ignores_motion_commands_from_stale_robot_mode_sequence() {
+        let mut state = InterfaceState::default();
+        state.update_confirmed_mode(Some(booster_sdk::types::RobotMode::Prepare));
+
+        assert!(!state.accept_motion_command(SequencedMotionCommand {
+            motion_command: MotionCommand::Damping,
+            robot_mode_sequence_number: 0,
+        }));
+        assert_eq!(state.current_motion_command(), None);
+
+        assert!(state.accept_motion_command(SequencedMotionCommand {
+            motion_command: MotionCommand::Prepare,
+            robot_mode_sequence_number: 1,
+        }));
+        assert_eq!(
+            state.current_motion_command(),
+            Some(&MotionCommand::Prepare)
+        );
+
+        state.update_confirmed_mode(Some(booster_sdk::types::RobotMode::Walking));
+
+        assert_eq!(state.current_motion_command(), None);
     }
 
     #[test]

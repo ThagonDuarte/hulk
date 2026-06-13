@@ -1,4 +1,5 @@
 use path_serde::{PathDeserialize, PathIntrospect, PathSerialize};
+use ros_z::Message;
 use serde::{Deserialize, Serialize};
 
 #[derive(
@@ -14,19 +15,14 @@ use serde::{Deserialize, Serialize};
     PathSerialize,
     PathDeserialize,
     PathIntrospect,
-    ros_z::Message,
+    Message,
 )]
-pub enum PrimaryState {
+pub enum RobotMode {
     #[default]
+    Unknown,
     Damping,
     Prepare,
-    Stop,
-    Initial,
-    Ready,
-    Set,
-    Playing,
-    Penalized,
-    Finished,
+    Walking,
 }
 
 #[derive(
@@ -42,9 +38,9 @@ pub enum PrimaryState {
     PathSerialize,
     PathDeserialize,
     PathIntrospect,
-    ros_z::Message,
+    Message,
 )]
-pub struct SequencedPrimaryState {
-    pub primary_state: PrimaryState,
-    pub robot_mode_sequence_number: u64,
+pub struct SequencedRobotMode {
+    pub mode: RobotMode,
+    pub sequence_number: u64,
 }

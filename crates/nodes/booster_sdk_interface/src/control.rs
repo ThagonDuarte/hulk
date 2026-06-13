@@ -18,18 +18,24 @@ pub enum DesiredMode {
     Walking,
 }
 
-pub fn desired_mode_for(command: &MotionCommand, emergency_damping: bool) -> DesiredMode {
+pub fn desired_mode_for(
+    command: &Option<MotionCommand>,
+    emergency_damping: bool,
+) -> Option<DesiredMode> {
     if emergency_damping {
-        return DesiredMode::Damping;
+        return Some(DesiredMode::Damping);
     }
 
     match command {
-        MotionCommand::Damping => DesiredMode::Damping,
-        MotionCommand::Prepare | MotionCommand::StandUp => DesiredMode::Prepare,
-        MotionCommand::Stand { .. }
-        | MotionCommand::VisualKick { .. }
-        | MotionCommand::Walk { .. }
-        | MotionCommand::WalkWithVelocity { .. } => DesiredMode::Walking,
+        Some(MotionCommand::Damping) => Some(DesiredMode::Damping),
+        Some(MotionCommand::Prepare | MotionCommand::StandUp) => Some(DesiredMode::Prepare),
+        Some(
+            MotionCommand::Stand { .. }
+            | MotionCommand::VisualKick { .. }
+            | MotionCommand::Walk { .. }
+            | MotionCommand::WalkWithVelocity { .. },
+        ) => Some(DesiredMode::Walking),
+        None => None,
     }
 }
 
@@ -234,7 +240,10 @@ mod tests {
             angular_velocity: 0.0,
         };
 
-        assert_eq!(desired_mode_for(&command, true), DesiredMode::Damping);
+        assert_eq!(
+            desired_mode_for(&Some(command), true),
+            Some(DesiredMode::Damping)
+        );
     }
 
     #[test]
@@ -245,30 +254,33 @@ mod tests {
             angular_velocity: 0.0,
         };
 
-        assert_eq!(desired_mode_for(&command, false), DesiredMode::Walking);
+        assert_eq!(
+            desired_mode_for(&Some(command), false),
+            Some(DesiredMode::Walking)
+        );
     }
 
     #[test]
     fn prepare_requests_prepare_mode() {
         assert_eq!(
-            desired_mode_for(&MotionCommand::Prepare, false),
-            DesiredMode::Prepare
+            desired_mode_for(&Some(MotionCommand::Prepare), false),
+            Some(DesiredMode::Prepare)
         );
     }
 
     #[test]
     fn stand_up_requests_prepare_mode() {
         assert_eq!(
-            desired_mode_for(&MotionCommand::StandUp, false),
-            DesiredMode::Prepare
+            desired_mode_for(&Some(MotionCommand::StandUp), false),
+            Some(DesiredMode::Prepare)
         );
     }
 
     #[test]
     fn damping_requests_damping_mode() {
         assert_eq!(
-            desired_mode_for(&MotionCommand::Damping, false),
-            DesiredMode::Damping
+            desired_mode_for(&Some(MotionCommand::Damping), false),
+            Some(DesiredMode::Damping)
         );
     }
 

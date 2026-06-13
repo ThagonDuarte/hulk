@@ -19,7 +19,9 @@ use linear_algebra::{Isometry3, Point2, distance, point, vector};
 use projection::camera_matrix::CameraMatrix;
 use ros_z::prelude::*;
 use types::{
-    motion_command::{GlanceDirection, HeadMotion, ImageRegion, MotionCommand},
+    motion_command::{
+        GlanceDirection, HeadMotion, ImageRegion, MotionCommand, SequencedMotionCommand,
+    },
     parameters::ImageRegionParameters,
     time_wrapper::TimeWrapper,
 };
@@ -51,7 +53,7 @@ async fn run(ctx: Arc<Context>) -> Result<()> {
         .build()
         .await?;
     let motion_command_sub = node
-        .subscriber::<MotionCommand>("motion_command")?
+        .subscriber::<SequencedMotionCommand>("behavior/motion_command")?
         .build()
         .await?;
     let serial_motor_states_sub = node
@@ -80,7 +82,7 @@ async fn run(ctx: Arc<Context>) -> Result<()> {
                 latest_ground_to_robot = ground_to_robot?.inner;
             }
             motion_command = motion_command_sub.recv() => {
-                latest_motion_command = Some(motion_command?);
+                latest_motion_command = Some(motion_command?.motion_command);
             }
             serial_motor_states = serial_motor_states_sub.recv() => {
                 latest_serial_motor_states = Some(serial_motor_states?);
@@ -107,7 +109,7 @@ async fn run(ctx: Arc<Context>) -> Result<()> {
                         break;
                     }
 
-                    latest_motion_command = Some(motion_command_sub.recv().await?);
+                    latest_motion_command = Some(motion_command_sub.recv().await?.motion_command);
                 }
 
                 for _ in 0..MAX_INPUT_DRAIN_PER_TICK {
