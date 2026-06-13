@@ -1,7 +1,7 @@
 use std::{error::Error as _, fmt::Write as _, marker::PhantomData, sync::Arc, time::Duration};
 
 use parking_lot::Mutex;
-use ros_z::{Message, dynamic::DynamicPayload, node::Node};
+use ros_z::{Message, dynamic::DynamicPayload, node::Node, qos::QosProfile};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
@@ -99,6 +99,7 @@ impl SubscriptionManager {
             manager: self,
             topic: topic.into(),
             retention: RetentionPolicy::LatestOnly,
+            qos: None,
             value: PhantomData,
         }
     }
@@ -170,6 +171,7 @@ pub struct TypedSubscriptionBuilder<'a, T> {
     pub(crate) manager: &'a SubscriptionManager,
     pub(crate) topic: String,
     pub(crate) retention: RetentionPolicy,
+    pub(crate) qos: Option<QosProfile>,
     value: PhantomData<T>,
 }
 
@@ -177,6 +179,12 @@ impl<T> TypedSubscriptionBuilder<'_, T> {
     /// Configure how many samples the handle retains.
     pub fn retention(mut self, retention: RetentionPolicy) -> Self {
         self.retention = retention;
+        self
+    }
+
+    /// Configure the QoS used by the underlying ros-z subscriber.
+    pub fn qos(mut self, qos: QosProfile) -> Self {
+        self.qos = Some(qos);
         self
     }
 
@@ -204,12 +212,11 @@ impl<T> TypedSubscriptionBuilder<'_, T> {
         let retention = self.retention;
         let requested_topic = TopicSelector::new(self.topic)?;
         let resolved_topic = requested_topic.resolve(self.manager.target_namespace())?;
-        let subscriber = self
-            .manager
-            .node()
-            .subscriber::<T>(&resolved_topic)?
-            .build()
-            .await?;
+        let mut subscriber_builder = self.manager.node().subscriber::<T>(&resolved_topic)?;
+        if let Some(qos) = self.qos {
+            subscriber_builder = subscriber_builder.qos(qos);
+        }
+        let subscriber = subscriber_builder.build().await?;
         let type_info = subscriber.entity().type_info.clone();
         let metadata = Arc::new(SampleMetadata {
             requested_topic,

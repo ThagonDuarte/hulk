@@ -8,22 +8,22 @@ use geometry::line_segment::LineSegment;
 use types::field_dimensions::FieldDimensions;
 
 use crate::{
-    panels::map::layer::Layer, robot::Robot, twix_painter::TwixPainter, value_buffer::BufferHandle,
+    backend::TwixBackend, panels::map::layer::Layer, twix_painter::TwixPainter,
+    value_buffer::BufferHandle,
 };
 
 pub struct LineCorrespondences {
-    correspondence_lines: BufferHandle<Option<Vec<LineSegment<Field>>>>,
-    measured_lines_in_field: BufferHandle<Option<Vec<LineSegment<Field>>>>,
+    correspondence_lines: BufferHandle<Vec<LineSegment<Field>>>,
+    measured_lines_in_field: BufferHandle<Vec<LineSegment<Field>>>,
 }
 
 impl Layer<Field> for LineCorrespondences {
     const NAME: &'static str = "Line Correspondences";
 
-    fn new(robot: Arc<Robot>) -> Self {
-        let correspondence_lines = robot
-            .subscribe_value("WorldState.additional_outputs.localization.correspondence_lines");
-        let measured_lines_in_field = robot
-            .subscribe_value("WorldState.additional_outputs.localization.measured_lines_in_field");
+    fn new(backend: Arc<TwixBackend>) -> Self {
+        let correspondence_lines = backend.subscribe_value("localization/correspondence_lines");
+        let measured_lines_in_field =
+            backend.subscribe_value("localization/measured_lines_in_field");
         Self {
             correspondence_lines,
             measured_lines_in_field,
@@ -35,13 +35,13 @@ impl Layer<Field> for LineCorrespondences {
         painter: &TwixPainter<Field>,
         _field_dimensions: &FieldDimensions,
     ) -> Result<()> {
-        if let Some(lines) = self.correspondence_lines.get_last_value()?.flatten() {
+        if let Some(lines) = self.correspondence_lines.get_last_value()? {
             for line in lines {
                 painter.line_segment(line.0, line.1, Stroke::new(0.02_f32, Color32::YELLOW));
             }
         }
 
-        if let Some(lines) = self.measured_lines_in_field.get_last_value()?.flatten() {
+        if let Some(lines) = self.measured_lines_in_field.get_last_value()? {
             for line in lines {
                 painter.line_segment(line.0, line.1, Stroke::new(0.04_f32, Color32::RED));
             }

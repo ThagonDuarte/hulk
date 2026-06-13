@@ -100,6 +100,7 @@ impl<World> TwixPainter<World> {
         }
     }
 
+    #[allow(dead_code)]
     pub fn paint_at(ui: &mut Ui, pixel_rect: Rect) -> Self {
         let painter = ui.painter_at(pixel_rect);
         let world_to_pixel = Similarity2::new(
@@ -117,6 +118,7 @@ impl<World> TwixPainter<World> {
         }
     }
 
+    #[allow(dead_code)]
     pub fn with_camera(
         self,
         camera_dimensions: Vector2<World, f32>,
@@ -262,6 +264,7 @@ impl<World> TwixPainter<World> {
         }
     }
 
+    #[allow(dead_code)]
     pub fn transform_pixel_to_world(&self, pos: Pos2) -> Point2<World> {
         let inverse = self
             .world_to_pixel
@@ -433,6 +436,7 @@ impl<World> TwixPainter<World> {
         self.painter.text(position, align, text, font_id, color);
     }
 
+    #[allow(dead_code)]
     pub fn image(&self, texture_id: TextureId, rect: Rectangle<World>) {
         let Rectangle { min, max } = rect;
         let min = self.transform_world_to_pixel(min);

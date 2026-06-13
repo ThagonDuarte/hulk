@@ -3,26 +3,25 @@ use std::sync::Arc;
 use color_eyre::Result;
 use eframe::epaint::{Color32, Stroke};
 
+use behavior_node::node::Blackboard;
 use coordinate_systems::Ground;
-use types::{
-    field_dimensions::FieldDimensions,
-    path_obstacles::{PathObstacle, PathObstacleShape},
-};
+use types::{field_dimensions::FieldDimensions, path_obstacles::PathObstacleShape};
 
 use crate::{
-    panels::map::layer::Layer, robot::Robot, twix_painter::TwixPainter, value_buffer::BufferHandle,
+    backend::TwixBackend, panels::map::layer::Layer, twix_painter::TwixPainter,
+    value_buffer::BufferHandle,
 };
 
 pub struct PathObstacles {
-    path_obstacles: BufferHandle<Option<Vec<PathObstacle>>>,
+    blackboard: BufferHandle<Blackboard>,
 }
 
 impl Layer<Ground> for PathObstacles {
     const NAME: &'static str = "Path Obstacles";
 
-    fn new(robot: Arc<Robot>) -> Self {
-        let path_obstacles = robot.subscribe_value("WorldState.additional_outputs.path_obstacles");
-        Self { path_obstacles }
+    fn new(backend: Arc<TwixBackend>) -> Self {
+        let blackboard = backend.subscribe_value("behavior/blackboard");
+        Self { blackboard }
     }
 
     fn paint(
@@ -30,12 +29,12 @@ impl Layer<Ground> for PathObstacles {
         painter: &TwixPainter<Ground>,
         _field_dimensions: &FieldDimensions,
     ) -> Result<()> {
-        if let Some(path_obstacles) = self.path_obstacles.get_last_value()?.flatten() {
+        if let Some(blackboard) = self.blackboard.get_last_value()? {
             let path_obstacle_stroke = Stroke {
                 width: 0.025,
                 color: Color32::RED,
             };
-            for path_obstacle in path_obstacles {
+            for path_obstacle in blackboard.path_obstacles_output {
                 match path_obstacle.shape {
                     PathObstacleShape::Circle(circle) => {
                         painter.circle_stroke(circle.center, circle.radius, path_obstacle_stroke)

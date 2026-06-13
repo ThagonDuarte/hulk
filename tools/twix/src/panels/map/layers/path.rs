@@ -10,7 +10,8 @@ use types::{
 };
 
 use crate::{
-    panels::map::layer::Layer, robot::Robot, twix_painter::TwixPainter, value_buffer::BufferHandle,
+    backend::TwixBackend, panels::map::layer::Layer, twix_painter::TwixPainter,
+    value_buffer::BufferHandle,
 };
 
 pub struct Path {
@@ -20,8 +21,8 @@ pub struct Path {
 impl Layer<Ground> for Path {
     const NAME: &'static str = "Path";
 
-    fn new(robot: Arc<Robot>) -> Self {
-        let motion_command = robot.subscribe_value("WorldState.main_outputs.motion_command");
+    fn new(backend: Arc<TwixBackend>) -> Self {
+        let motion_command = backend.subscribe_value("behavior/motion_command");
         Self { motion_command }
     }
 
