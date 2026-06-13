@@ -23,6 +23,14 @@ Twix does not translate old dotted debug paths such as `WorldState.main_outputs.
 
 Twix is read-only in this version. Write panels, STOP, remote control, parameter editing, and simulator panels show an unsupported message.
 
+To inspect receive-to-panel forwarding latency, enable the `twix::latency` trace target:
+
+```bash
+RUST_LOG=twix::latency=trace ./twix
+```
+
+The trace fields report milliseconds from the publisher source timestamp, Zenoh transport timestamp when available, and local receive timestamp to the point where Twix forwards the sample into a panel buffer.
+
 # Configuration
 
 Twix loads a user configuration file on startup. The location of the configuration file depends on your platform:

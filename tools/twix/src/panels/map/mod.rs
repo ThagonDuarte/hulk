@@ -1,3 +1,6 @@
+use std::time::Duration;
+
+use color_eyre::Result;
 use coordinate_systems::{Field, Ground};
 use eframe::egui::{ComboBox, Ui, Widget};
 use linear_algebra::{Isometry2, point, vector};
@@ -18,6 +21,8 @@ mod layer;
 mod layers;
 
 const SKIPPED_LAYER_KEYS: &[&str] = &["behavior_simulator", "pose_detection", "referee_position"];
+const GROUND_TO_FIELD_QUEUE_DEPTH: usize = crate::backend::HIGH_RATE_SUBSCRIBER_QUEUE_DEPTH;
+const BALL_STATE_QUEUE_DEPTH: usize = crate::backend::HIGH_RATE_SUBSCRIBER_QUEUE_DEPTH;
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq)]
 enum PlotType {
@@ -64,7 +69,7 @@ pub struct MapPanel {
     skipped_layers: JsonMap<String, Value>,
 
     field_dimensions: BufferHandle<FieldDimensions>,
-    ground_to_field: BufferHandle<Isometry2<Ground, Field>>,
+    ground_to_field: BufferHandle<Option<Isometry2<Ground, Field>>>,
     zoom_and_pan: ZoomAndPanTransform,
 
     field: EnabledLayer<layers::Field, Field>,
@@ -78,10 +83,29 @@ pub struct MapPanel {
     robot_pose: EnabledLayer<layers::RobotPose, Ground>,
     ball_percept: EnabledLayer<layers::BallPercepts, Ground>,
     ball_position: EnabledLayer<layers::BallPosition, Field>,
+    ball_state: EnabledLayer<layers::BallState, Field>,
     ball_filter: EnabledLayer<layers::BallFilter, Ground>,
     obstacle_filter: EnabledLayer<layers::ObstacleFilter, Ground>,
     localization: EnabledLayer<layers::Localization, Field>,
     voronoi_cells: EnabledLayer<layers::VoronoiCell, Field>,
+}
+
+fn latest_ground_to_field(
+    ground_to_field: &BufferHandle<Option<Isometry2<Ground, Field>>>,
+) -> Result<Option<Isometry2<Ground, Field>>> {
+    Ok(ground_to_field.get_last_value()?.flatten())
+}
+
+fn latest_ground_to_field_or_none(
+    ground_to_field: &BufferHandle<Option<Isometry2<Ground, Field>>>,
+) -> Option<Isometry2<Ground, Field>> {
+    latest_ground_to_field(ground_to_field).ok().flatten()
+}
+
+fn latest_ground_to_field_or_identity(
+    ground_to_field: &BufferHandle<Option<Isometry2<Ground, Field>>>,
+) -> Isometry2<Ground, Field> {
+    latest_ground_to_field_or_none(ground_to_field).unwrap_or_default()
 }
 
 impl<'a> Panel<'a> for MapPanel {
@@ -99,6 +123,7 @@ impl<'a> Panel<'a> for MapPanel {
         let robot_pose = EnabledLayer::new(context.backend.clone(), context.value, true);
         let ball_percept = EnabledLayer::new(context.backend.clone(), context.value, false);
         let ball_position = EnabledLayer::new(context.backend.clone(), context.value, true);
+        let ball_state = EnabledLayer::new(context.backend.clone(), context.value, true);
         let ball_filter = EnabledLayer::new(context.backend.clone(), context.value, false);
         let obstacle_filter = EnabledLayer::new(context.backend.clone(), context.value, false);
         let localization = EnabledLayer::new(context.backend.clone(), context.value, false);
@@ -107,7 +132,11 @@ impl<'a> Panel<'a> for MapPanel {
         let field_dimensions = context
             .backend
             .subscribe_transient_local_value("field_dimensions");
-        let ground_to_field = context.backend.subscribe_value("ground_to_field");
+        let ground_to_field = context.backend.subscribe_buffered_value_with_queue_depth(
+            "ground_to_field",
+            Duration::ZERO,
+            GROUND_TO_FIELD_QUEUE_DEPTH,
+        );
 
         let current_plot_type = context
             .value
@@ -138,6 +167,7 @@ impl<'a> Panel<'a> for MapPanel {
             robot_pose,
             ball_percept,
             ball_position,
+            ball_state,
             ball_filter,
             obstacle_filter,
             localization,
@@ -161,6 +191,7 @@ impl<'a> Panel<'a> for MapPanel {
             "robot_pose": self.robot_pose.save(),
             "ball_percept": self.ball_percept.save(),
             "ball_position": self.ball_position.save(),
+            "ball_state": self.ball_state.save(),
             "ball_filter": self.ball_filter.save(),
             "obstacle_filter": self.obstacle_filter.save(),
             "localization": self.localization.save(),
@@ -205,6 +236,7 @@ impl Widget for &mut MapPanel {
                 self.robot_pose.checkbox(ui);
                 self.ball_percept.checkbox(ui);
                 self.ball_position.checkbox(ui);
+                self.ball_state.checkbox(ui);
                 self.ball_filter.checkbox(ui);
                 self.obstacle_filter.checkbox(ui);
                 self.localization.checkbox(ui);
@@ -224,12 +256,7 @@ impl Widget for &mut MapPanel {
             Err(error) => return ui.label(format!("{error:#}")),
         };
 
-        let ground_to_field = self
-            .ground_to_field
-            .get_last_value()
-            .ok()
-            .flatten()
-            .unwrap_or_default();
+        let ground_to_field = latest_ground_to_field_or_identity(&self.ground_to_field);
         let (response, mut painter) = match self.current_plot_type {
             PlotType::Field => {
                 let width = field_dimensions.width;
@@ -257,50 +284,150 @@ impl Widget for &mut MapPanel {
             }
         };
         self.zoom_and_pan.apply(ui, &mut painter, &response);
-
-        // draw largest layers first so they don't obscure smaller ones
-        self.field
-            .generic_paint(&painter, ground_to_field, &field_dimensions);
-        self.image_segments
-            .generic_paint(&painter, ground_to_field, &field_dimensions);
-
-        self.line_correspondences
-            .generic_paint(&painter, ground_to_field, &field_dimensions);
-        self.lines
-            .generic_paint(&painter, ground_to_field, &field_dimensions);
-
-        self.ball_search_heatmap
-            .generic_paint(&painter, ground_to_field, &field_dimensions);
-        self.path_obstacles
-            .generic_paint(&painter, ground_to_field, &field_dimensions);
-        self.obstacles
-            .generic_paint(&painter, ground_to_field, &field_dimensions);
-        self.path
-            .generic_paint(&painter, ground_to_field, &field_dimensions);
-        self.robot_pose
-            .generic_paint(&painter, ground_to_field, &field_dimensions);
-        self.ball_percept
-            .generic_paint(&painter, ground_to_field, &field_dimensions);
-        self.ball_position
-            .generic_paint(&painter, ground_to_field, &field_dimensions);
-        self.ball_filter
-            .generic_paint(&painter, ground_to_field, &field_dimensions);
-        self.obstacle_filter
-            .generic_paint(&painter, ground_to_field, &field_dimensions);
-        self.localization
-            .generic_paint(&painter, ground_to_field, &field_dimensions);
-        self.voronoi_cells
-            .generic_paint(&painter, ground_to_field, &field_dimensions);
+        self.paint_layers(&painter, ground_to_field, &field_dimensions);
 
         response
     }
 }
 
+impl MapPanel {
+    fn paint_layers(
+        &mut self,
+        painter: &TwixPainter<Field>,
+        ground_to_field: Isometry2<Ground, Field>,
+        field_dimensions: &FieldDimensions,
+    ) {
+        // draw largest layers first so they don't obscure smaller ones
+        self.field
+            .generic_paint(painter, ground_to_field, field_dimensions);
+        self.image_segments
+            .generic_paint(painter, ground_to_field, field_dimensions);
+
+        self.line_correspondences
+            .generic_paint(painter, ground_to_field, field_dimensions);
+        self.lines
+            .generic_paint(painter, ground_to_field, field_dimensions);
+
+        self.ball_search_heatmap
+            .generic_paint(painter, ground_to_field, field_dimensions);
+        self.path_obstacles
+            .generic_paint(painter, ground_to_field, field_dimensions);
+        self.obstacles
+            .generic_paint(painter, ground_to_field, field_dimensions);
+        self.path
+            .generic_paint(painter, ground_to_field, field_dimensions);
+        self.robot_pose
+            .generic_paint(painter, ground_to_field, field_dimensions);
+        self.ball_percept
+            .generic_paint(painter, ground_to_field, field_dimensions);
+        self.ball_position
+            .generic_paint(painter, ground_to_field, field_dimensions);
+        self.ball_state
+            .generic_paint(painter, ground_to_field, field_dimensions);
+        self.ball_filter
+            .generic_paint(painter, ground_to_field, field_dimensions);
+        self.obstacle_filter
+            .generic_paint(painter, ground_to_field, field_dimensions);
+        self.localization
+            .generic_paint(painter, ground_to_field, field_dimensions);
+        self.voronoi_cells
+            .generic_paint(painter, ground_to_field, field_dimensions);
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use std::time::{Duration, SystemTime};
+
+    use color_eyre::eyre;
     use serde_json::json;
 
     use super::*;
+    use crate::value_buffer::{Buffer, Datum};
+
+    #[test]
+    fn ground_to_field_uses_deployed_optional_message_type() {
+        fn assert_ground_to_field(_: &BufferHandle<Option<Isometry2<Ground, Field>>>) {}
+
+        fn assert_map_panel(panel: &MapPanel) {
+            assert_ground_to_field(&panel.ground_to_field);
+        }
+
+        let _ = assert_map_panel;
+    }
+
+    #[test]
+    fn map_panel_uses_single_generic_paint_path() {
+        let source = include_str!("mod.rs");
+        let split_field_name = ["paint", "on", "field"].join("_");
+        let split_ground_name = ["paint", "on", "ground"].join("_");
+
+        assert!(source.contains("generic_paint"));
+        assert!(!source.contains(&split_field_name));
+        assert!(!source.contains(&split_ground_name));
+    }
+
+    #[test]
+    fn high_rate_map_topics_use_expanded_subscriber_queue_depth() {
+        assert!(GROUND_TO_FIELD_QUEUE_DEPTH > ros_z::qos::DEFAULT_HISTORY_DEPTH);
+        assert!(BALL_STATE_QUEUE_DEPTH > ros_z::qos::DEFAULT_HISTORY_DEPTH);
+    }
+
+    #[tokio::test]
+    async fn latest_ground_to_field_or_none_treats_errors_as_missing_transform() {
+        let (buffer, handle) =
+            Buffer::<Option<Isometry2<Ground, Field>>, eyre::Report>::new(Duration::ZERO);
+
+        buffer.send_error(color_eyre::eyre::eyre!("decode failed"));
+
+        assert!(latest_ground_to_field_or_none(&handle).is_none());
+    }
+
+    #[tokio::test]
+    async fn ground_plot_uses_identity_when_ground_to_field_is_missing() {
+        let (_buffer, handle) =
+            Buffer::<Option<Isometry2<Ground, Field>>, eyre::Report>::new(Duration::ZERO);
+
+        assert_eq!(
+            latest_ground_to_field_or_identity(&handle) * point![1.0, 2.0],
+            point![1.0, 2.0]
+        );
+    }
+
+    #[tokio::test]
+    async fn ground_plot_uses_identity_when_ground_to_field_is_none() {
+        let (buffer, handle) =
+            Buffer::<Option<Isometry2<Ground, Field>>, eyre::Report>::new(Duration::ZERO);
+        buffer
+            .push(Datum {
+                timestamp: SystemTime::UNIX_EPOCH,
+                value: None,
+            })
+            .await;
+
+        assert_eq!(
+            latest_ground_to_field_or_identity(&handle) * point![1.0, 2.0],
+            point![1.0, 2.0]
+        );
+    }
+
+    #[tokio::test]
+    async fn ground_plot_uses_latest_ground_to_field_when_present() {
+        let (buffer, handle) =
+            Buffer::<Option<Isometry2<Ground, Field>>, eyre::Report>::new(Duration::ZERO);
+        let transform = Isometry2::from_parts(vector![1.0, 0.0], 0.0);
+        buffer
+            .push(Datum {
+                timestamp: SystemTime::UNIX_EPOCH,
+                value: Some(transform),
+            })
+            .await;
+
+        assert_eq!(
+            latest_ground_to_field_or_identity(&handle) * point![1.0, 2.0],
+            transform * point![1.0, 2.0]
+        );
+    }
 
     #[test]
     fn save_preserves_skipped_overlay_state_from_saved_map() {

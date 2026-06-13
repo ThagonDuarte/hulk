@@ -5,7 +5,7 @@ use parking_lot::Mutex;
 use ros_z::dynamic::DynamicPayload;
 use ros_z::time::Time;
 use serde_json::Value;
-use tokio::task::AbortHandle;
+use tokio::{sync::watch, task::AbortHandle};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
@@ -28,12 +28,14 @@ pub(crate) trait ManagedSubscription: Send + Sync {
 /// cancels the receive task.
 pub struct SubscriptionHandle<V> {
     state: Arc<SubscriptionState<V>>,
+    changes: watch::Receiver<u64>,
 }
 
 impl<V> Clone for SubscriptionHandle<V> {
     fn clone(&self) -> Self {
         Self {
             state: Arc::clone(&self.state),
+            changes: self.changes.clone(),
         }
     }
 }
@@ -59,6 +61,11 @@ impl<V> SubscriptionHandle<V> {
     /// Drain queued status/value/diagnostic events.
     pub fn drain_events(&self) -> Vec<DebugEvent> {
         self.state.drain_events()
+    }
+
+    /// Wait until this subscription queues another status/value/diagnostic event.
+    pub async fn changed(&mut self) -> Result<(), watch::error::RecvError> {
+        self.changes.changed().await
     }
 }
 
@@ -101,12 +108,18 @@ impl JsonSubscriptionHandle {
     pub fn drain_events(&self) -> Vec<DebugEvent> {
         self.dynamic.drain_events()
     }
+
+    /// Wait until this subscription queues another status/value/diagnostic event.
+    pub async fn changed(&mut self) -> Result<(), watch::error::RecvError> {
+        self.dynamic.changed().await
+    }
 }
 
 pub(crate) struct SubscriptionState<V> {
     latest: ArcSwapOption<SampleRecord<V>>,
     history: Option<Mutex<TimeIndexedHistory<V>>>,
     meta: Mutex<SubscriptionMeta>,
+    changes: watch::Sender<u64>,
     cancellation_token: CancellationToken,
 }
 
@@ -123,6 +136,8 @@ impl<V> SubscriptionState<V> {
             RetentionPolicy::TimeWindow(_) => Some(Mutex::new(TimeIndexedHistory::new(retention))),
         };
 
+        let (changes, _) = watch::channel(0);
+
         Self {
             latest: ArcSwapOption::empty(),
             history,
@@ -134,6 +149,7 @@ impl<V> SubscriptionState<V> {
                 events: EventBuffer::new(EVENT_BUFFER_CAPACITY),
                 receive_task: None,
             }),
+            changes,
             cancellation_token: CancellationToken::new(),
         }
     }
@@ -141,6 +157,7 @@ impl<V> SubscriptionState<V> {
     pub(crate) fn handle(self: &Arc<Self>) -> SubscriptionHandle<V> {
         SubscriptionHandle {
             state: Arc::clone(self),
+            changes: self.changes.subscribe(),
         }
     }
 
@@ -171,6 +188,7 @@ impl<V> SubscriptionState<V> {
         let receive_task = meta.receive_task.take();
         drop(meta);
 
+        self.notify_changed();
         self.cancellation_token.cancel();
         if let Some(receive_task) = receive_task {
             receive_task.abort();
@@ -201,6 +219,8 @@ impl<V> SubscriptionState<V> {
             source_time,
             publication_id,
         });
+        drop(meta);
+        self.notify_changed();
     }
 
     pub(crate) fn set_receive_error(&self, status: SubscriptionStatus) {
@@ -218,6 +238,14 @@ impl<V> SubscriptionState<V> {
         if let Some(message) = message {
             meta.events.push(DebugEvent::Diagnostic(message));
         }
+        drop(meta);
+        self.notify_changed();
+    }
+
+    fn notify_changed(&self) {
+        self.changes.send_modify(|version| {
+            *version = version.wrapping_add(1);
+        });
     }
 
     fn status(&self) -> SubscriptionStatusSnapshot {
@@ -305,6 +333,7 @@ mod tests {
             value,
             source_time,
             transport_time: None,
+            receive_time: source_time,
             publication_id: test_publication_id(),
             metadata: test_metadata(),
         })
@@ -330,6 +359,7 @@ mod tests {
             value: dynamic_payload(value),
             source_time,
             transport_time: None,
+            receive_time: source_time,
             publication_id: test_publication_id(),
             metadata: test_metadata(),
         })
@@ -423,6 +453,22 @@ mod tests {
             ]
         ));
         assert!(state.handle().drain_events().is_empty());
+    }
+
+    #[tokio::test]
+    async fn handle_changed_wakes_when_events_are_queued() {
+        let state = Arc::new(SubscriptionState::<NonClonePayload>::new(
+            SubscriptionStatusSnapshot::new(SubscriptionStatus::WaitingForFirstSample),
+            RetentionPolicy::LatestOnly,
+        ));
+        let mut handle = state.handle();
+
+        state.store_latest(sample_record(NonClonePayload(1)));
+
+        tokio::time::timeout(Duration::from_millis(100), handle.changed())
+            .await
+            .expect("subscription changes should wake promptly")
+            .expect("subscription change channel should stay open");
     }
 
     #[test]
@@ -606,6 +652,22 @@ mod tests {
             ]
         ));
         assert!(handle.drain_events().is_empty());
+    }
+
+    #[tokio::test]
+    async fn json_handle_changed_wakes_when_events_are_queued() {
+        let state = Arc::new(SubscriptionState::<DynamicPayload>::new(
+            SubscriptionStatusSnapshot::new(SubscriptionStatus::WaitingForFirstSample),
+            RetentionPolicy::LatestOnly,
+        ));
+        let mut handle = JsonSubscriptionHandle::new(state.handle(), JsonRenderPolicy::default());
+
+        state.store_latest(dynamic_record_at(1, Time::zero()));
+
+        tokio::time::timeout(Duration::from_millis(100), handle.changed())
+            .await
+            .expect("JSON subscription changes should wake promptly")
+            .expect("JSON subscription change channel should stay open");
     }
 
     #[test]

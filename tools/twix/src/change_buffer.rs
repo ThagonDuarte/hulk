@@ -3,19 +3,18 @@ use std::{fmt::Display, sync::Arc, time::Duration, time::SystemTime};
 use color_eyre::eyre::{self, eyre};
 use color_eyre::{Result, eyre::Report};
 use eframe::egui::Context as EguiContext;
-use ros_z::{dynamic::DynamicPayload, node::Node, pubsub::PublicationId, time::Time};
+use ros_z::{
+    dynamic::DynamicPayload, node::Node, pubsub::PublicationId, qos::QosProfile, time::Time,
+};
 use ros_z_debug::{
     DebugEvent, JsonRenderPolicy, ManagerOptions, RetentionPolicy, SampleRecord,
     SubscriptionManager, dynamic_payload_to_json,
 };
 use serde_json::Value;
-use tokio::{
-    runtime::Runtime,
-    sync::watch,
-    time::{self, MissedTickBehavior},
-};
+use tokio::{runtime::Runtime, sync::watch, time};
 
-const EVENT_POLL_INTERVAL: Duration = Duration::from_millis(50);
+use crate::backend::latency::trace_forward_latency;
+
 const SUBSCRIBE_RETRY_DELAY: Duration = Duration::from_secs(1);
 const CHANGE_RETENTION_WINDOW: Duration = Duration::from_secs(1);
 
@@ -135,6 +134,7 @@ pub fn spawn_json_change_buffer(
     target_namespace: watch::Receiver<String>,
     egui_context: EguiContext,
     selector: String,
+    qos: Option<QosProfile>,
 ) -> ChangeBufferHandle<Value> {
     let (buffer, handle) = ChangeBuffer::new();
     runtime.spawn(run_json_change_buffer(
@@ -142,6 +142,7 @@ pub fn spawn_json_change_buffer(
         target_namespace,
         egui_context,
         selector,
+        qos,
         buffer,
     ));
     handle
@@ -152,6 +153,7 @@ async fn run_json_change_buffer(
     mut target_namespace: watch::Receiver<String>,
     egui_context: EguiContext,
     selector: String,
+    qos: Option<QosProfile>,
     buffer: JsonChangeBuffer,
 ) {
     let mut clear_on_rebuild = true;
@@ -167,7 +169,7 @@ async fn run_json_change_buffer(
         }
 
         let namespace = target_namespace.borrow_and_update().clone();
-        let subscription = subscribe_dynamic(node.clone(), namespace, selector.clone());
+        let subscription = subscribe_dynamic(node.clone(), namespace, selector.clone(), qos);
         tokio::pin!(subscription);
 
         let active_subscription = tokio::select! {
@@ -219,17 +221,18 @@ async fn subscribe_dynamic(
     node: Arc<Node>,
     target_namespace: String,
     selector: String,
+    qos: Option<QosProfile>,
 ) -> Result<ActiveSubscription> {
     let retention = change_retention_policy();
     let manager = SubscriptionManager::new(
         node,
         ManagerOptions::with_target_namespace(target_namespace)?,
     );
-    let handle = manager
-        .subscribe_dynamic(selector)
-        .retention(retention)
-        .build()
-        .await?;
+    let mut builder = manager.subscribe_dynamic(selector).retention(retention);
+    if let Some(qos) = qos {
+        builder = builder.qos(qos);
+    }
+    let handle = builder.build().await?;
 
     Ok(ActiveSubscription {
         _manager: manager,
@@ -239,17 +242,21 @@ async fn subscribe_dynamic(
 }
 
 async fn forward_subscription(
-    active_subscription: ActiveSubscription,
+    mut active_subscription: ActiveSubscription,
     target_namespace: &mut watch::Receiver<String>,
     buffer: &JsonChangeBuffer,
     egui_context: &EguiContext,
 ) -> Option<RebuildReason> {
-    let mut poll = time::interval(EVENT_POLL_INTERVAL);
-    poll.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    drain_events(&active_subscription, buffer, egui_context);
 
     loop {
         tokio::select! {
-            _ = poll.tick() => drain_events(&active_subscription, buffer, egui_context),
+            changed = active_subscription.handle.changed() => {
+                if changed.is_err() {
+                    return None;
+                }
+                drain_events(&active_subscription, buffer, egui_context);
+            }
             changed = target_namespace.changed() => return changed.ok().map(|()| RebuildReason::Retarget),
             _ = buffer.closed() => return None,
         }
@@ -308,6 +315,7 @@ fn drain_events(
 }
 
 fn forward_record(record: Arc<SampleRecord<DynamicPayload>>, buffer: &JsonChangeBuffer) {
+    trace_forward_latency("change", &record);
     buffer.push(Change {
         timestamp: record.source_time.to_wallclock(),
         value: dynamic_payload_to_json(&record.value, JsonRenderPolicy::default()),

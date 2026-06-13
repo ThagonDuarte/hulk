@@ -5,15 +5,13 @@ use color_eyre::{Result, eyre::Report};
 use eframe::egui::Context as EguiContext;
 use ros_z::{Message, node::Node, pubsub::PublicationId, qos::QosProfile, time::Time};
 use ros_z_debug::{DebugEvent, ManagerOptions, RetentionPolicy, SampleRecord, SubscriptionManager};
-use tokio::{
-    runtime::Runtime,
-    sync::watch,
-    time::{self, MissedTickBehavior},
+use tokio::{runtime::Runtime, sync::watch, time};
+
+use crate::{
+    backend::latency::trace_forward_latency,
+    value_buffer::{Buffer, BufferHandle, Datum},
 };
 
-use crate::value_buffer::{Buffer, BufferHandle, Datum};
-
-const EVENT_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const SUBSCRIBE_RETRY_DELAY: Duration = Duration::from_secs(1);
 
 type TypedBuffer<T> = Buffer<T, Report>;
@@ -162,7 +160,7 @@ where
 }
 
 async fn forward_subscription<T>(
-    active_subscription: ActiveSubscription<T>,
+    mut active_subscription: ActiveSubscription<T>,
     target_namespace: &mut watch::Receiver<String>,
     buffer: &TypedBuffer<T>,
     egui_context: &EguiContext,
@@ -170,13 +168,41 @@ async fn forward_subscription<T>(
 where
     T: Message + Clone,
 {
-    let mut poll = time::interval(EVENT_POLL_INTERVAL);
-    poll.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    let mut history_changes = buffer.subscribe_history();
+
+    if let Some(rebuild_reason) = subscription_event_rebuild_reason(
+        active_subscription.retention,
+        drain_events(&active_subscription, buffer, egui_context),
+        async { retention_policy(buffer.history().await) },
+    )
+    .await
+    {
+        return Some(rebuild_reason);
+    }
 
     loop {
         tokio::select! {
-            _ = poll.tick() => {
-                if let Some(rebuild_reason) = poll_tick_rebuild_reason(
+            changed = active_subscription.handle.changed() => {
+                if changed.is_err() {
+                    return None;
+                }
+                if let Some(rebuild_reason) = subscription_event_rebuild_reason(
+                    active_subscription.retention,
+                    drain_events(
+                        &active_subscription,
+                        buffer,
+                        egui_context,
+                    ),
+                    async { retention_policy(buffer.history().await) },
+                ).await {
+                    return Some(rebuild_reason);
+                }
+            }
+            changed = history_changes.changed() => {
+                if changed.is_err() {
+                    return None;
+                }
+                if let Some(rebuild_reason) = subscription_event_rebuild_reason(
                     active_subscription.retention,
                     drain_events(
                         &active_subscription,
@@ -247,7 +273,7 @@ async fn drain_events<T>(
     }
 }
 
-async fn poll_tick_rebuild_reason(
+async fn subscription_event_rebuild_reason(
     active_retention: RetentionPolicy,
     drain_events: impl Future<Output = ()>,
     current_retention: impl Future<Output = RetentionPolicy>,
@@ -264,6 +290,7 @@ async fn forward_record<T>(record: Arc<SampleRecord<T>>, buffer: &TypedBuffer<T>
 where
     T: Message + Clone,
 {
+    trace_forward_latency("typed", &record);
     buffer
         .push(Datum {
             timestamp: record.source_time.to_wallclock(),
@@ -322,7 +349,64 @@ fn retention_policy(history: Duration) -> RetentionPolicy {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
+    use eframe::egui::Context as EguiContext;
+    use ros_z::context::ContextBuilder;
+    use tokio::{runtime::Builder, sync::watch};
+
     use super::*;
+
+    #[test]
+    fn typed_buffer_forwards_published_sample() {
+        let runtime = Builder::new_multi_thread().enable_all().build().unwrap();
+        runtime.block_on(async {
+            let context = ContextBuilder::default()
+                .disable_multicast_scouting()
+                .with_json("connect/endpoints", serde_json::json!([]))
+                .build()
+                .await
+                .unwrap();
+            let publisher_node = context.create_node("twix_typed_pub").build().await.unwrap();
+            let subscriber_node =
+                Arc::new(context.create_node("twix_typed_sub").build().await.unwrap());
+            let publisher = publisher_node
+                .publisher::<String>("twix_debug_text")
+                .unwrap()
+                .build()
+                .await
+                .unwrap();
+            let (_namespace_sender, namespace_receiver) = watch::channel("/".to_string());
+            let buffer = subscribe_value::<String>(
+                &runtime,
+                subscriber_node,
+                namespace_receiver,
+                EguiContext::default(),
+                "twix_debug_text",
+                Duration::ZERO,
+                None,
+            );
+
+            assert!(
+                publisher
+                    .wait_for_subscribers(1, Duration::from_secs(1))
+                    .await
+            );
+            publisher.publish(&"hello".to_string()).await.unwrap();
+
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+            loop {
+                if buffer.get_last_value().unwrap() == Some("hello".to_string()) {
+                    break;
+                }
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "timed out waiting for Twix typed buffer"
+                );
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        });
+    }
 
     #[test]
     fn rebuild_clears_only_after_retarget() {

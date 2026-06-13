@@ -19,7 +19,11 @@ impl Layer<Ground> for Obstacles {
     const NAME: &'static str = "Obstacles";
 
     fn new(backend: Arc<TwixBackend>) -> Self {
-        let obstacles = backend.subscribe_value("obstacles");
+        let obstacles = backend.subscribe_buffered_value_with_queue_depth(
+            "obstacles",
+            std::time::Duration::ZERO,
+            crate::backend::HIGH_RATE_SUBSCRIBER_QUEUE_DEPTH,
+        );
         Self { obstacles }
     }
 

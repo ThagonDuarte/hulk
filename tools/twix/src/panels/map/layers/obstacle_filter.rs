@@ -20,7 +20,11 @@ impl Layer<Ground> for ObstacleFilter {
     const NAME: &'static str = "Obstacle Filter";
 
     fn new(backend: Arc<TwixBackend>) -> Self {
-        let hypotheses = backend.subscribe_value("obstacle_filter_hypotheses");
+        let hypotheses = backend.subscribe_buffered_value_with_queue_depth(
+            "obstacle_filter_hypotheses",
+            std::time::Duration::ZERO,
+            crate::backend::HIGH_RATE_SUBSCRIBER_QUEUE_DEPTH,
+        );
         Self { hypotheses }
     }
 

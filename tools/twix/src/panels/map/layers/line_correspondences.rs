@@ -21,9 +21,16 @@ impl Layer<Field> for LineCorrespondences {
     const NAME: &'static str = "Line Correspondences";
 
     fn new(backend: Arc<TwixBackend>) -> Self {
-        let correspondence_lines = backend.subscribe_value("localization/correspondence_lines");
-        let measured_lines_in_field =
-            backend.subscribe_value("localization/measured_lines_in_field");
+        let correspondence_lines = backend.subscribe_buffered_value_with_queue_depth(
+            "localization/correspondence_lines",
+            std::time::Duration::ZERO,
+            crate::backend::HIGH_RATE_SUBSCRIBER_QUEUE_DEPTH,
+        );
+        let measured_lines_in_field = backend.subscribe_buffered_value_with_queue_depth(
+            "localization/measured_lines_in_field",
+            std::time::Duration::ZERO,
+            crate::backend::HIGH_RATE_SUBSCRIBER_QUEUE_DEPTH,
+        );
         Self {
             correspondence_lines,
             measured_lines_in_field,

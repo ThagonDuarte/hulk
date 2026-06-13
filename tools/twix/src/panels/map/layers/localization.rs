@@ -23,7 +23,11 @@ impl Layer<Field> for Localization {
     const NAME: &'static str = "Localization";
 
     fn new(backend: Arc<TwixBackend>) -> Self {
-        let poses = backend.subscribe_value("localization/pose_hypotheses");
+        let poses = backend.subscribe_buffered_value_with_queue_depth(
+            "localization/pose_hypotheses",
+            std::time::Duration::ZERO,
+            crate::backend::HIGH_RATE_SUBSCRIBER_QUEUE_DEPTH,
+        );
         Self { poses }
     }
 

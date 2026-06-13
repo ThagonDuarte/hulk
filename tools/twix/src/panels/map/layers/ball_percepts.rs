@@ -20,7 +20,11 @@ impl Layer<Ground> for BallPercepts {
     const NAME: &'static str = "Ball Percepts";
 
     fn new(backend: Arc<TwixBackend>) -> Self {
-        let ball_percepts = backend.subscribe_value("ball_filter/ball_percepts");
+        let ball_percepts = backend.subscribe_buffered_value_with_queue_depth(
+            "ball_filter/ball_percepts",
+            std::time::Duration::ZERO,
+            crate::backend::HIGH_RATE_SUBSCRIBER_QUEUE_DEPTH,
+        );
         Self { ball_percepts }
     }
 

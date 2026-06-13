@@ -1,9 +1,10 @@
 pub mod catalog;
 pub mod json_buffer;
+pub mod latency;
 pub mod topic;
 pub mod typed_buffer;
 
-use std::{sync::Arc, time::Duration};
+use std::{num::NonZeroUsize, sync::Arc, time::Duration};
 
 use color_eyre::{Result, eyre::eyre};
 use eframe::egui::Context as EguiContext;
@@ -13,7 +14,7 @@ use ros_z::{
     Message,
     context::ContextBuilder,
     node::Node,
-    qos::{QosDurability, QosProfile},
+    qos::{QosDurability, QosHistory, QosProfile},
 };
 use serde_json::Value;
 use tokio::{
@@ -22,6 +23,8 @@ use tokio::{
 };
 
 use crate::{backend::catalog::TopicCatalog, value_buffer::BufferHandle};
+
+pub(crate) const HIGH_RATE_SUBSCRIBER_QUEUE_DEPTH: usize = 1024;
 
 pub struct TwixBackend {
     node: Arc<Node>,
@@ -108,9 +111,11 @@ impl TwixBackend {
             self.egui_context.clone(),
             selector,
             history,
+            Some(high_rate_qos(HIGH_RATE_SUBSCRIBER_QUEUE_DEPTH)),
         )
     }
 
+    #[allow(dead_code)]
     pub fn subscribe_value<T>(&self, selector: impl Into<String>) -> BufferHandle<T>
     where
         T: Message + Clone,
@@ -139,6 +144,7 @@ impl TwixBackend {
         self.subscribe_buffered_value_with_qos(selector, Duration::ZERO, qos)
     }
 
+    #[allow(dead_code)]
     pub fn subscribe_buffered_value<T>(
         &self,
         selector: impl Into<String>,
@@ -180,6 +186,19 @@ impl TwixBackend {
         )
     }
 
+    pub fn subscribe_buffered_value_with_queue_depth<T>(
+        &self,
+        selector: impl Into<String>,
+        history: Duration,
+        queue_depth: usize,
+    ) -> BufferHandle<T>
+    where
+        T: Message + Clone,
+        T::Codec: Send + Sync,
+    {
+        self.subscribe_buffered_value_with_qos(selector, history, high_rate_qos(queue_depth))
+    }
+
     pub fn subscribe_changes_json(
         &self,
         selector: impl Into<String>,
@@ -190,7 +209,17 @@ impl TwixBackend {
             self.target_namespace_sender.subscribe(),
             self.egui_context.clone(),
             selector.into(),
+            Some(high_rate_qos(HIGH_RATE_SUBSCRIBER_QUEUE_DEPTH)),
         )
+    }
+}
+
+pub(crate) fn high_rate_qos(queue_depth: usize) -> QosProfile {
+    QosProfile {
+        history: QosHistory::KeepLast(
+            NonZeroUsize::new(queue_depth).expect("high-rate queue depth must be non-zero"),
+        ),
+        ..Default::default()
     }
 }
 
@@ -198,6 +227,24 @@ fn transient_local_qos() -> QosProfile {
     QosProfile {
         durability: QosDurability::TransientLocal,
         ..Default::default()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use ros_z::qos::{DEFAULT_HISTORY_DEPTH, QosHistory};
+
+    use super::*;
+
+    #[test]
+    fn high_rate_qos_uses_deeper_queue_than_ros_z_default() {
+        let QosHistory::KeepLast(depth) = high_rate_qos(HIGH_RATE_SUBSCRIBER_QUEUE_DEPTH).history
+        else {
+            panic!("high-rate Twix subscriptions must use bounded KeepLast history");
+        };
+
+        assert_eq!(depth.get(), HIGH_RATE_SUBSCRIBER_QUEUE_DEPTH);
+        assert!(depth.get() > DEFAULT_HISTORY_DEPTH);
     }
 }
 

@@ -20,8 +20,16 @@ impl Layer<Ground> for ImageSegments {
     const NAME: &'static str = "Image Segments";
 
     fn new(backend: std::sync::Arc<TwixBackend>) -> Self {
-        let camera_matrix = backend.subscribe_value("camera_matrix");
-        let image_segments = backend.subscribe_value("image_segments");
+        let camera_matrix = backend.subscribe_buffered_value_with_queue_depth(
+            "camera_matrix",
+            std::time::Duration::ZERO,
+            crate::backend::HIGH_RATE_SUBSCRIBER_QUEUE_DEPTH,
+        );
+        let image_segments = backend.subscribe_buffered_value_with_queue_depth(
+            "image_segments",
+            std::time::Duration::ZERO,
+            crate::backend::HIGH_RATE_SUBSCRIBER_QUEUE_DEPTH,
+        );
         Self {
             camera_matrix,
             image_segments,

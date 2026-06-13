@@ -34,6 +34,7 @@ const DEFAULT_LINE_COLORS: &[Color32] = &[
     Color32::from_rgb(23, 190, 207),
 ];
 const DEFAULT_LUA_TEXT: &str = "function (value)\n  return value\nend";
+const LINE_TOPIC_COMPLETION_SHOWS_ALL_TOPICS: bool = true;
 
 #[derive(Serialize, Deserialize)]
 struct LineData {
@@ -144,11 +145,21 @@ impl LineData {
         buffer_history: Duration,
     ) {
         ui.horizontal_top(|ui| {
-            let subscription_field = ui.add(TopicCompletionEdit::namespace_topics(
-                ui.id().with(id).with("plot-panel"),
-                backend.topic_catalog(),
-                &mut self.topic,
-            ));
+            let completion_id = ui.id().with(id).with("plot-panel");
+            let catalog = backend.topic_catalog();
+            let subscription_field = if LINE_TOPIC_COMPLETION_SHOWS_ALL_TOPICS {
+                ui.add(TopicCompletionEdit::all_topics(
+                    completion_id,
+                    catalog,
+                    &mut self.topic,
+                ))
+            } else {
+                ui.add(TopicCompletionEdit::namespace_topics(
+                    completion_id,
+                    catalog,
+                    &mut self.topic,
+                ))
+            };
             self.set_highlighted(subscription_field.hovered());
             if subscription_field.changed() {
                 let handle = backend.subscribe_json(self.topic.clone(), buffer_history);
@@ -391,5 +402,10 @@ mod tests {
             .call::<f64>(line_data.lua.to_value(&json!(42.0)).unwrap())
             .unwrap();
         assert_eq!(value, 42.0);
+    }
+
+    #[test]
+    fn plot_lines_complete_all_topics() {
+        assert!(LINE_TOPIC_COMPLETION_SHOWS_ALL_TOPICS);
     }
 }

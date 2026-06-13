@@ -21,7 +21,11 @@ impl Layer<Ground> for BallFilter {
     const NAME: &'static str = "Ball Filter";
 
     fn new(backend: Arc<TwixBackend>) -> Self {
-        let filter = backend.subscribe_value("ball_filter/ball_filter_state");
+        let filter = backend.subscribe_buffered_value_with_queue_depth(
+            "ball_filter/ball_filter_state",
+            std::time::Duration::ZERO,
+            crate::backend::HIGH_RATE_SUBSCRIBER_QUEUE_DEPTH,
+        );
         Self { filter }
     }
 

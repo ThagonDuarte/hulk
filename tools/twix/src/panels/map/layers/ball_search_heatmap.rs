@@ -1,8 +1,9 @@
+use std::sync::Arc;
+
 use color_eyre::Result;
 use coordinate_systems::Field;
 use eframe::epaint::Color32;
 use linear_algebra::point;
-use std::sync::Arc;
 use types::{field_dimensions::FieldDimensions, heatmap::Heatmap};
 
 use crate::{
@@ -18,7 +19,11 @@ impl Layer<Field> for BallSearchHeatmap {
     const NAME: &'static str = "Ball Search Heatmap";
 
     fn new(backend: Arc<TwixBackend>) -> Self {
-        let ball_search_heatmap = backend.subscribe_value("ball_search_heatmap");
+        let ball_search_heatmap = backend.subscribe_buffered_value_with_queue_depth(
+            "ball_search_heatmap",
+            std::time::Duration::ZERO,
+            crate::backend::HIGH_RATE_SUBSCRIBER_QUEUE_DEPTH,
+        );
         Self {
             ball_search_heatmap,
         }

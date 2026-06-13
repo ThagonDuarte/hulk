@@ -22,8 +22,16 @@ impl Layer<Ground> for Lines {
     const NAME: &'static str = "Lines";
 
     fn new(backend: Arc<TwixBackend>) -> Self {
-        let lines_in_image = backend.subscribe_value("line_detection/lines_in_image");
-        let camera_matrix = backend.subscribe_value("camera_matrix");
+        let lines_in_image = backend.subscribe_buffered_value_with_queue_depth(
+            "line_detection/lines_in_image",
+            std::time::Duration::ZERO,
+            crate::backend::HIGH_RATE_SUBSCRIBER_QUEUE_DEPTH,
+        );
+        let camera_matrix = backend.subscribe_buffered_value_with_queue_depth(
+            "camera_matrix",
+            std::time::Duration::ZERO,
+            crate::backend::HIGH_RATE_SUBSCRIBER_QUEUE_DEPTH,
+        );
         Self {
             lines_in_image,
             camera_matrix,

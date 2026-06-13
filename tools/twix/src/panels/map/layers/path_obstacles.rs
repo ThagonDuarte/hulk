@@ -20,7 +20,11 @@ impl Layer<Ground> for PathObstacles {
     const NAME: &'static str = "Path Obstacles";
 
     fn new(backend: Arc<TwixBackend>) -> Self {
-        let blackboard = backend.subscribe_value("behavior/blackboard");
+        let blackboard = backend.subscribe_buffered_value_with_queue_depth(
+            "behavior/blackboard",
+            std::time::Duration::ZERO,
+            crate::backend::HIGH_RATE_SUBSCRIBER_QUEUE_DEPTH,
+        );
         Self { blackboard }
     }
 
