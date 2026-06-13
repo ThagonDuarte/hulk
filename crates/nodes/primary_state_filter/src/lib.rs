@@ -143,7 +143,7 @@ impl PrimaryStateFilter {
         self.primary_state = match robot_mode.mode {
             RobotMode::Damping => PrimaryState::Damping,
             RobotMode::Prepare => PrimaryState::Prepare,
-            RobotMode::Unknown | RobotMode::Walking => self.primary_state,
+            _ => self.primary_state,
         };
     }
 

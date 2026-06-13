@@ -1,7 +1,7 @@
 use std::{f32::consts::PI, time::SystemTime};
 
 use booster::Kick;
-use booster_sdk::types::RobotMode as SdkRobotMode;
+use booster_sdk::types::RobotMode;
 use linear_algebra::{Orientation2, Point2};
 use ros2::std_msgs::header::Header;
 use types::{
@@ -27,8 +27,8 @@ pub fn desired_mode_for(
     }
 
     match command {
-        Some(MotionCommand::Damping) => Some(DesiredMode::Damping),
-        Some(MotionCommand::Prepare | MotionCommand::StandUp) => Some(DesiredMode::Prepare),
+        Some(MotionCommand::Damping | MotionCommand::Prepare) => None,
+        Some(MotionCommand::StandUp) => Some(DesiredMode::Prepare),
         Some(
             MotionCommand::Stand { .. }
             | MotionCommand::VisualKick { .. }
@@ -39,8 +39,8 @@ pub fn desired_mode_for(
     }
 }
 
-pub fn confirmed_mode_allows_walking(mode: Option<SdkRobotMode>) -> bool {
-    matches!(mode, Some(SdkRobotMode::Walking))
+pub fn confirmed_mode_allows_walking(mode: Option<RobotMode>) -> bool {
+    matches!(mode, Some(RobotMode::Walking))
 }
 
 pub fn target_alignment_importance(
@@ -261,11 +261,8 @@ mod tests {
     }
 
     #[test]
-    fn prepare_requests_prepare_mode() {
-        assert_eq!(
-            desired_mode_for(&Some(MotionCommand::Prepare), false),
-            Some(DesiredMode::Prepare)
-        );
+    fn prepare_command_does_not_request_mode_change() {
+        assert_eq!(desired_mode_for(&Some(MotionCommand::Prepare), false), None);
     }
 
     #[test]
@@ -277,17 +274,14 @@ mod tests {
     }
 
     #[test]
-    fn damping_requests_damping_mode() {
-        assert_eq!(
-            desired_mode_for(&Some(MotionCommand::Damping), false),
-            Some(DesiredMode::Damping)
-        );
+    fn damping_command_does_not_request_mode_change() {
+        assert_eq!(desired_mode_for(&Some(MotionCommand::Damping), false), None);
     }
 
     #[test]
     fn only_confirmed_walking_allows_walking_effects() {
-        assert!(confirmed_mode_allows_walking(Some(SdkRobotMode::Walking)));
-        assert!(!confirmed_mode_allows_walking(Some(SdkRobotMode::Prepare)));
+        assert!(confirmed_mode_allows_walking(Some(RobotMode::Walking)));
+        assert!(!confirmed_mode_allows_walking(Some(RobotMode::Prepare)));
         assert!(!confirmed_mode_allows_walking(None));
     }
 
