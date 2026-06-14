@@ -17,6 +17,8 @@ Twix is subsequently installed at `~/.cargo/bin/twix`. <br>
 
 Twix connects to a Zenoh router and inspects native ros-z graph topics. The default router endpoint is `tcp/127.0.0.1:7447`.
 
+Use the `Keep connected` checkbox in the top bar to control the ros-z backend session. When checked, Twix keeps a backend session open and reconnects subscriptions after connection changes. When unchecked, Twix intentionally disconnects and panels report that Twix is disconnected. With `Keep connected` checked, editing the router endpoint and leaving the field reconnects Twix to the new valid endpoint without restarting the application.
+
 Select the robot namespace in the top bar. A namespace such as `/42` makes panel topic selectors relative to that robot. For example, `ground_to_field` subscribes to `/42/ground_to_field`.
 
 Twix does not translate old dotted debug paths such as `WorldState.main_outputs.ground_to_field`. Pick native ros-z topics from the topic selector instead.
