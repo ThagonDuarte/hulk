@@ -58,7 +58,8 @@ pub fn create_tree() -> Node<Blackboard> {
         ),
         sequence!(
             condition!(is_primary_state, PrimaryState::Playing),
-            subtree!(playing_subtree)
+            // subtree!(playing_subtree)
+            action!(leuchtturm)
         ),
         Node::Failure
     )
