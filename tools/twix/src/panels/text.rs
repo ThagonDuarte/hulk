@@ -11,6 +11,8 @@ use crate::{
     value_buffer::BufferHandle,
 };
 
+const DEFAULT_SHOW_ALL_TOPICS: bool = true;
+
 pub struct TextPanel {
     backend: Arc<TwixBackend>,
     topic: String,
@@ -41,7 +43,7 @@ impl<'a> Panel<'a> for TextPanel {
             backend: context.backend,
             topic,
             buffer,
-            show_all_topics: false,
+            show_all_topics: DEFAULT_SHOW_ALL_TOPICS,
         }
     }
 

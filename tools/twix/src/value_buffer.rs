@@ -1,12 +1,11 @@
 use std::{
     fmt::Display,
-    sync::Arc,
     time::{Duration, SystemTime},
 };
 
 use color_eyre::Result;
 use color_eyre::eyre::{self, eyre};
-use tokio::sync::{Mutex, watch};
+use tokio::sync::watch;
 
 #[derive(Clone, Debug)]
 pub struct Datum<T> {
@@ -18,7 +17,7 @@ type TimeSeries<T> = Vec<Datum<T>>;
 
 pub struct BufferHandle<T, E = eyre::Report> {
     receiver: watch::Receiver<Result<TimeSeries<T>, E>>,
-    history: Arc<Mutex<Duration>>,
+    history: watch::Sender<Duration>,
 }
 
 impl<T, E> Clone for BufferHandle<T, E> {
@@ -60,30 +59,46 @@ where
         Ok(self.get_last()?.map(|datum| datum.value))
     }
 
+    #[allow(dead_code)]
+    pub fn get_nearest(&self, timestamp: SystemTime) -> Result<Option<Datum<T>>> {
+        let guard = self.receiver.borrow();
+        match guard.as_ref() {
+            Ok(series) => Ok(nearest_datum(series, timestamp).cloned()),
+            Err(error) => Err(eyre!("{error:#}")),
+        }
+    }
+
     pub fn set_history(&self, history: Duration) {
-        *self.history.blocking_lock() = history;
+        self.history.send_replace(history);
     }
 }
 
 pub struct Buffer<T, E> {
     sender: watch::Sender<Result<TimeSeries<T>, E>>,
-    history: Arc<Mutex<Duration>>,
+    history: watch::Receiver<Duration>,
 }
 
 impl<T, E> Buffer<T, E> {
     pub fn new(history: Duration) -> (Buffer<T, E>, BufferHandle<T, E>) {
         let (sender, receiver) = watch::channel(Ok(TimeSeries::new()));
-        let history = Arc::new(Mutex::new(history));
+        let (history_sender, history_receiver) = watch::channel(history);
         let buffer = Buffer {
             sender,
-            history: history.clone(),
+            history: history_receiver,
         };
-        let handle = BufferHandle { receiver, history };
+        let handle = BufferHandle {
+            receiver,
+            history: history_sender,
+        };
         (buffer, handle)
     }
 
     pub async fn history(&self) -> Duration {
-        *self.history.lock().await
+        *self.history.borrow()
+    }
+
+    pub fn subscribe_history(&self) -> watch::Receiver<Duration> {
+        self.history.clone()
     }
 
     pub fn send_error(&self, error: E) {
@@ -102,7 +117,7 @@ impl<T, E> Buffer<T, E> {
     }
 
     pub async fn push(&self, datum: Datum<T>) {
-        let history = *self.history.lock().await;
+        let history = *self.history.borrow();
         self.sender
             .send_modify(|value| handle_update(value, datum, history));
     }
@@ -154,6 +169,35 @@ fn handle_update<T, E>(value: &mut Result<Vec<Datum<T>>, E>, datum: Datum<T>, hi
     }
 }
 
+#[allow(dead_code)]
+fn nearest_datum<T>(series: &[Datum<T>], timestamp: SystemTime) -> Option<&Datum<T>> {
+    let after_index = series.partition_point(|sample| sample.timestamp < timestamp);
+    let before = after_index
+        .checked_sub(1)
+        .and_then(|index| series.get(index));
+    let after = series.get(after_index);
+
+    match (before, after) {
+        (None, Some(after)) => Some(after),
+        (Some(before), None) => Some(before),
+        (Some(before), Some(after)) => {
+            let before_distance = timestamp
+                .duration_since(before.timestamp)
+                .unwrap_or(Duration::ZERO);
+            let after_distance = after
+                .timestamp
+                .duration_since(timestamp)
+                .unwrap_or(Duration::ZERO);
+            if after_distance < before_distance {
+                Some(after)
+            } else {
+                Some(before)
+            }
+        }
+        (None, None) => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -185,6 +229,90 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![2]
         );
+    }
+
+    #[tokio::test]
+    async fn set_history_notifies_buffer_history_subscribers() {
+        let (buffer, handle) = Buffer::<i32, eyre::Report>::new(Duration::ZERO);
+        let mut history = buffer.subscribe_history();
+
+        handle.set_history(Duration::from_secs(2));
+
+        tokio::time::timeout(Duration::from_millis(100), history.changed())
+            .await
+            .expect("history changes should wake promptly")
+            .expect("history channel should stay open");
+        assert_eq!(*history.borrow(), Duration::from_secs(2));
+    }
+
+    #[tokio::test]
+    async fn get_nearest_returns_none_for_empty_buffer() {
+        let (_buffer, handle) = Buffer::<i32, eyre::Report>::new(Duration::from_secs(10));
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(100);
+
+        assert!(handle.get_nearest(now).unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn get_nearest_returns_closest_sample_and_prefers_earlier_tie() {
+        let (buffer, handle) = Buffer::<i32, eyre::Report>::new(Duration::from_secs(20));
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(100);
+
+        buffer
+            .push(Datum {
+                timestamp: now,
+                value: 1,
+            })
+            .await;
+        buffer
+            .push(Datum {
+                timestamp: now + Duration::from_secs(10),
+                value: 3,
+            })
+            .await;
+        buffer
+            .push(Datum {
+                timestamp: now + Duration::from_secs(4),
+                value: 2,
+            })
+            .await;
+
+        assert_eq!(handle.get_nearest(now).unwrap().unwrap().value, 1);
+        assert_eq!(
+            handle
+                .get_nearest(now + Duration::from_secs(3))
+                .unwrap()
+                .unwrap()
+                .value,
+            2
+        );
+        assert_eq!(
+            handle
+                .get_nearest(now + Duration::from_secs(8))
+                .unwrap()
+                .unwrap()
+                .value,
+            3
+        );
+        assert_eq!(
+            handle
+                .get_nearest(now + Duration::from_secs(2))
+                .unwrap()
+                .unwrap()
+                .value,
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn get_nearest_propagates_buffer_error() {
+        let (buffer, handle) = Buffer::<i32, eyre::Report>::new(Duration::from_secs(10));
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(100);
+
+        buffer.send_error(color_eyre::eyre::eyre!("subscription failed"));
+
+        let error = handle.get_nearest(now).unwrap_err();
+        assert!(error.to_string().contains("subscription failed"));
     }
 
     #[tokio::test]

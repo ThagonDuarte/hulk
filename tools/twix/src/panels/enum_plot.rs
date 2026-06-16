@@ -25,6 +25,8 @@ use crate::{
     topic_completion_edit::TopicCompletionEdit,
 };
 
+const SEGMENT_TOPIC_COMPLETION_SHOWS_ALL_TOPICS: bool = true;
+
 fn color_hash(value: impl Hash) -> Color32 {
     let mut hasher = DefaultHasher::new();
     value.hash(&mut hasher);
@@ -162,11 +164,21 @@ impl SegmentRow {
     }
 
     fn show_settings(&mut self, ui: &mut Ui, backend: Arc<TwixBackend>) {
-        let subscription_field = ui.add(TopicCompletionEdit::namespace_topics(
-            ui.auto_id_with("enum-plot"),
-            backend.topic_catalog(),
-            &mut self.topic,
-        ));
+        let completion_id = ui.auto_id_with("enum-plot");
+        let catalog = backend.topic_catalog();
+        let subscription_field = if SEGMENT_TOPIC_COMPLETION_SHOWS_ALL_TOPICS {
+            ui.add(TopicCompletionEdit::all_topics(
+                completion_id,
+                catalog,
+                &mut self.topic,
+            ))
+        } else {
+            ui.add(TopicCompletionEdit::namespace_topics(
+                completion_id,
+                catalog,
+                &mut self.topic,
+            ))
+        };
 
         if subscription_field.changed() {
             self.subscribe(backend);
@@ -478,5 +490,10 @@ mod tests {
 
         let error = row.error_message().unwrap();
         assert!(error.contains("subscription failed"));
+    }
+
+    #[test]
+    fn segment_rows_complete_all_topics() {
+        assert!(SEGMENT_TOPIC_COMPLETION_SHOWS_ALL_TOPICS);
     }
 }

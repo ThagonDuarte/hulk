@@ -12,6 +12,7 @@ pub struct ZoomAndPanTransform {
 }
 
 impl ZoomAndPanTransform {
+    #[allow(dead_code)]
     pub fn centering_transform(
         &self,
         position: Pos2,
@@ -23,6 +24,7 @@ impl ZoomAndPanTransform {
         Similarity2::new(vector![tx, ty], 0.0, scale).framed_transform()
     }
 
+    #[allow(dead_code)]
     pub fn center_on(&mut self, position: Pos2, desired: Pos2, scale: f32) {
         self.transformation = self.centering_transform(position, desired, scale);
     }
