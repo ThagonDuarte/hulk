@@ -1,34 +1,31 @@
 use std::sync::Arc;
 
+use behavior_node::node::Blackboard;
 use color_eyre::Result;
 use coordinate_systems::Field;
 use eframe::egui::{Color32, Stroke};
 use hsl_network_messages::PlayerNumber;
-use linear_algebra::Pose2;
-use serde_json::{Value, from_value};
-use voronoi::{Ownership, VoronoiGrid};
+use voronoi::Ownership;
 
 use crate::{
-    panels::map::layer::Layer, robot::Robot, twix_painter::TwixPainter, value_buffer::BufferHandle,
+    backend::TwixBackend, panels::map::layer::Layer, twix_painter::TwixPainter,
+    value_buffer::BufferHandle,
 };
 
 pub struct VoronoiCell {
-    voronoi_grid: BufferHandle<Value>,
-    voronoi_inputs: BufferHandle<Value>,
+    blackboard: BufferHandle<Blackboard>,
 }
 
 impl Layer<Field> for VoronoiCell {
     const NAME: &'static str = "Voronoi Cells";
 
-    fn new(robot: Arc<Robot>) -> Self {
-        let voronoi_grid =
-            robot.subscribe_json("WorldState.additional_outputs.behavior.voronoi_map");
-        let voronoi_inputs =
-            robot.subscribe_json("WorldState.additional_outputs.behavior.voronoi_inputs");
-        Self {
-            voronoi_grid,
-            voronoi_inputs,
-        }
+    fn new(backend: Arc<TwixBackend>) -> Self {
+        let blackboard = backend.subscribe_buffered_value_with_queue_depth(
+            "behavior/blackboard",
+            std::time::Duration::ZERO,
+            crate::backend::HIGH_RATE_SUBSCRIBER_QUEUE_DEPTH,
+        );
+        Self { blackboard }
     }
 
     fn paint(
@@ -36,12 +33,11 @@ impl Layer<Field> for VoronoiCell {
         painter: &TwixPainter<Field>,
         _field_dimensions: &types::field_dimensions::FieldDimensions,
     ) -> Result<()> {
-        let Some(grid_value) = self.voronoi_grid.get_last_value()? else {
+        let Some(blackboard) = self.blackboard.get_last_value()? else {
             return Ok(());
         };
-        let grid: VoronoiGrid = match from_value(grid_value) {
-            Ok(grid) => grid,
-            Err(_) => return Ok(()),
+        let Some(grid) = blackboard.voronoi_map else {
+            return Ok(());
         };
 
         let colors = [
@@ -97,20 +93,14 @@ impl Layer<Field> for VoronoiCell {
             }
         }
 
-        if let Some(voronoi_inputs) = self.voronoi_inputs.get_last_value()? {
-            let voronoi_inputs: Vec<Pose2<Field>> = match serde_json::from_value(voronoi_inputs) {
-                Ok(inputs) => inputs,
-                Err(_) => return Ok(()),
-            };
-            for voronoi_input in &voronoi_inputs {
-                painter.pose(
-                    *voronoi_input,
-                    0.08,
-                    0.12,
-                    Color32::from_rgba_premultiplied(255, 0, 0, 128),
-                    Stroke::new(0.01, Color32::BLACK),
-                );
-            }
+        for voronoi_input in &blackboard.voronoi_inputs {
+            painter.pose(
+                *voronoi_input,
+                0.08,
+                0.12,
+                Color32::from_rgba_premultiplied(255, 0, 0, 128),
+                Stroke::new(0.01, Color32::BLACK),
+            );
         }
 
         Ok(())

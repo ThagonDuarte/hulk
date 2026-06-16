@@ -33,7 +33,7 @@ use configuration::{
 use hulk_widgets::CompletionEdit;
 use log::{error, warn};
 use panel::{Panel, PanelCreationContext};
-use panels::{EnumPlotPanel, PlotPanel, TextPanel, UnsupportedPanel};
+use panels::{EnumPlotPanel, MapPanel, PlotPanel, TextPanel, UnsupportedPanel};
 use repository::{Repository, inspect_version::check_for_update};
 use visuals::Visuals;
 
@@ -45,8 +45,10 @@ mod configuration;
 mod panel;
 mod panels;
 mod topic_completion_edit;
+mod twix_painter;
 mod value_buffer;
 mod visuals;
+mod zoom_and_pan;
 
 const DEFAULT_ROUTER_ENDPOINT: &str = "tcp/127.0.0.1:7447";
 const DEFAULT_TARGET_NAMESPACE: &str = "/42";
@@ -309,6 +311,7 @@ enum SelectablePanel {
     Text(TextPanel),
     Plot(PlotPanel),
     EnumPlot(EnumPlotPanel),
+    Map(MapPanel),
     Unsupported(UnsupportedPanel),
 }
 
@@ -333,6 +336,7 @@ impl SelectablePanel {
             TextPanel::NAME => Ok(SelectablePanel::Text(TextPanel::new(context()))),
             PlotPanel::NAME => Ok(SelectablePanel::Plot(PlotPanel::new(context()))),
             EnumPlotPanel::NAME => Ok(SelectablePanel::EnumPlot(EnumPlotPanel::new(context()))),
+            MapPanel::NAME => Ok(SelectablePanel::Map(MapPanel::new(context()))),
             other => Err(eyre!("unknown panel '{other}'")),
         }
     }
@@ -342,6 +346,7 @@ impl SelectablePanel {
             TextPanel::NAME => Ok(SelectablePanel::Text(TextPanel::new(context))),
             PlotPanel::NAME => Ok(SelectablePanel::Plot(PlotPanel::new(context))),
             EnumPlotPanel::NAME => Ok(SelectablePanel::EnumPlot(EnumPlotPanel::new(context))),
+            MapPanel::NAME => Ok(SelectablePanel::Map(MapPanel::new(context))),
             other => Ok(SelectablePanel::Unsupported(UnsupportedPanel::new(
                 other,
                 context.value,
@@ -354,6 +359,7 @@ impl SelectablePanel {
             TextPanel::NAME.to_owned(),
             PlotPanel::NAME.to_owned(),
             EnumPlotPanel::NAME.to_owned(),
+            MapPanel::NAME.to_owned(),
         ]
     }
 
@@ -362,6 +368,7 @@ impl SelectablePanel {
             SelectablePanel::Text(panel) => panel.save(),
             SelectablePanel::Plot(panel) => panel.save(),
             SelectablePanel::EnumPlot(panel) => panel.save(),
+            SelectablePanel::Map(panel) => panel.save(),
             SelectablePanel::Unsupported(panel) => return panel.save(),
         };
         value["_panel_type"] = Value::String(self.to_string());
@@ -375,6 +382,7 @@ impl Widget for &mut SelectablePanel {
             SelectablePanel::Text(panel) => panel.ui(ui),
             SelectablePanel::Plot(panel) => panel.ui(ui),
             SelectablePanel::EnumPlot(panel) => panel.ui(ui),
+            SelectablePanel::Map(panel) => panel.ui(ui),
             SelectablePanel::Unsupported(panel) => panel.ui(ui),
         }
     }
@@ -386,6 +394,7 @@ impl std::fmt::Display for SelectablePanel {
             SelectablePanel::Text(_) => TextPanel::NAME,
             SelectablePanel::Plot(_) => PlotPanel::NAME,
             SelectablePanel::EnumPlot(_) => EnumPlotPanel::NAME,
+            SelectablePanel::Map(_) => MapPanel::NAME,
             SelectablePanel::Unsupported(panel) => panel.title(),
         };
         formatter.write_str(panel_name)
@@ -453,6 +462,11 @@ mod tests {
         };
 
         assert!(format!("{error:#}").contains("unknown panel"));
+    }
+
+    #[test]
+    fn map_panel_is_registered_for_live_selection() {
+        assert!(SelectablePanel::registered().contains(&panels::MapPanel::NAME.to_string()));
     }
 }
 
