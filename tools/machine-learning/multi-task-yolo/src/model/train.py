@@ -3,12 +3,12 @@ from pathlib import Path
 from typing import Any, cast
 
 import click
-import wandb
 import yaml
 from ultralytics.models.yolo.model import YOLO
 from ultralytics.nn.tasks import DetectionModel
 from wonderwords import RandomWord
 
+import wandb
 from model.hydra import get_backbone, set_backbone
 from utils.model_naming import (
     HYDRA_MODEL_NAME_TYPE,

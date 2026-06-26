@@ -28,6 +28,7 @@ This project uses `uv run ...` for all commands.
 - `src/utils/export_yolo_to_onnx.py`: export a single YOLO checkpoint with NV12 preprocessing.
 - `src/utils/export_hydra.py`: export Hydra models to ONNX or TorchScript (optional NV12 layer).
 - `src/utils/model_complexity.py`: report checkpoint parameters, MACs, FLOPs, and file size.
+- `src/utils/generate_balanced_yolo_train_list.py`: generate repeat-factor balanced YOLO train lists.
 - `src/utils/nv12_to_rgb.py`: NV12-to-RGB layer used by export wrappers.
 
 ## Common commands
@@ -56,6 +57,9 @@ uv run -m utils.export_hydra --help
 
 # Model complexity help
 uv run -m utils.model_complexity --help
+
+# Balanced YOLO train-list generation help
+uv run -m utils.generate_balanced_yolo_train_list --help
 ```
 
 ## Single-task training (`src/model/train.py`)
@@ -179,6 +183,22 @@ uv run -m utils.model_complexity runs/train \
 uv run -m utils.model_complexity \
   --hydra-model-name yolo26m=f11+yolo26m+yolo26m-pose
 ```
+
+## Dataset balancing
+
+Generate a repeat-factor balanced training list for YOLO datasets without
+copying images or changing the validation split.
+
+```bash
+uv run -m utils.generate_balanced_yolo_train_list \
+  assets/datasets/my-dataset.yaml \
+  --output-data-yaml assets/datasets/my-dataset-balanced.yaml
+```
+
+The generated dataset YAML keeps `val` unchanged and points `train` to a text
+file where rare-class images can appear multiple times. Start with the default
+`--max-repeat 4`; only lower `--common-only-keep-ratio` if oversampling alone is
+not enough.
 
 ## Export utilities
 
