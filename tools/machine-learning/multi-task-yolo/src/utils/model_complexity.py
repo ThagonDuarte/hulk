@@ -4,25 +4,30 @@ import json
 from dataclasses import asdict, dataclass
 from itertools import pairwise
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import click
 import torch
 from torch import nn
 from ultralytics.models.yolo.model import YOLO
+from ultralytics.nn.tasks import DetectionModel
 from ultralytics.utils.torch_utils import get_flops
 
-from model.hydra import Hydra
+from model.hydra import get_backbone, get_backbone_length, get_head
 from utils.export_hydra import (
-    HydraWrapper,
-    build_task_dict,
     export_torchscript,
     set_export_mode,
 )
-from utils.model_naming import HYDRA_MODEL_NAME_TYPE, HydraModelName
+from utils.model_naming import (
+    HYDRA_MODEL_NAME_TYPE,
+    HydraModelName,
+    TaskType,
+    resolve_model_path,
+)
 
 GIGA = 1_000_000_000
 MEGA = 1_000_000
+ResolvedModelPath = Path | str
 
 
 @dataclass(frozen=True)
@@ -40,6 +45,111 @@ class ComplexityResult:
     exported_model_path: str | None = None
     report_path: str | None = None
     error: str | None = None
+
+
+@dataclass(frozen=True)
+class HydraHeadProfileSpec:
+    task_type: TaskType
+    path: ResolvedModelPath
+
+
+class HydraComplexityModel(nn.Module):
+    def __init__(
+        self,
+        backbone_path: ResolvedModelPath,
+        heads: list[HydraHeadProfileSpec],
+        number_of_frozen_modules: int | None,
+    ) -> None:
+        super().__init__()
+
+        backbone_yolo = YOLO(backbone_path)
+        backbone_root = cast(DetectionModel, backbone_yolo.model)
+        self.backbone_length = (
+            number_of_frozen_modules
+            if number_of_frozen_modules is not None
+            else get_backbone_length(cast(dict, backbone_root.yaml))
+        )
+        self.shared_backbone = get_backbone(
+            backbone_root,
+            number_of_frozen_modules,
+        )
+        self.save_backbone = cast(list[int], backbone_root.save)
+
+        self.heads = nn.ModuleList()
+        self.branch_saves: list[list[int]] = []
+        for head in heads:
+            task_yolo = YOLO(head.path)
+            task_root = cast(DetectionModel, task_yolo.model)
+            self.heads.append(get_head(task_root, number_of_frozen_modules))
+            self.branch_saves.append(cast(list[int], task_root.save))
+
+    def forward(
+        self, x: torch.Tensor
+    ) -> torch.Tensor | tuple[torch.Tensor, ...]:
+        y_backbone: list[torch.Tensor | None] = []
+        backbone_activations: Any = x
+
+        for index, module in enumerate(self.shared_backbone):
+            from_index = cast(Any, module.f)
+            if from_index != -1:
+                backbone_activations = (
+                    y_backbone[from_index]
+                    if isinstance(from_index, int)
+                    else [
+                        backbone_activations if idx == -1 else y_backbone[idx]
+                        for idx in cast(list[int], from_index)
+                    ]
+                )
+            backbone_activations = module(backbone_activations)
+            y_backbone.append(
+                backbone_activations if index in self.save_backbone else None
+            )
+
+        outputs: list[torch.Tensor] = []
+        for head_module, branch_save in zip(
+            self.heads, self.branch_saves, strict=True
+        ):
+            head = cast(nn.ModuleList, head_module)
+            y_head = list(y_backbone)
+            head_activations: Any = backbone_activations
+
+            for index, module in enumerate(head):
+                module_index = index + self.backbone_length
+                from_index = cast(Any, module.f)
+                if from_index != -1:
+                    head_activations = (
+                        cast(torch.Tensor, y_head[from_index])
+                        if isinstance(from_index, int)
+                        else [
+                            cast(torch.Tensor, head_activations)
+                            if idx == -1
+                            else cast(torch.Tensor, y_head[idx])
+                            for idx in cast(list[int], from_index)
+                        ]
+                    )
+
+                head_activations = module(head_activations)
+                y_head.append(
+                    cast(torch.Tensor, head_activations)
+                    if module_index in branch_save
+                    else None
+                )
+
+            if isinstance(head_activations, torch.Tensor):
+                outputs.append(head_activations)
+            elif isinstance(head_activations, tuple) and all(
+                isinstance(output, torch.Tensor) for output in head_activations
+            ):
+                outputs.extend(head_activations)
+            else:
+                raise TypeError(  # noqa: TRY003
+                    "Hydra head output must be a tensor or tuple of tensors, "
+                    f"got {type(head_activations)}"
+                )
+
+        if len(outputs) == 1:
+            return outputs[0]
+        return tuple(outputs)
 
 
 def display_path(path: Path) -> str:
@@ -117,37 +227,56 @@ def checkpoint_report_path(runs_dir: Path, path: Path) -> Path:
     return runs_dir / "complexity" / path.stem / "report.json"
 
 
-def resolve_asset_path(model_name: str, assets_dir: Path) -> Path:
-    path = assets_dir / model_name
-    if path.exists() or path.suffix:
-        return path
+def model_path_exists(path: ResolvedModelPath) -> bool:
+    return Path(path).exists()
 
-    for suffix in (".pt", ".yaml"):
-        suffixed_path = path.with_suffix(suffix)
-        if suffixed_path.exists():
-            return suffixed_path
 
-    return path
+def resolve_asset_path(model_name: str, assets_dir: Path) -> ResolvedModelPath:
+    return resolve_model_path(model_name, assets_dir)
+
+
+def resolve_hydra_head_specs(
+    hydra_model_name: HydraModelName,
+    *,
+    assets_dir: Path,
+    train_folder_path: Path,
+    val_folder_path: Path,
+) -> list[HydraHeadProfileSpec]:
+    head_specs: list[HydraHeadProfileSpec] = []
+
+    for head in hydra_model_name.heads:
+        task_type = head.task_type()
+        integrated_model_name = hydra_model_name.integrated_model_name(head)
+        if head.is_finetuned_model():
+            path = train_folder_path / integrated_model_name / "weights/best.pt"
+        else:
+            path = (
+                val_folder_path
+                / integrated_model_name
+                / f"{integrated_model_name}.pt"
+            )
+
+        if not model_path_exists(path):
+            path = resolve_asset_path(head.name, assets_dir)
+        head_specs.append(HydraHeadProfileSpec(task_type=task_type, path=path))
+
+    return head_specs
 
 
 def resolve_hydra_backbone_path(
     hydra_model_name: HydraModelName,
     assets_dir: Path,
-    task_paths: list[Path],
-) -> Path:
+    head_specs: list[HydraHeadProfileSpec],
+) -> ResolvedModelPath:
     asset_path = resolve_asset_path(hydra_model_name.backbone.name, assets_dir)
-    if asset_path.exists():
+    if model_path_exists(asset_path):
         return asset_path
 
-    for task_path in task_paths:
-        if task_path.exists():
-            return task_path
+    for head in head_specs:
+        if model_path_exists(head.path):
+            return head.path
 
-    checked_paths = ", ".join(str(path) for path in [asset_path, *task_paths])
-    raise FileNotFoundError(  # noqa: TRY003
-        f"No local backbone source found for {hydra_model_name}. "
-        f"Checked: {checked_paths}"
-    )
+    return asset_path
 
 
 def profile_checkpoint(
@@ -200,16 +329,16 @@ def profile_hydra_model(
     train_folder_path: Path,
     val_folder_path: Path,
 ) -> ComplexityResult:
-    task_dict = build_task_dict(
+    head_specs = resolve_hydra_head_specs(
         hydra_model_name=hydra_model_name,
+        assets_dir=assets_dir,
         train_folder_path=train_folder_path,
         val_folder_path=val_folder_path,
     )
-    task_paths = list(task_dict.values())
     backbone_path = resolve_hydra_backbone_path(
         hydra_model_name,
         assets_dir,
-        task_paths,
+        head_specs,
     )
     output_dir = hydra_output_dir(runs_dir, hydra_model_name)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -217,18 +346,15 @@ def profile_hydra_model(
     report_path = hydra_report_path(runs_dir, hydra_model_name)
 
     with torch.inference_mode():
-        hydra_model = Hydra(
-            backbone_path=str(backbone_path),
-            task_dict=task_dict,
+        model = HydraComplexityModel(
+            backbone_path=backbone_path,
+            heads=head_specs,
             number_of_frozen_modules=(
                 hydra_model_name.number_of_frozen_modules
             ),
         ).to(device)
-        hydra_model.eval()
-        set_export_mode(hydra_model)
-
-        model = HydraWrapper(hydra_model, task_dict=task_dict).to(device)
         model.eval()
+        set_export_mode(model)
 
         # Ultralytics reports FLOPs as two floating point ops per MAC.
         gflops = float(get_flops(model, imgsz=imgsz))
@@ -430,7 +556,7 @@ def write_report(path: Path, result: ComplexityResult) -> None:
     type=HYDRA_MODEL_NAME_TYPE,
     help=(
         "Hydra model name to assemble and profile. "
-        "Example: yolo26m=f11+yolo26m+yolo26m-pose. May repeat."
+        "Example: yolo26s=f11+yolo26s+yolo26s-pose. May repeat."
     ),
 )
 @click.option(
