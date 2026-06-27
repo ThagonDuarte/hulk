@@ -14,6 +14,7 @@ from utils.model_naming import (
     HYDRA_MODEL_NAME_TYPE,
     HydraModelName,
     TaskType,
+    field_feature_pose_pretrained_model_name,
     resolve_model_path,
 )
 from validation.validator import DatasetNotFoundError
@@ -110,6 +111,20 @@ def create_hydra_checkpoint(
     head_model_yolo_wrapper = YOLO(
         resolve_model_path(hydra_model.heads[0].name, assets_dir)
     )
+    pretrained_model_name = field_feature_pose_pretrained_model_name(
+        hydra_model.heads[0].name
+    )
+    if pretrained_model_name is not None:
+        pretrained_model_path = resolve_model_path(
+            pretrained_model_name,
+            assets_dir,
+        )
+        print(
+            "Initializing field-feature pose head from pretrained model: "
+            f"{pretrained_model_path}"
+        )
+        head_model_yolo_wrapper.load(pretrained_model_path)
+
     head_model = cast(DetectionModel, head_model_yolo_wrapper.model)
     backbone = get_backbone(
         backbone_model, hydra_model.number_of_frozen_modules
@@ -147,6 +162,13 @@ def create_hydra_checkpoint(
     type=Path,
     default="coco-pose.yaml",
     help="Name of the pose detection dataset. "
+    "Is assumed to be relative to `./assets/datasets/`.",
+)
+@click.option(
+    "--field_feature_pose_dataset_name",
+    type=Path,
+    default="multi-task-field-features-pose.yaml",
+    help="Name of the field-feature pose dataset. "
     "Is assumed to be relative to `./assets/datasets/`.",
 )
 @click.option(
@@ -206,6 +228,7 @@ def main(
     hydra_model_name: list[HydraModelName],
     object_dataset_name: Path,
     pose_dataset_name: Path,
+    field_feature_pose_dataset_name: Path,
     segmentation_dataset_name: Path,
     assets_dir: Path,
     runs_dir: Path,
@@ -240,7 +263,11 @@ def main(
             case TaskType.OBJECT:
                 dataset_name = object_dataset_name
             case TaskType.POSE:
-                dataset_name = pose_dataset_name
+                dataset_name = (
+                    field_feature_pose_dataset_name
+                    if hydra_model.heads[0].is_field_feature_pose_model()
+                    else pose_dataset_name
+                )
             case TaskType.SEGMENTATION:
                 dataset_name = segmentation_dataset_name
         if dataset_name is None:

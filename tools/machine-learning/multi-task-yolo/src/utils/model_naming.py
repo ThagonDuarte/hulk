@@ -5,16 +5,56 @@ from typing import Self
 import click
 
 YOLO26_SIZES = ("n", "s", "m", "l", "x")
+FIELD_FEATURE_POSE_SUFFIX = "-pose-field-features"
 
 
-def _yolo26_variant_suffix(stem: str) -> str | None:
+def _yolo26_size_and_variant_suffix(stem: str) -> tuple[str, str] | None:
     for size in YOLO26_SIZES:
         prefix = f"yolo26{size}"
         if stem == prefix:
-            return ""
+            return size, ""
         if stem.startswith(f"{prefix}-"):
-            return stem.removeprefix(prefix)
+            return size, stem.removeprefix(prefix)
     return None
+
+
+def _yolo26_variant_suffix(stem: str) -> str | None:
+    parsed = _yolo26_size_and_variant_suffix(stem)
+    return None if parsed is None else parsed[1]
+
+
+def yolo26_model_size(model_name: str | PurePath) -> str | None:
+    parsed = _yolo26_size_and_variant_suffix(PurePath(model_name).stem)
+    return None if parsed is None else parsed[0]
+
+
+def is_field_feature_pose_model_name(model_name: str | PurePath) -> bool:
+    variant_suffix = _yolo26_variant_suffix(PurePath(model_name).stem)
+    return bool(
+        variant_suffix is not None
+        and variant_suffix.startswith(FIELD_FEATURE_POSE_SUFFIX)
+    )
+
+
+def field_feature_pose_pretrained_model_name(
+    model_name: str | PurePath,
+) -> str | None:
+    size = yolo26_model_size(model_name)
+    if size is None or not is_field_feature_pose_model_name(model_name):
+        return None
+    return f"yolo26{size}-pose"
+
+
+def _field_feature_pose_size_agnostic_yaml(model_path: Path) -> Path | None:
+    variant_suffix = _yolo26_variant_suffix(model_path.stem)
+    if variant_suffix is None or not variant_suffix.startswith(
+        FIELD_FEATURE_POSE_SUFFIX
+    ):
+        return None
+
+    return model_path.with_suffix(".yaml").with_name(
+        f"yolo26{variant_suffix}.yaml"
+    )
 
 
 def _model_path_candidates(model_path: Path) -> tuple[Path, ...]:
@@ -30,13 +70,19 @@ def _model_path_candidates(model_path: Path) -> tuple[Path, ...]:
 def resolve_model_path(model_name: str, assets_dir: Path) -> str | Path:
     model_path = Path(model_name)
     if model_path.is_absolute() or model_path.parent != Path("."):
-        candidates = _model_path_candidates(model_path)
+        search_path = model_path
     else:
-        candidates = _model_path_candidates(assets_dir / model_path)
+        search_path = assets_dir / model_path
+
+    candidates = _model_path_candidates(search_path)
 
     for candidate in candidates:
         if candidate.exists():
             return candidate
+
+    size_agnostic_yaml = _field_feature_pose_size_agnostic_yaml(search_path)
+    if size_agnostic_yaml is not None and size_agnostic_yaml.exists():
+        return search_path.with_suffix(".yaml")
 
     if model_path.suffix:
         return model_name
@@ -93,6 +139,9 @@ class ModelName:
 
     def is_finetuned_model(self) -> bool:
         return "~" in self.name
+
+    def is_field_feature_pose_model(self) -> bool:
+        return is_field_feature_pose_model_name(self.name)
 
 
 class HydraModelName:
