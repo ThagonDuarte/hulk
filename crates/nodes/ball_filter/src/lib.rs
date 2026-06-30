@@ -19,7 +19,7 @@ use types::{
     ball_position::{BallPosition, HypotheticalBallPosition},
     field_dimensions::FieldDimensions,
     multivariate_normal_distribution::MultivariateNormalDistribution,
-    object_detection::{Object, RobocupObjectLabel},
+    object_detection::{CustomObjectLabel, Object},
     parameters::BallFilterParameters,
     time_wrapper::TimeWrapper,
 };
@@ -59,7 +59,7 @@ pub async fn run(ctx: Arc<Context>) -> Result<()> {
         .create_future_map_builder()
         .create_future_subscriber::<Odometer>("inputs/odometer", Duration::from_millis(1))
         .await?
-        .create_future_subscriber::<Vec<Object<RobocupObjectLabel>>>(
+        .create_future_subscriber::<Vec<Object<CustomObjectLabel>>>(
             "detected_objects",
             Duration::from_millis(1),
         )
@@ -390,7 +390,7 @@ fn mahalanobis_matrix_of_hypotheses_and_percepts(
 }
 
 fn project_detected_balls(
-    detections: Option<&[Object<RobocupObjectLabel>]>,
+    detections: Option<&[Object<CustomObjectLabel>]>,
     camera_matrix: Option<&CameraMatrix>,
     parameters: &BallFilterParameters,
     ball_radius: f32,
@@ -402,7 +402,7 @@ fn project_detected_balls(
         detections
             .iter()
             .filter_map(|detection| {
-                if detection.label != RobocupObjectLabel::Ball {
+                if detection.label != CustomObjectLabel::Ball {
                     return None;
                 }
                 let area = detection.bounding_box.area;

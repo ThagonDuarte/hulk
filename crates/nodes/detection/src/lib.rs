@@ -15,9 +15,9 @@ use ros_z::prelude::*;
 use tokio::time::Instant;
 use types::{
     bounding_box::BoundingBox,
-    object_detection::{NUMBER_OF_VALUES_PER_OBJECT, Object, RobocupObjectLabel, YOLOObjectLabel},
+    object_detection::{CustomObjectLabel, NUMBER_OF_VALUES_PER_OBJECT, Object, YOLOObjectLabel},
     parameters::DetectionParameters,
-    pose_detection::{NUMBER_OF_VALUES_PER_POSE, Pose},
+    pose_detection::{FieldFeaturePose, NUMBER_OF_VALUES_PER_FIELD_FEATURE_POSE, Pose},
     time_wrapper::TimeWrapper,
 };
 
@@ -25,29 +25,37 @@ pub const NUMBER_OF_DETECTIONS: usize = 300;
 
 #[derive(Clone, Copy, Debug)]
 enum TaskHead {
-    ObjectDetection,
+    YOLOObjectDetection,
+    CustomObjectDetection,
     PoseDetection,
 }
 
 impl TaskHead {
     fn output_name(self) -> &'static str {
         match self {
-            TaskHead::ObjectDetection => "object_output",
+            TaskHead::YOLOObjectDetection => "yolo_object_output",
+            TaskHead::CustomObjectDetection => "custom_object_output",
             TaskHead::PoseDetection => "pose_output",
         }
     }
 
     fn expected_shape(self) -> [usize; 3] {
         match self {
-            Self::ObjectDetection => [1, NUMBER_OF_DETECTIONS, NUMBER_OF_VALUES_PER_OBJECT],
-            Self::PoseDetection => [1, NUMBER_OF_DETECTIONS, NUMBER_OF_VALUES_PER_POSE],
+            Self::YOLOObjectDetection => [1, NUMBER_OF_DETECTIONS, NUMBER_OF_VALUES_PER_OBJECT],
+            Self::CustomObjectDetection => [1, NUMBER_OF_DETECTIONS, NUMBER_OF_VALUES_PER_OBJECT],
+            Self::PoseDetection => [
+                1,
+                NUMBER_OF_DETECTIONS,
+                NUMBER_OF_VALUES_PER_FIELD_FEATURE_POSE,
+            ],
         }
     }
 }
 
 #[derive(Debug)]
 struct ModelOutputs<'a> {
-    objects: ArrayView2<'a, f32>,
+    yolo_objects: ArrayView2<'a, f32>,
+    custom_objects: ArrayView2<'a, f32>,
     poses: ArrayView2<'a, f32>,
 }
 
@@ -76,11 +84,14 @@ async fn run(ctx: Arc<Context>) -> Result<()> {
         .publisher::<Duration>("non_maximum_suppression_duration")
         .build()
         .await?;
-    let detected_objects_pub = node
-        .announcing_publisher::<Vec<Object<RobocupObjectLabel>>>("detected_objects")
+    let detected_yolo_objects_pub = node
+        .announcing_publisher::<Vec<Object<YOLOObjectLabel>>>("detected_yolo_objects")
+        .await?;
+    let detected_custom_objects_pub = node
+        .announcing_publisher::<Vec<Object<CustomObjectLabel>>>("detected_objects")
         .await?;
     let detected_poses_pub = node
-        .announcing_publisher::<Vec<Pose<YOLOObjectLabel>>>("detected_poses")
+        .announcing_publisher::<Vec<FieldFeaturePose>>("detected_poses")
         .await?;
 
     let initial_parameters_snapshot = node_parameters.snapshot();
@@ -114,7 +125,9 @@ async fn run(ctx: Arc<Context>) -> Result<()> {
         let timed_image = image_sub.recv().await?;
         let image_time = timed_image.time;
 
-        let detected_objects_pending = detected_objects_pub.announce(image_time).await?;
+        let detected_yolo_objects_pending = detected_yolo_objects_pub.announce(image_time).await?;
+        let detected_custom_objects_pending =
+            detected_custom_objects_pub.announce(image_time).await?;
         let detected_poses_pending = detected_poses_pub.announce(image_time).await?;
 
         let image = timed_image.inner;
@@ -134,24 +147,34 @@ async fn run(ctx: Arc<Context>) -> Result<()> {
         let post_processing_start = Instant::now();
 
         let outputs = extract_outputs(&outputs)?;
-        let candidate_detections = extract_candidate_object_detections(
+        let candidate_yolo_detections = extract_candidate_yolo_object_detections(
             &outputs,
             parameters.object_detection_parameters.confidence_threshold,
         )?;
-        let candidate_human_poses = extract_candidate_pose_detections(
+        let candidate_custom_detections = extract_candidate_custom_object_detections(
+            &outputs,
+            parameters.object_detection_parameters.confidence_threshold,
+        )?;
+        let candidate_field_feature_poses = extract_candidate_pose_detections(
             &outputs,
             parameters.pose_detection_parameters.confidence_threshold,
         )?;
         let post_processing_duration = post_processing_start.elapsed();
         let non_maximum_suppression_start = Instant::now();
-        let detected_objects = non_maximum_suppression(
-            candidate_detections,
+        let detected_yolo_objects = non_maximum_suppression(
+            candidate_yolo_detections,
+            parameters
+                .object_detection_parameters
+                .maximum_intersection_over_union,
+        );
+        let detected_custom_objects = non_maximum_suppression(
+            candidate_custom_detections,
             parameters
                 .object_detection_parameters
                 .maximum_intersection_over_union,
         );
         let detected_poses = non_maximum_suppression(
-            candidate_human_poses,
+            candidate_field_feature_poses,
             parameters
                 .pose_detection_parameters
                 .maximum_intersection_over_union,
@@ -166,7 +189,12 @@ async fn run(ctx: Arc<Context>) -> Result<()> {
             .publish(&non_maximum_suppression_duration)
             .await?;
 
-        detected_objects_pending.publish(&detected_objects).await?;
+        detected_yolo_objects_pending
+            .publish(&detected_yolo_objects)
+            .await?;
+        detected_custom_objects_pending
+            .publish(&detected_custom_objects)
+            .await?;
         detected_poses_pending.publish(&detected_poses).await?;
     }
 }
@@ -188,16 +216,27 @@ fn check_image(image: &Image) -> Result<()> {
 }
 
 fn extract_outputs<'a>(outputs: &'a SessionOutputs<'a>) -> Result<ModelOutputs<'a>> {
-    let objects_output =
-        outputs[TaskHead::ObjectDetection.output_name()].try_extract_array::<f32>()?;
-    if objects_output.shape() != TaskHead::ObjectDetection.expected_shape() {
+    let yolo_objects_output =
+        outputs[TaskHead::YOLOObjectDetection.output_name()].try_extract_array::<f32>()?;
+    if yolo_objects_output.shape() != TaskHead::YOLOObjectDetection.expected_shape() {
         bail!(
             "object detection output not of expected shape. Expected: {:?}, got: {:?}",
-            TaskHead::ObjectDetection.expected_shape(),
-            objects_output.shape()
+            TaskHead::YOLOObjectDetection.expected_shape(),
+            yolo_objects_output.shape()
         )
     }
-    let reshaped_objects_output = objects_output.squeeze().into_dimensionality()?;
+    let reshaped_yolo_objects_output = yolo_objects_output.squeeze().into_dimensionality()?;
+
+    let custom_objects_output =
+        outputs[TaskHead::CustomObjectDetection.output_name()].try_extract_array::<f32>()?;
+    if custom_objects_output.shape() != TaskHead::CustomObjectDetection.expected_shape() {
+        bail!(
+            "object detection output not of expected shape. Expected: {:?}, got: {:?}",
+            TaskHead::CustomObjectDetection.expected_shape(),
+            custom_objects_output.shape()
+        )
+    }
+    let reshaped_custom_objects_output = custom_objects_output.squeeze().into_dimensionality()?;
 
     let poses_output = outputs[TaskHead::PoseDetection.output_name()].try_extract_array::<f32>()?;
     if poses_output.shape() != TaskHead::PoseDetection.expected_shape() {
@@ -210,17 +249,44 @@ fn extract_outputs<'a>(outputs: &'a SessionOutputs<'a>) -> Result<ModelOutputs<'
     let reshaped_pose_output = poses_output.squeeze().into_dimensionality()?;
 
     Ok(ModelOutputs {
-        objects: reshaped_objects_output,
+        yolo_objects: reshaped_yolo_objects_output,
+        custom_objects: reshaped_custom_objects_output,
         poses: reshaped_pose_output,
     })
 }
 
-fn extract_candidate_object_detections(
+fn extract_candidate_yolo_object_detections(
     outputs: &ModelOutputs,
     confidence_threshold: f32,
-) -> Result<Vec<Object<RobocupObjectLabel>>> {
+) -> Result<Vec<Object<YOLOObjectLabel>>> {
     Ok(outputs
-        .objects
+        .yolo_objects
+        .axis_iter(Axis(0))
+        .filter_map(|row| {
+            let confidence = row[4usize];
+            if confidence < confidence_threshold {
+                return None;
+            }
+
+            let object_values: [f32; NUMBER_OF_VALUES_PER_OBJECT] = row
+                .as_slice()
+                .expect("slice is not contiguous")
+                .try_into()
+                .unwrap_or_else(|_| {
+                    panic!("slice is not of length {}", NUMBER_OF_VALUES_PER_OBJECT)
+                });
+
+            Some(Object::from(object_values))
+        })
+        .collect())
+}
+
+fn extract_candidate_custom_object_detections(
+    outputs: &ModelOutputs,
+    confidence_threshold: f32,
+) -> Result<Vec<Object<CustomObjectLabel>>> {
+    Ok(outputs
+        .custom_objects
         .axis_iter(Axis(0))
         .filter_map(|row| {
             let confidence = row[4usize];
@@ -244,7 +310,7 @@ fn extract_candidate_object_detections(
 fn extract_candidate_pose_detections(
     outputs: &ModelOutputs,
     confidence_threshold: f32,
-) -> Result<Vec<Pose<YOLOObjectLabel>>> {
+) -> Result<Vec<FieldFeaturePose>> {
     Ok(outputs
         .poses
         .axis_iter(Axis(0))
@@ -254,11 +320,16 @@ fn extract_candidate_pose_detections(
                 return None;
             }
 
-            let pose_values: [f32; NUMBER_OF_VALUES_PER_POSE] = row
+            let pose_values: [f32; NUMBER_OF_VALUES_PER_FIELD_FEATURE_POSE] = row
                 .as_slice()
                 .expect("slice is not contiguous")
                 .try_into()
-                .unwrap_or_else(|_| panic!("slice is not of length {}", NUMBER_OF_VALUES_PER_POSE));
+                .unwrap_or_else(|_| {
+                    panic!(
+                        "slice is not of length {}",
+                        NUMBER_OF_VALUES_PER_FIELD_FEATURE_POSE
+                    )
+                });
 
             Some(Pose::from(&pose_values))
         })
@@ -275,7 +346,7 @@ impl<T> HasBoundingBox for Object<T> {
     }
 }
 
-impl<T> HasBoundingBox for Pose<T> {
+impl<T, K> HasBoundingBox for Pose<T, K> {
     fn bounding_box(&self) -> &BoundingBox {
         &self.object.bounding_box
     }

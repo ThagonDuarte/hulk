@@ -8,7 +8,9 @@ use coordinate_systems::Pixel;
 use hsl_network_messages::Team;
 use linear_algebra::{Point2, point};
 
-use crate::object_detection::{LabelIndex, NUMBER_OF_VALUES_PER_OBJECT, Object, YOLOObjectLabel};
+use crate::object_detection::{
+    FieldFeatureLabel, LabelIndex, NUMBER_OF_VALUES_PER_OBJECT, Object, YOLOObjectLabel,
+};
 
 #[derive(
     Debug,
@@ -29,7 +31,18 @@ pub enum DetectionRegion {
 pub const OVERALL_KEYPOINT_INDEX_MASK: [usize; 15] =
     [0, 1, 2, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16];
 pub const VISUAL_REFEREE_KEYPOINT_INDEX_MASK: [usize; 8] = [5, 6, 7, 8, 9, 10, 15, 16];
-pub const NUMBER_OF_VALUES_PER_POSE: usize = 57;
+pub const NUMBER_OF_KEYPOINTS_PER_HUMANOID_POSE: usize = 17;
+pub const NUMBER_OF_KEYPOINTS_PER_FIELD_FEATURE_POSE: usize = 1;
+pub const NUMBER_OF_VALUES_PER_KEYPOINTS: usize = 3;
+pub const NUMBER_OF_VALUES_PER_HUMANOID_KEYPOINTS: usize =
+    NUMBER_OF_VALUES_PER_KEYPOINTS * NUMBER_OF_KEYPOINTS_PER_HUMANOID_POSE;
+pub const NUMBER_OF_VALUES_PER_FIELD_FEATURE_KEYPOINTS: usize =
+    NUMBER_OF_VALUES_PER_KEYPOINTS * NUMBER_OF_KEYPOINTS_PER_FIELD_FEATURE_POSE;
+pub const NUMBER_OF_VALUES_PER_HUMANOID_POSE: usize = NUMBER_OF_VALUES_PER_OBJECT
+    + NUMBER_OF_VALUES_PER_KEYPOINTS * NUMBER_OF_KEYPOINTS_PER_HUMANOID_POSE;
+pub const NUMBER_OF_VALUES_PER_FIELD_FEATURE_POSE: usize = NUMBER_OF_VALUES_PER_OBJECT
+    + NUMBER_OF_VALUES_PER_KEYPOINTS * NUMBER_OF_KEYPOINTS_PER_FIELD_FEATURE_POSE;
+pub const NUMBER_OF_VALUES_PER_POSE: usize = NUMBER_OF_VALUES_PER_HUMANOID_POSE;
 pub const POSE_KEYPOINT_OFFSET: usize = NUMBER_OF_VALUES_PER_OBJECT;
 
 #[derive(
@@ -59,7 +72,7 @@ pub struct Keypoint {
     PathIntrospect,
     ros_z::Message,
 )]
-pub struct Keypoints {
+pub struct HumanoidKeypoints {
     pub left_eye: Keypoint,
     pub right_eye: Keypoint,
     pub nose: Keypoint,
@@ -79,13 +92,13 @@ pub struct Keypoints {
     pub right_foot: Keypoint,
 }
 
-impl Keypoints {
-    pub fn as_array(self) -> [Keypoint; 17] {
-        Into::<[Keypoint; 17]>::into(self)
+impl HumanoidKeypoints {
+    pub fn as_array(self) -> [Keypoint; NUMBER_OF_KEYPOINTS_PER_HUMANOID_POSE] {
+        Into::<[Keypoint; NUMBER_OF_KEYPOINTS_PER_HUMANOID_POSE]>::into(self)
     }
 }
 
-impl From<&[f32; 51]> for Keypoints {
+impl From<&[f32; 51]> for HumanoidKeypoints {
     fn from(keypoints_slice: &[f32; 51]) -> Self {
         let mut keypoints_iter = keypoints_slice
             .chunks_exact(3)
@@ -116,7 +129,7 @@ impl From<&[f32; 51]> for Keypoints {
     }
 }
 
-impl Index<usize> for Keypoints {
+impl Index<usize> for HumanoidKeypoints {
     fn index(&self, index: usize) -> &Keypoint {
         match index {
             0 => &self.left_eye,
@@ -142,8 +155,8 @@ impl Index<usize> for Keypoints {
     type Output = Keypoint;
 }
 
-impl From<Keypoints> for [Keypoint; 17] {
-    fn from(keypoints: Keypoints) -> Self {
+impl From<HumanoidKeypoints> for [Keypoint; NUMBER_OF_KEYPOINTS_PER_HUMANOID_POSE] {
+    fn from(keypoints: HumanoidKeypoints) -> Self {
         [
             keypoints.left_eye,
             keypoints.right_eye,
@@ -177,43 +190,128 @@ impl From<Keypoints> for [Keypoint; 17] {
     PathIntrospect,
     ros_z::Message,
 )]
-pub struct Pose<T> {
-    pub object: Object<T>,
-    pub keypoints: Keypoints,
+pub struct FieldFeatureKeypoints {
+    pub feature: Keypoint,
 }
 
-impl<T> Pose<T> {
-    pub fn new(object: Object<T>, keypoints: Keypoints) -> Pose<T> {
+impl FieldFeatureKeypoints {
+    pub fn as_array(self) -> [Keypoint; NUMBER_OF_KEYPOINTS_PER_FIELD_FEATURE_POSE] {
+        [self.feature]
+    }
+}
+
+impl From<&[f32; NUMBER_OF_VALUES_PER_FIELD_FEATURE_KEYPOINTS]> for FieldFeatureKeypoints {
+    fn from(keypoints_slice: &[f32; NUMBER_OF_VALUES_PER_FIELD_FEATURE_KEYPOINTS]) -> Self {
+        Self {
+            feature: Keypoint {
+                point: point![keypoints_slice[0], keypoints_slice[1]],
+                confidence: keypoints_slice[2],
+            },
+        }
+    }
+}
+
+impl Index<usize> for FieldFeatureKeypoints {
+    fn index(&self, index: usize) -> &Keypoint {
+        match index {
+            0 => &self.feature,
+            _ => panic!("out of bounds: {index}"),
+        }
+    }
+    type Output = Keypoint;
+}
+
+impl From<FieldFeatureKeypoints> for [Keypoint; NUMBER_OF_KEYPOINTS_PER_FIELD_FEATURE_POSE] {
+    fn from(keypoints: FieldFeatureKeypoints) -> Self {
+        keypoints.as_array()
+    }
+}
+
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    Serialize,
+    Deserialize,
+    PathSerialize,
+    PathDeserialize,
+    PathIntrospect,
+    ros_z::Message,
+)]
+pub struct Pose<T, K = HumanoidKeypoints> {
+    pub object: Object<T>,
+    pub keypoints: K,
+}
+
+impl<T, K> Pose<T, K> {
+    pub fn new(object: Object<T>, keypoints: K) -> Pose<T, K> {
         Self { object, keypoints }
     }
 }
 
-impl<T> From<&[f32; 57]> for Pose<T>
+pub type HumanoidPose<T> = Pose<T, HumanoidKeypoints>;
+pub type FieldFeaturePose = Pose<FieldFeatureLabel, FieldFeatureKeypoints>;
+
+impl<T> From<&[f32; NUMBER_OF_VALUES_PER_HUMANOID_POSE]> for Pose<T, HumanoidKeypoints>
 where
     T: LabelIndex,
 {
-    fn from(values: &[f32; 57]) -> Self {
-        let object_detection_values: [f32; 6] = values[..POSE_KEYPOINT_OFFSET]
+    fn from(values: &[f32; NUMBER_OF_VALUES_PER_HUMANOID_POSE]) -> Self {
+        let object_detection_values: [f32; NUMBER_OF_VALUES_PER_OBJECT] = values
+            [..POSE_KEYPOINT_OFFSET]
             .try_into()
             .unwrap_or_else(|_| {
                 panic!(
-                    "slice does not contain atleast {} values",
+                    "slice does not contain at least {} values",
                     POSE_KEYPOINT_OFFSET
                 )
             });
 
-        let keypoint_values = &values[POSE_KEYPOINT_OFFSET..]
+        let keypoint_values: [f32; NUMBER_OF_VALUES_PER_HUMANOID_KEYPOINTS] = values
+            [POSE_KEYPOINT_OFFSET..]
             .try_into()
             .unwrap_or_else(|_| {
                 panic!(
-                    "slice does not contain atleast {} values",
-                    NUMBER_OF_VALUES_PER_POSE - POSE_KEYPOINT_OFFSET
+                    "slice does not contain at least {} values",
+                    NUMBER_OF_VALUES_PER_HUMANOID_KEYPOINTS
                 )
             });
 
         Pose {
             object: Object::from(object_detection_values),
-            keypoints: Keypoints::from(keypoint_values),
+            keypoints: HumanoidKeypoints::from(&keypoint_values),
+        }
+    }
+}
+
+impl<T> From<&[f32; NUMBER_OF_VALUES_PER_FIELD_FEATURE_POSE]> for Pose<T, FieldFeatureKeypoints>
+where
+    T: LabelIndex,
+{
+    fn from(values: &[f32; NUMBER_OF_VALUES_PER_FIELD_FEATURE_POSE]) -> Self {
+        let object_detection_values: [f32; NUMBER_OF_VALUES_PER_OBJECT] = values
+            [..POSE_KEYPOINT_OFFSET]
+            .try_into()
+            .unwrap_or_else(|_| {
+                panic!(
+                    "slice does not contain at least {} values",
+                    POSE_KEYPOINT_OFFSET
+                )
+            });
+
+        let keypoint_values: [f32; NUMBER_OF_VALUES_PER_FIELD_FEATURE_KEYPOINTS] = values
+            [POSE_KEYPOINT_OFFSET..]
+            .try_into()
+            .unwrap_or_else(|_| {
+                panic!(
+                    "slice does not contain at least {} values",
+                    NUMBER_OF_VALUES_PER_FIELD_FEATURE_KEYPOINTS
+                )
+            });
+
+        Pose {
+            object: Object::from(object_detection_values),
+            keypoints: FieldFeatureKeypoints::from(&keypoint_values),
         }
     }
 }
@@ -230,7 +328,7 @@ where
     ros_z::Message,
 )]
 pub struct RefereePoseCandidate {
-    pub pose: Pose<YOLOObjectLabel>,
+    pub pose: HumanoidPose<YOLOObjectLabel>,
     pub distance_to_referee_position: f32,
 }
 

@@ -316,6 +316,7 @@ impl From<YOLOObjectLabel> for String {
         .to_string()
     }
 }
+
 #[derive(
     Debug,
     Clone,
@@ -328,41 +329,72 @@ impl From<YOLOObjectLabel> for String {
     PartialEq,
     ros_z::Message,
 )]
-pub enum RobocupObjectLabel {
+pub enum CustomObjectLabel {
     Ball = 0,
-    GoalPost = 1,
-    LSpot = 2,
-    PenaltySpot = 3,
-    Robot = 4,
-    TSpot = 5,
-    XSpot = 6,
+    Robot = 1,
 }
 
-impl LabelIndex for RobocupObjectLabel {
+impl LabelIndex for CustomObjectLabel {
     fn from_index(index: usize) -> Self {
         match index {
             0 => Self::Ball,
-            1 => Self::GoalPost,
-            2 => Self::LSpot,
-            3 => Self::PenaltySpot,
-            4 => Self::Robot,
-            5 => Self::TSpot,
-            6 => Self::XSpot,
+            1 => Self::Robot,
             _ => unimplemented!(),
         }
     }
 }
 
-impl From<RobocupObjectLabel> for String {
-    fn from(label: RobocupObjectLabel) -> Self {
+impl From<CustomObjectLabel> for String {
+    fn from(label: CustomObjectLabel) -> Self {
         match label {
-            RobocupObjectLabel::Ball => "Ball",
-            RobocupObjectLabel::GoalPost => "GoalPost",
-            RobocupObjectLabel::LSpot => "LSpot",
-            RobocupObjectLabel::PenaltySpot => "PenaltySpot",
-            RobocupObjectLabel::Robot => "Robot",
-            RobocupObjectLabel::TSpot => "TSpot",
-            RobocupObjectLabel::XSpot => "XSpot",
+            CustomObjectLabel::Ball => "Ball",
+            CustomObjectLabel::Robot => "Robot",
+        }
+        .to_string()
+    }
+}
+
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    Serialize,
+    Deserialize,
+    PathIntrospect,
+    PathSerialize,
+    PathDeserialize,
+    PartialEq,
+    ros_z::Message,
+)]
+pub enum FieldFeatureLabel {
+    GoalPost = 0,
+    LSpot = 1,
+    PenaltySpot = 2,
+    TSpot = 3,
+    XSpot = 4,
+}
+
+impl LabelIndex for FieldFeatureLabel {
+    fn from_index(index: usize) -> Self {
+        match index {
+            0 => Self::GoalPost,
+            1 => Self::LSpot,
+            2 => Self::PenaltySpot,
+            3 => Self::TSpot,
+            4 => Self::XSpot,
+            _ => unimplemented!(),
+        }
+    }
+}
+
+impl From<FieldFeatureLabel> for String {
+    fn from(label: FieldFeatureLabel) -> Self {
+        match label {
+            FieldFeatureLabel::GoalPost => "GoalPost",
+            FieldFeatureLabel::LSpot => "LSpot",
+            FieldFeatureLabel::PenaltySpot => "PenaltySpot",
+            FieldFeatureLabel::TSpot => "TSpot",
+            FieldFeatureLabel::XSpot => "XSpot",
         }
         .to_string()
     }
