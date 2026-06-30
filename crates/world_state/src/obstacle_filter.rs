@@ -13,16 +13,16 @@ use context_attribute::context;
 use coordinate_systems::{Field, Ground};
 use filtering::kalman_filter::KalmanFilter;
 use framework::{AdditionalOutput, HistoricInput, MainOutput, PerceptionInput};
-use linear_algebra::{IntoFramed, Isometry2, Point2, center, point};
+use linear_algebra::{IntoFramed, Isometry2, Point2, point};
 use types::{
     cycle_time::CycleTime,
     field_dimensions::FieldDimensions,
     multivariate_normal_distribution::MultivariateNormalDistribution,
-    object_detection::{Object, RobocupObjectLabel, YOLOObjectLabel},
+    object_detection::{CustomObjectLabel, FieldFeatureLabel, Object, YOLOObjectLabel},
     obstacle_filter::Hypothesis,
     obstacles::{Obstacle, ObstacleKind},
     parameters::ObstacleFilterParameters,
-    pose_detection::Pose,
+    pose_detection::FieldFeaturePose,
     primary_state::PrimaryState,
 };
 
@@ -54,8 +54,10 @@ pub struct CycleContext {
     current_ground_to_field: Input<Option<Isometry2<Ground, Field>>, "ground_to_field?">,
 
     fall_down_state: PerceptionInput<Option<FallDownState>, "FallDownState", "fall_down_state?">,
-    detected_objects: PerceptionInput<Vec<Object<RobocupObjectLabel>>, "Hydra", "detected_objects">,
-    detected_poses: PerceptionInput<Vec<Pose<YOLOObjectLabel>>, "Hydra", "detected_poses">,
+    detected_objects: PerceptionInput<Vec<Object<CustomObjectLabel>>, "Hydra", "detected_objects">,
+    detected_yolo_objects:
+        PerceptionInput<Vec<Object<YOLOObjectLabel>>, "Hydra", "detected_yolo_objects">,
+    detected_poses: PerceptionInput<Vec<FieldFeaturePose>, "Hydra", "detected_poses">,
 
     field_dimensions: Parameter<FieldDimensions, "field_dimensions">,
     parameters: Parameter<ObstacleFilterParameters, "obstacle_filter">,
@@ -88,11 +90,14 @@ impl ObstacleFilter {
                     (
                         detection_time,
                         detected_objects,
+                        context.detected_yolo_objects.persistent[detection_time].clone(),
                         context.detected_poses.persistent[detection_time].clone(),
                     )
                 });
 
-        for (detection_time, detected_objects, detected_poses) in measurements {
+        for (detection_time, detected_objects, detected_yolo_objects, detected_poses) in
+            measurements
+        {
             let current_odometry_to_last_odometry = context
                 .current_odometry_to_last_odometry
                 .get_nearest(detection_time)
@@ -125,11 +130,18 @@ impl ObstacleFilter {
                 let measured_object_positions =
                     measured_object_positions(parameters, detected_objects, camera_matrix);
 
+                let measured_yolo_object_positions = measured_yolo_object_positions(
+                    parameters,
+                    &detected_yolo_objects,
+                    camera_matrix,
+                );
+
                 let measured_pose_positions =
                     measured_pose_positions(parameters, &detected_poses, camera_matrix);
 
                 for (kind, position, measurement_noise) in measured_object_positions
                     .into_iter()
+                    .chain(measured_yolo_object_positions)
                     .chain(measured_pose_positions)
                 {
                     self.update_hypotheses_with_measurement(
@@ -348,7 +360,7 @@ impl ObstacleFilter {
 
 fn measured_object_positions(
     parameters: &ObstacleFilterParameters,
-    detected_objects: &Vec<&Vec<Object<RobocupObjectLabel>>>,
+    detected_objects: &Vec<&Vec<Object<CustomObjectLabel>>>,
     camera_matrix: &CameraMatrix,
 ) -> impl IntoIterator<Item = (ObstacleKind, Point2<Ground>, nalgebra::Vector2<f32>)> {
     detected_objects
@@ -361,11 +373,7 @@ fn measured_object_positions(
             } = detected_object;
 
             let (kind, measurement_noise) = match label {
-                RobocupObjectLabel::GoalPost => (
-                    ObstacleKind::GoalPost,
-                    parameters.goal_post_measurement_noise,
-                ),
-                RobocupObjectLabel::Robot => {
+                CustomObjectLabel::Robot => {
                     (ObstacleKind::Robot, parameters.robot_measurement_noise)
                 }
                 _ => return None,
@@ -384,19 +392,19 @@ fn measured_object_positions(
         })
 }
 
-fn measured_pose_positions(
+fn measured_yolo_object_positions(
     parameters: &ObstacleFilterParameters,
-    detected_poses: &Vec<&Vec<Pose<YOLOObjectLabel>>>,
+    detected_objects: &Vec<&Vec<Object<YOLOObjectLabel>>>,
     camera_matrix: &CameraMatrix,
 ) -> impl Iterator<Item = (ObstacleKind, Point2<Ground>, nalgebra::Vector2<f32>)> {
-    detected_poses
+    detected_objects
         .iter()
         .flat_map(|detections| detections.iter())
-        .filter_map(|detected_pose| {
+        .filter_map(|detected_object| {
             let Object {
                 label,
                 bounding_box,
-            } = detected_pose.object;
+            } = detected_object;
 
             let (kind, measurement_noise) = match label {
                 YOLOObjectLabel::Person => {
@@ -405,34 +413,47 @@ fn measured_pose_positions(
                 _ => return None,
             };
 
-            let keypoints = detected_pose.keypoints;
-
-            if keypoints.left_foot.confidence
-                > parameters.person_feet_keypoints_confidence_threshold
-                && keypoints.right_foot.confidence
-                    > parameters.person_feet_keypoints_confidence_threshold
-            {
-                let feet_center_point =
-                    center(keypoints.left_foot.point, keypoints.right_foot.point);
-
-                let obstacle_center: Point2<Ground> =
-                    camera_matrix.pixel_to_ground(feet_center_point).ok()?;
-
-                Some((kind, obstacle_center, measurement_noise))
-            } else if bounding_box.confidence > parameters.person_object_confidence_threshold {
-                let bottom_center_position = {
-                    let Rectangle { min, max } = bounding_box.area;
-
-                    point![min.x() + (max.x() - min.x()) / 2.0, max.y()]
-                };
-
-                let obstacle_center: Point2<Ground> =
-                    camera_matrix.pixel_to_ground(bottom_center_position).ok()?;
-
-                Some((kind, obstacle_center, measurement_noise))
-            } else {
-                None
+            if bounding_box.confidence <= parameters.person_object_confidence_threshold {
+                return None;
             }
+
+            let bottom_center_position = {
+                let Rectangle { min, max } = bounding_box.area;
+
+                point![min.x() + (max.x() - min.x()) / 2.0, max.y()]
+            };
+
+            let obstacle_center: Point2<Ground> =
+                camera_matrix.pixel_to_ground(bottom_center_position).ok()?;
+
+            Some((kind, obstacle_center, measurement_noise))
+        })
+}
+
+fn measured_pose_positions(
+    parameters: &ObstacleFilterParameters,
+    detected_poses: &Vec<&Vec<FieldFeaturePose>>,
+    camera_matrix: &CameraMatrix,
+) -> impl Iterator<Item = (ObstacleKind, Point2<Ground>, nalgebra::Vector2<f32>)> {
+    detected_poses
+        .iter()
+        .flat_map(|detections| detections.iter())
+        .filter_map(|detected_pose| {
+            let label = detected_pose.object.label;
+
+            let (kind, measurement_noise) = match label {
+                FieldFeatureLabel::GoalPost => (
+                    ObstacleKind::GoalPost,
+                    parameters.goal_post_measurement_noise,
+                ),
+                _ => return None,
+            };
+
+            let obstacle_center: Point2<Ground> = camera_matrix
+                .pixel_to_ground(detected_pose.keypoints.feature.point)
+                .ok()?;
+
+            Some((kind, obstacle_center, measurement_noise))
         })
 }
 
