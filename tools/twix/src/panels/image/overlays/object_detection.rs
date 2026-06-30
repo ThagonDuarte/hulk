@@ -3,16 +3,39 @@ use std::sync::Arc;
 use color_eyre::Result;
 use coordinate_systems::Pixel;
 use eframe::egui::{Align2, Color32, FontId, Stroke};
-use types::object_detection::{Object, RobocupObjectLabel};
+use types::object_detection::{CustomObjectLabel, Object, YOLOObjectLabel};
 
 use crate::{panels::image::overlay::Overlay, robot::Robot, value_buffer::BufferHandle};
 
-pub struct ObjectDetection {
-    object_detections: BufferHandle<Vec<Object<RobocupObjectLabel>>>,
+pub struct YoloObjectDetection {
+    object_detections: BufferHandle<Vec<Object<YOLOObjectLabel>>>,
 }
 
-impl Overlay for ObjectDetection {
-    const NAME: &'static str = "Object Detection";
+impl Overlay for YoloObjectDetection {
+    const NAME: &'static str = "YOLO Object Detection";
+
+    fn new(robot: Arc<Robot>) -> Self {
+        let object_detections = robot.subscribe_value("Hydra.main_outputs.detected_yolo_objects");
+        Self { object_detections }
+    }
+
+    fn paint(&self, painter: &crate::twix_painter::TwixPainter<Pixel>) -> Result<()> {
+        let Some(object_detections) = self.object_detections.get_last_value()? else {
+            return Ok(());
+        };
+
+        paint_bounding_boxes(painter, object_detections, Color32::LIGHT_BLUE);
+
+        Ok(())
+    }
+}
+
+pub struct CustomObjectDetection {
+    object_detections: BufferHandle<Vec<Object<CustomObjectLabel>>>,
+}
+
+impl Overlay for CustomObjectDetection {
+    const NAME: &'static str = "Custom Object Detection";
 
     fn new(robot: Arc<Robot>) -> Self {
         let object_detections = robot.subscribe_value("Hydra.main_outputs.detected_objects");
@@ -32,7 +55,7 @@ impl Overlay for ObjectDetection {
 
 fn paint_bounding_boxes(
     painter: &crate::twix_painter::TwixPainter<Pixel>,
-    detections: Vec<Object<RobocupObjectLabel>>,
+    detections: Vec<Object<impl Into<String>>>,
     line_color: Color32,
 ) {
     for detection in detections {

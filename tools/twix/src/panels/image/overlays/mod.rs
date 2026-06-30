@@ -9,5 +9,5 @@ pub use ball_detection::BallDetection;
 pub use field_border::FieldBorder;
 pub use horizon::Horizon;
 pub use line_detection::LineDetection;
-pub use object_detection::ObjectDetection;
-pub use pose_detection::PoseDetection;
+pub use object_detection::{CustomObjectDetection, YoloObjectDetection};
+pub use pose_detection::{FieldFeaturePoseDetection, HumanoidPoseDetection};

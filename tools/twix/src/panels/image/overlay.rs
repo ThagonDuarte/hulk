@@ -9,7 +9,10 @@ use serde_json::{Value, json};
 use coordinate_systems::Pixel;
 
 use crate::{
-    panels::image::overlays::{BallDetection, ObjectDetection, PoseDetection},
+    panels::image::overlays::{
+        BallDetection, CustomObjectDetection, FieldFeaturePoseDetection, HumanoidPoseDetection,
+        YoloObjectDetection,
+    },
     robot::Robot,
     twix_painter::TwixPainter,
 };
@@ -77,8 +80,10 @@ pub struct Overlays {
     pub ball_detection: EnabledOverlay<BallDetection>,
     pub horizon: EnabledOverlay<Horizon>,
     pub field_border: EnabledOverlay<FieldBorder>,
-    pub object_detection: EnabledOverlay<ObjectDetection>,
-    pub pose_detection: EnabledOverlay<PoseDetection>,
+    pub yolo_object_detection: EnabledOverlay<YoloObjectDetection>,
+    pub custom_object_detection: EnabledOverlay<CustomObjectDetection>,
+    pub humanoid_pose_detection: EnabledOverlay<HumanoidPoseDetection>,
+    pub field_feature_pose_detection: EnabledOverlay<FieldFeaturePoseDetection>,
 }
 
 impl Overlays {
@@ -87,16 +92,20 @@ impl Overlays {
         let ball_detection = EnabledOverlay::new(robot.clone(), storage, false);
         let horizon = EnabledOverlay::new(robot.clone(), storage, false);
         let field_border = EnabledOverlay::new(robot.clone(), storage, false);
-        let object_detection = EnabledOverlay::new(robot.clone(), storage, false);
-        let pose_detection = EnabledOverlay::new(robot.clone(), storage, false);
+        let yolo_object_detection = EnabledOverlay::new(robot.clone(), storage, false);
+        let custom_object_detection = EnabledOverlay::new(robot.clone(), storage, false);
+        let humanoid_pose_detection = EnabledOverlay::new(robot.clone(), storage, false);
+        let field_feature_pose_detection = EnabledOverlay::new(robot.clone(), storage, false);
 
         Self {
             line_detection,
             ball_detection,
             horizon,
             field_border,
-            object_detection,
-            pose_detection,
+            yolo_object_detection,
+            custom_object_detection,
+            humanoid_pose_detection,
+            field_feature_pose_detection,
         }
     }
 
@@ -106,8 +115,10 @@ impl Overlays {
             self.ball_detection.checkbox(ui);
             self.horizon.checkbox(ui);
             self.field_border.checkbox(ui);
-            self.object_detection.checkbox(ui);
-            self.pose_detection.checkbox(ui);
+            self.yolo_object_detection.checkbox(ui);
+            self.custom_object_detection.checkbox(ui);
+            self.humanoid_pose_detection.checkbox(ui);
+            self.field_feature_pose_detection.checkbox(ui);
         });
     }
 
@@ -116,8 +127,10 @@ impl Overlays {
         self.ball_detection.paint(painter);
         self.horizon.paint(painter);
         self.field_border.paint(painter);
-        self.object_detection.paint(painter);
-        self.pose_detection.paint(painter);
+        self.yolo_object_detection.paint(painter);
+        self.custom_object_detection.paint(painter);
+        self.humanoid_pose_detection.paint(painter);
+        self.field_feature_pose_detection.paint(painter);
     }
 
     pub fn save(&self) -> Value {
@@ -126,8 +139,10 @@ impl Overlays {
             "ball_detection": self.ball_detection.save(),
             "horizon": self.horizon.save(),
             "field_border": self.field_border.save(),
-            "object_detection": self.object_detection.save(),
-            "pose_detection": self.pose_detection.save(),
+            "yolo_object_detection": self.yolo_object_detection.save(),
+            "custom_object_detection": self.custom_object_detection.save(),
+            "humanoid_pose_detection": self.humanoid_pose_detection.save(),
+            "field_feature_pose_detection": self.field_feature_pose_detection.save(),
         })
     }
 }

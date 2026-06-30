@@ -6,7 +6,9 @@ use eframe::egui::{Align2, Color32, FontId, Stroke};
 use linear_algebra::vector;
 use types::{
     object_detection::YOLOObjectLabel,
-    pose_detection::{Keypoint, Pose},
+    pose_detection::{
+        FieldFeaturePose, HumanoidPose, Keypoint, NUMBER_OF_KEYPOINTS_PER_HUMANOID_POSE,
+    },
 };
 
 use crate::{panels::image::overlay::Overlay, robot::Robot, value_buffer::BufferHandle};
@@ -31,15 +33,15 @@ const POSE_SKELETON_KEYPOINT_LINE_MAPPING: [(usize, usize); 16] = [
 ];
 const KEYPOINT_CONFIDENCE_THRESHOLD: f32 = 0.8;
 
-pub struct PoseDetection {
-    poses: BufferHandle<Vec<Pose<YOLOObjectLabel>>>,
+pub struct HumanoidPoseDetection {
+    poses: BufferHandle<Vec<HumanoidPose<YOLOObjectLabel>>>,
 }
 
-impl Overlay for PoseDetection {
-    const NAME: &'static str = "Pose Detection";
+impl Overlay for HumanoidPoseDetection {
+    const NAME: &'static str = "Humanoid Pose Detection";
 
-    fn new(nao: Arc<Robot>) -> Self {
-        let poses = nao.subscribe_value("Hydra.main_outputs.detected_poses".to_string());
+    fn new(robot: Arc<Robot>) -> Self {
+        let poses = robot.subscribe_value("Hydra.main_outputs.detected_humanoid_poses");
         Self { poses }
     }
 
@@ -48,18 +50,41 @@ impl Overlay for PoseDetection {
             return Ok(());
         };
 
-        paint_poses(painter, poses)?;
+        paint_humanoid_poses(painter, poses)?;
 
         Ok(())
     }
 }
 
-fn paint_poses(
+pub struct FieldFeaturePoseDetection {
+    poses: BufferHandle<Vec<FieldFeaturePose>>,
+}
+
+impl Overlay for FieldFeaturePoseDetection {
+    const NAME: &'static str = "Field Feature Pose Detection";
+
+    fn new(robot: Arc<Robot>) -> Self {
+        let poses = robot.subscribe_value("Hydra.main_outputs.detected_poses");
+        Self { poses }
+    }
+
+    fn paint(&self, painter: &crate::twix_painter::TwixPainter<Pixel>) -> Result<()> {
+        let Some(poses) = self.poses.get_last_value()? else {
+            return Ok(());
+        };
+
+        paint_field_feature_poses(painter, poses)?;
+
+        Ok(())
+    }
+}
+
+fn paint_humanoid_poses(
     painter: &crate::twix_painter::TwixPainter<Pixel>,
-    poses: Vec<Pose<YOLOObjectLabel>>,
+    poses: Vec<HumanoidPose<YOLOObjectLabel>>,
 ) -> Result<()> {
     for pose in poses {
-        let keypoints: [Keypoint; 17] = pose.keypoints.into();
+        let keypoints: [Keypoint; NUMBER_OF_KEYPOINTS_PER_HUMANOID_POSE] = pose.keypoints.into();
 
         for (idx1, idx2) in POSE_SKELETON_KEYPOINT_LINE_MAPPING {
             if keypoints[idx1].confidence < KEYPOINT_CONFIDENCE_THRESHOLD
@@ -113,5 +138,32 @@ fn paint_poses(
             Color32::WHITE,
         );
     }
+    Ok(())
+}
+
+fn paint_field_feature_poses(
+    painter: &crate::twix_painter::TwixPainter<Pixel>,
+    poses: Vec<FieldFeaturePose>,
+) -> Result<()> {
+    for pose in poses {
+        let keypoint = pose.keypoints.feature;
+        if keypoint.confidence < KEYPOINT_CONFIDENCE_THRESHOLD {
+            continue;
+        }
+
+        painter.circle_filled(keypoint.point, 2.0, Color32::YELLOW);
+        painter.floating_text(
+            keypoint.point,
+            Align2::LEFT_TOP,
+            format!(
+                "{} {:.2}",
+                String::from(pose.object.label),
+                keypoint.confidence
+            ),
+            FontId::default(),
+            Color32::WHITE,
+        );
+    }
+
     Ok(())
 }
