@@ -5,7 +5,8 @@ use color_eyre::{Result, eyre::Context as _};
 
 use booster::{ImuState, LowState, MotorState};
 use kinematics::joints::Joints;
-use ros_z::prelude::*;
+use log::error;
+use ros_z::{prelude::*, time::Time};
 
 pub fn run_boxed(ctx: Arc<Context>) -> Pin<Box<dyn Future<Output = Result<()>> + Send>> {
     Box::pin(run(ctx))
@@ -39,31 +40,37 @@ async fn run(ctx: Arc<Context>) -> Result<()> {
         .await?;
 
     loop {
-        tokio::select! {
-            low_state = low_state_sub.recv_async() => {
-                let low_state = low_state.map_err(|error| color_eyre::eyre::eyre!("{error}"))?;
+        let low_state_sample = low_state_sub
+            .recv_async()
+            .await
+            .map_err(|error| color_eyre::eyre::eyre!("{error}"))?;
 
-                let low_state: LowState = cdr::deserialize(&low_state.payload().to_bytes())
-                    .wrap_err("deserialization failed")?;
+        let source_time = low_state_sample
+            .timestamp()
+            .map(|timestamp| Time::from_wallclock(timestamp.get_time().to_system_time()))
+            .unwrap_or_else(|| {
+                error!("No zenoh timestamp for low state. Falling back to node time");
+                node.clock().now()
+            });
 
-                let imu_state = low_state.imu_state;
-                let serial_motor_states = low_state.serial_motor_states()?;
-                let parallel_motor_states = low_state.parallel_motor_states().ok();
+        let low_state: LowState = cdr::deserialize(&low_state_sample.payload().to_bytes())
+            .wrap_err("deserialization failed")?;
 
-                low_state_pub
-                    .publish(&low_state)
-                    .await?;
-                imu_state_pub
-                    .publish(&imu_state)
-                    .await?;
-                serial_motor_states_pub
-                    .publish(&serial_motor_states)
-                    .await?;
-                parallel_motor_states_pub
-                    .publish(&parallel_motor_states)
-                    .await?;
+        let imu_state = low_state.imu_state;
+        let serial_motor_states = low_state.serial_motor_states()?;
+        let parallel_motor_states = low_state.parallel_motor_states().ok();
 
-            }
-        }
+        low_state_pub
+            .publish_with_source_time(&low_state, source_time)
+            .await?;
+        imu_state_pub
+            .publish_with_source_time(&imu_state, source_time)
+            .await?;
+        serial_motor_states_pub
+            .publish_with_source_time(&serial_motor_states, source_time)
+            .await?;
+        parallel_motor_states_pub
+            .publish_with_source_time(&parallel_motor_states, source_time)
+            .await?;
     }
 }

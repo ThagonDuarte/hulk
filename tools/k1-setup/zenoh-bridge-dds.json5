@@ -164,6 +164,18 @@
   mode: "client",
 
   ////
+  //// Enable Zenoh timestamps on samples published by this client. The low_state_bridge
+  //// uses these timestamps as source times when republishing DDS low_state data.
+  ////
+  timestamping: {
+    enabled: {
+      router: true,
+      peer: true,
+      client: true,
+    },
+  },
+
+  ////
   //// Which endpoints to connect to. E.g. tcp/localhost:7447.
   //// By configuring the endpoints, it is possible to tell zenoh which router/peer to connect to at startup.
   ////

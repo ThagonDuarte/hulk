@@ -6594,6 +6594,7 @@ dependencies = [
  "cdr",
  "color-eyre",
  "kinematics",
+ "log",
  "ros-z",
  "tokio",
 ]

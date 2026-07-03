@@ -712,6 +712,50 @@ async fn test_logical_clock_is_used_for_attachment_timestamps() {
     assert_eq!(attachment.source_time(), clock.now());
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn publish_with_source_time_sets_attachment_timestamp() {
+    let context = ContextBuilder::default()
+        .build()
+        .await
+        .expect("Failed to create context");
+    let node = context
+        .create_node("explicit_source_time_node")
+        .build()
+        .await
+        .expect("Failed to create node");
+
+    let publisher = node
+        .publisher::<TestMessage>("/explicit_source_time")
+        .build()
+        .await
+        .unwrap();
+    let subscriber = node
+        .subscriber::<TestMessage>("/explicit_source_time")
+        .build()
+        .await
+        .unwrap();
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let source_time = Time::from_nanos(123_456_789);
+    let message = TestMessage {
+        data: vec![1, 2],
+        counter: 3,
+    };
+    publisher
+        .publish_with_source_time(&message, source_time)
+        .await
+        .unwrap();
+
+    let received = tokio::time::timeout(Duration::from_secs(1), subscriber.recv_with_metadata())
+        .await
+        .expect("receive should not time out")
+        .expect("receive should succeed");
+
+    assert_eq!(received.message, message);
+    assert_eq!(received.source_time, source_time);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_vec_u8_pubsub() {
     let context = ContextBuilder::default()
