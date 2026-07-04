@@ -126,7 +126,7 @@ class ModelName:
         return f"{self.name}"
 
     def task_type(self) -> TaskType:
-        stem = PurePath(self.name).stem
+        stem = PurePath(self.name).stem.split("~", maxsplit=1)[0]
         variant_suffix = _yolo26_variant_suffix(stem)
         if variant_suffix is None:
             raise ModelNameError(self.name)
