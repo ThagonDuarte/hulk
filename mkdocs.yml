@@ -34,6 +34,7 @@ nav:
   - Tooling:
       - Overview: tooling/overview.md
       - Aliveness: tooling/aliveness.md
+      - Detection Replay: tooling/detection_replay.md
       - Charging box:
           - Overview: tooling/charging_box/overview.md
           - Building your own: tooling/charging_box/building_your_own.md

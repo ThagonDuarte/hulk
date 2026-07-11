@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# ort-sys otherwise prefers a system CPU-only ONNX Runtime over its WebGPU build.
+LIBONNXRUNTIME_NO_PKG_CONFIG=1 cargo run --package detection-replay -- "$@"

@@ -1,9 +1,13 @@
-use std::{boxed::Box, future::Future, pin::Pin, sync::Arc, time::Duration};
+use std::{boxed::Box, future::Future, path::Path, pin::Pin, sync::Arc, time::Duration};
 
-use color_eyre::{Result, eyre::bail};
-use ndarray::{ArrayView2, ArrayView3, Axis};
+use color_eyre::{Result, eyre::bail, eyre::eyre};
+use ndarray::{ArrayView2, ArrayView3, ArrayViewD, Axis};
+#[cfg(feature = "webgpu")]
+use ort::execution_providers::WebGPUExecutionProvider;
+#[cfg(feature = "nvidia")]
+use ort::execution_providers::{CUDAExecutionProvider, TensorRTExecutionProvider};
 use ort::{
-    execution_providers::{CUDAExecutionProvider, TensorRTExecutionProvider},
+    execution_providers::{CPUExecutionProvider, ExecutionProvider, ExecutionProviderDispatch},
     inputs,
     session::{Session, SessionOutputs, builder::GraphOptimizationLevel},
     value::TensorRef,
@@ -22,6 +26,13 @@ use types::{
 };
 
 pub const NUMBER_OF_DETECTIONS: usize = 300;
+
+#[derive(Clone, Copy, Debug, Default)]
+pub enum ExecutionProviderPolicy {
+    #[default]
+    Automatic,
+    WebGpuRequired,
+}
 
 #[derive(Clone, Copy, Debug)]
 enum TaskHead {
@@ -56,14 +67,21 @@ impl TaskHead {
 #[derive(Debug)]
 struct ModelOutputs<'a> {
     objects: ArrayView2<'a, f32>,
-    poses: ArrayView2<'a, f32>,
+    poses: Option<ArrayView2<'a, f32>>,
 }
 
 pub fn run_boxed(ctx: Arc<Context>) -> Pin<Box<dyn Future<Output = Result<()>> + Send>> {
-    Box::pin(run(ctx))
+    run_boxed_with_provider_policy(ctx, ExecutionProviderPolicy::Automatic)
 }
 
-async fn run(ctx: Arc<Context>) -> Result<()> {
+pub fn run_boxed_with_provider_policy(
+    ctx: Arc<Context>,
+    provider_policy: ExecutionProviderPolicy,
+) -> Pin<Box<dyn Future<Output = Result<()>> + Send>> {
+    Box::pin(run(ctx, provider_policy))
+}
+
+async fn run(ctx: Arc<Context>, provider_policy: ExecutionProviderPolicy) -> Result<()> {
     let node = ctx.create_node("detection").build().await?;
 
     let node_parameters = node.bind_parameter_as::<DetectionParameters>("detection")?;
@@ -98,17 +116,12 @@ async fn run(ctx: Arc<Context>) -> Result<()> {
         .neural_networks_folder
         .join(&parameters.model_name);
 
-    let tensor_rt = TensorRTExecutionProvider::default()
-        .with_device_id(0)
-        .with_fp16(true)
-        .with_engine_cache(true)
-        .with_engine_cache_path(parameters.neural_networks_folder.display())
-        .build();
-    let cuda = CUDAExecutionProvider::default().build();
+    let execution_providers =
+        execution_providers(&parameters.neural_networks_folder, provider_policy)?;
 
     let mut session = block_in_place(|| {
         Session::builder()?
-            .with_execution_providers([tensor_rt, cuda])?
+            .with_execution_providers(execution_providers)?
             .with_optimization_level(GraphOptimizationLevel::Level3)?
             .with_intra_threads(2)?
             .commit_from_file(model_path)
@@ -210,6 +223,67 @@ async fn run(ctx: Arc<Context>) -> Result<()> {
     }
 }
 
+fn execution_providers(
+    _neural_networks_folder: &Path,
+    policy: ExecutionProviderPolicy,
+) -> Result<Vec<ExecutionProviderDispatch>> {
+    #[allow(unused_mut)]
+    let mut providers = Vec::new();
+
+    #[cfg(feature = "nvidia")]
+    if matches!(policy, ExecutionProviderPolicy::Automatic) {
+        let tensor_rt = TensorRTExecutionProvider::default()
+            .with_device_id(0)
+            .with_fp16(true)
+            .with_engine_cache(true)
+            .with_engine_cache_path(_neural_networks_folder.display());
+        log_provider_availability(&tensor_rt);
+        providers.push(tensor_rt.build());
+
+        let cuda = CUDAExecutionProvider::default();
+        log_provider_availability(&cuda);
+        providers.push(cuda.build());
+    }
+
+    #[cfg(feature = "webgpu")]
+    {
+        let webgpu = WebGPUExecutionProvider::default();
+        log_provider_availability(&webgpu);
+        let webgpu = webgpu.build();
+        let webgpu = if matches!(policy, ExecutionProviderPolicy::WebGpuRequired) {
+            webgpu.error_on_failure()
+        } else {
+            webgpu
+        };
+        providers.push(webgpu);
+    }
+
+    #[cfg(not(feature = "webgpu"))]
+    if matches!(policy, ExecutionProviderPolicy::WebGpuRequired) {
+        bail!("WebGPU was required but detection was built without its WebGPU feature");
+    }
+
+    // CPU is ORT's implicit final fallback and must not be explicitly registered.
+    log_provider_availability(&CPUExecutionProvider::default());
+
+    Ok(providers)
+}
+
+fn log_provider_availability(provider: &impl ExecutionProvider) {
+    match provider.is_available() {
+        Ok(available) => tracing::info!(
+            provider = provider.name(),
+            available,
+            "ONNX Runtime execution provider availability"
+        ),
+        Err(error) => tracing::warn!(
+            provider = provider.name(),
+            ?error,
+            "failed to query ONNX Runtime execution provider availability"
+        ),
+    }
+}
+
 fn check_image(image: &Image) -> Result<()> {
     if image.encoding != "nv12" {
         bail!("unsupported image encoding: {}", image.encoding);
@@ -227,31 +301,50 @@ fn check_image(image: &Image) -> Result<()> {
 }
 
 fn extract_outputs<'a>(outputs: &'a SessionOutputs<'a>) -> Result<ModelOutputs<'a>> {
-    let objects_output =
-        outputs[TaskHead::ObjectDetection.output_name()].try_extract_array::<f32>()?;
-    if objects_output.shape() != TaskHead::ObjectDetection.expected_shape() {
+    let objects_output = outputs
+        .get(TaskHead::ObjectDetection.output_name())
+        .map(|output| output.try_extract_array::<f32>())
+        .transpose()?;
+    let poses_output = outputs
+        .get(TaskHead::PoseDetection.output_name())
+        .map(|output| output.try_extract_array::<f32>())
+        .transpose()?;
+
+    model_outputs_from_arrays(objects_output, poses_output)
+}
+
+fn model_outputs_from_arrays<'a>(
+    objects_output: Option<ArrayViewD<'a, f32>>,
+    poses_output: Option<ArrayViewD<'a, f32>>,
+) -> Result<ModelOutputs<'a>> {
+    let objects_output = objects_output.ok_or_else(|| {
+        eyre!(
+            "mandatory model output `{}` is missing",
+            TaskHead::ObjectDetection.output_name()
+        )
+    })?;
+    let objects = validate_and_reshape_output(TaskHead::ObjectDetection, objects_output)?;
+    let poses = poses_output
+        .map(|output| validate_and_reshape_output(TaskHead::PoseDetection, output))
+        .transpose()?;
+
+    Ok(ModelOutputs { objects, poses })
+}
+
+fn validate_and_reshape_output<'a>(
+    task_head: TaskHead,
+    output: ArrayViewD<'a, f32>,
+) -> Result<ArrayView2<'a, f32>> {
+    if output.shape() != task_head.expected_shape() {
         bail!(
-            "object detection output not of expected shape. Expected: {:?}, got: {:?}",
-            TaskHead::ObjectDetection.expected_shape(),
-            objects_output.shape()
+            "{} not of expected shape. Expected: {:?}, got: {:?}",
+            task_head.output_name(),
+            task_head.expected_shape(),
+            output.shape()
         )
     }
-    let reshaped_objects_output = objects_output.squeeze().into_dimensionality()?;
 
-    let poses_output = outputs[TaskHead::PoseDetection.output_name()].try_extract_array::<f32>()?;
-    if poses_output.shape() != TaskHead::PoseDetection.expected_shape() {
-        bail!(
-            "pose detection output not of expected shape. Expected: {:?}, got: {:?}",
-            TaskHead::PoseDetection.expected_shape(),
-            poses_output.shape()
-        )
-    }
-    let reshaped_pose_output = poses_output.squeeze().into_dimensionality()?;
-
-    Ok(ModelOutputs {
-        objects: reshaped_objects_output,
-        poses: reshaped_pose_output,
-    })
+    Ok(output.squeeze().into_dimensionality()?)
 }
 
 fn extract_candidate_object_detections(
@@ -284,8 +377,11 @@ fn extract_candidate_pose_detections(
     outputs: &ModelOutputs,
     confidence_threshold: f32,
 ) -> Result<Vec<Pose<YOLOObjectLabel>>> {
-    Ok(outputs
-        .poses
+    let Some(poses) = &outputs.poses else {
+        return Ok(Vec::new());
+    };
+
+    Ok(poses
         .axis_iter(Axis(0))
         .filter_map(|row| {
             let confidence = row[4usize];
@@ -345,4 +441,81 @@ fn non_maximum_suppression<T: HasBoundingBox>(
     }
 
     remaining_detections
+}
+
+#[cfg(test)]
+mod tests {
+    use ndarray::Array3;
+
+    use super::*;
+
+    #[test]
+    fn missing_pose_output_produces_no_pose_candidates() {
+        let objects = Array3::zeros(TaskHead::ObjectDetection.expected_shape());
+        let outputs = model_outputs_from_arrays(Some(objects.view().into_dyn()), None).unwrap();
+
+        let poses = extract_candidate_pose_detections(&outputs, 0.0).unwrap();
+
+        assert!(poses.is_empty());
+    }
+
+    #[test]
+    fn object_output_is_mandatory() {
+        let error = model_outputs_from_arrays(None, None).unwrap_err();
+
+        assert!(error.to_string().contains("`object_output` is missing"));
+    }
+
+    #[test]
+    fn object_output_must_have_expected_shape() {
+        let objects =
+            Array3::<f32>::zeros((1, NUMBER_OF_DETECTIONS - 1, NUMBER_OF_VALUES_PER_OBJECT));
+
+        let error = model_outputs_from_arrays(Some(objects.view().into_dyn()), None).unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("object_output not of expected shape")
+        );
+    }
+
+    #[test]
+    fn present_outputs_are_shape_validated_and_reshaped() {
+        let objects = Array3::zeros(TaskHead::ObjectDetection.expected_shape());
+        let poses = Array3::zeros(TaskHead::PoseDetection.expected_shape());
+
+        let outputs = model_outputs_from_arrays(
+            Some(objects.view().into_dyn()),
+            Some(poses.view().into_dyn()),
+        )
+        .unwrap();
+
+        assert_eq!(
+            outputs.objects.shape(),
+            [NUMBER_OF_DETECTIONS, NUMBER_OF_VALUES_PER_OBJECT]
+        );
+        assert_eq!(
+            outputs.poses.unwrap().shape(),
+            [NUMBER_OF_DETECTIONS, NUMBER_OF_VALUES_PER_POSE]
+        );
+    }
+
+    #[test]
+    fn present_pose_output_must_have_expected_shape() {
+        let objects = Array3::zeros(TaskHead::ObjectDetection.expected_shape());
+        let poses = Array3::<f32>::zeros((1, NUMBER_OF_DETECTIONS - 1, NUMBER_OF_VALUES_PER_POSE));
+
+        let error = model_outputs_from_arrays(
+            Some(objects.view().into_dyn()),
+            Some(poses.view().into_dyn()),
+        )
+        .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("pose_output not of expected shape")
+        );
+    }
 }

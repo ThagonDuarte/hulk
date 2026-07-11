@@ -1,0 +1,31 @@
+[package]
+name = "detection-replay"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+homepage.workspace = true
+
+[lib]
+name = "detection_replay"
+path = "src/lib.rs"
+
+[dependencies]
+bincode = { workspace = true }
+blake3 = { workspace = true }
+clap = { workspace = true, features = ["derive"] }
+color-eyre = { workspace = true }
+detection = { workspace = true, features = ["webgpu"] }
+eframe = { workspace = true }
+image = { workspace = true }
+libc = { workspace = true }
+mcap = { workspace = true }
+ort = { workspace = true }
+ros-z = { workspace = true }
+ros2 = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "sync", "time"] }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true, features = ["env-filter"] }
+types = { workspace = true }

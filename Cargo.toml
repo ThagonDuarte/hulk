@@ -95,6 +95,7 @@ members = [
   "crates/x5_receiver",
   "crates/zed",
   "tools/annotato",
+  "tools/detection_replay",
   "tools/depp",
   "tools/hydra-bench",
   "tools/mujoco-simulator/mujoco-rust-server",
@@ -161,7 +162,7 @@ derive_more = { version = "2.0.1", features = [
   "mul",
   "not",
 ] }
-detection = { path = "crates/nodes/detection" }
+detection = { path = "crates/nodes/detection", default-features = false }
 dirs = "6.0.0"
 eframe = { version = "0.33.3", features = ["persistence", "wgpu"] }
 egui = { version = "0.33.3", features = ["persistence"] }
