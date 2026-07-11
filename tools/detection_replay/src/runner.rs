@@ -37,6 +37,8 @@ pub struct ModelRunConfig {
     pub model_path: PathBuf,
     pub thresholds: DetectionThresholds,
     pub frame_limit: Option<usize>,
+    pub start_frame: usize,
+    pub end_frame: Option<usize>,
     pub startup_timeout: Duration,
     pub output_timeout: Duration,
 }
@@ -48,6 +50,8 @@ impl ModelRunConfig {
             model_path: model_path.into(),
             thresholds: DetectionThresholds::default(),
             frame_limit: None,
+            start_frame: 0,
+            end_frame: None,
             startup_timeout: Duration::from_secs(30),
             output_timeout: Duration::from_secs(30),
         }
@@ -75,6 +79,11 @@ where
     fs::create_dir_all(cache_directory)
         .wrap_err_with(|| format!("failed to create {}", cache_directory.display()))?;
     let (canonical_model_path, model_hash) = hash_model(&config.model_path)?;
+    let frame_end = config
+        .end_frame
+        .unwrap_or_else(|| recording.frame_count().saturating_sub(1));
+    validate_frame_range(config.start_frame, frame_end, recording.frame_count())?;
+    let frame_count = frame_end - config.start_frame + 1;
     let proposed = ModelRunManifest::new(
         config.label.clone(),
         canonical_model_path,
@@ -82,14 +91,13 @@ where
         recording.fingerprint().clone(),
         config.thresholds,
         recording.frame_count(),
+        config.start_frame..=frame_end,
     )?;
-    let mut store = PredictionStore::open(cache_directory, proposed)?;
-    validate_completed_prefix(recording, store.predictions())?;
+    let mut store =
+        PredictionStore::open(cache_directory, proposed, config.start_frame, frame_count)?;
+    validate_completed_prefix(recording, config.start_frame, store.predictions())?;
 
-    let target_frames = config
-        .frame_limit
-        .unwrap_or(recording.frame_count())
-        .min(recording.frame_count());
+    let target_frames = config.frame_limit.unwrap_or(frame_count).min(frame_count);
     progress(RunProgress {
         label: config.label.clone(),
         completed_frames: store.completed_count(),
@@ -268,10 +276,10 @@ where
         );
     }
 
-    let resume_frame = store.completed_count();
+    let resume_frame = config.start_frame + store.completed_count();
     let mut images = recording.original_images(
         resume_frame,
-        Some(target_frames.saturating_sub(resume_frame)),
+        Some(target_frames.saturating_sub(store.completed_count())),
     )?;
     while store.completed_count() < target_frames {
         let frame = tokio::select! {
@@ -402,8 +410,13 @@ fn write_detection_parameters(
     Ok(())
 }
 
-fn validate_completed_prefix(recording: &Recording, predictions: &[Prediction]) -> Result<()> {
-    for (frame_index, prediction) in predictions.iter().enumerate() {
+fn validate_completed_prefix(
+    recording: &Recording,
+    start_frame: usize,
+    predictions: &[Prediction],
+) -> Result<()> {
+    for (offset, prediction) in predictions.iter().enumerate() {
+        let frame_index = start_frame + offset;
         let frame = recording
             .frames()
             .get(frame_index)
@@ -413,6 +426,16 @@ fn validate_completed_prefix(recording: &Recording, predictions: &[Prediction]) 
         {
             bail!("cached prediction {frame_index} does not match the recording index");
         }
+    }
+    Ok(())
+}
+
+fn validate_frame_range(start: usize, end: usize, frame_count: usize) -> Result<()> {
+    if start > end {
+        bail!("start frame {start} is greater than end frame {end}");
+    }
+    if end >= frame_count {
+        bail!("end frame {end} is out of range for {frame_count} frames");
     }
     Ok(())
 }

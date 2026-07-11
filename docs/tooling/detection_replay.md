@@ -14,6 +14,8 @@ The source MCAP is opened read-only. A recording that ends in an incomplete fina
 
 By default the cache is written next to the recording as `recording.detection-replay-cache`. Use `--cache-dir` to put it elsewhere.
 
+All commands accept an inclusive frame-ID range through `--start-frame` and `--end-frame`. The index still scans the MCAP once to establish stable global frame IDs, but prerendering and viewing are restricted to the selected range.
+
 ## Prerendering
 
 Run models sequentially so their GPU timings and predictions do not interfere:
@@ -21,7 +23,8 @@ Run models sequentially so their GPU timings and predictions do not interfere:
 ```bash
 ./detection-replay prerender /path/to/recording.mcap \
   --model baseline=/path/to/baseline.onnx \
-  --model candidate=/path/to/candidate.onnx
+  --model candidate=/path/to/candidate.onnx \
+  --start-frame 5000 --end-frame 5500
 ```
 
 Each input frame is published only after the preceding result has been received. Predictions are matched by the image header timestamp and written in atomic chunks. Repeating the command resumes at the first uncached frame.
@@ -35,7 +38,7 @@ The desktop build requires successful ONNX Runtime WebGPU registration. The wrap
 ## Viewing
 
 ```bash
-./detection-replay view /path/to/recording.mcap
+./detection-replay view /path/to/recording.mcap --start-frame 5000 --end-frame 5500
 ```
 
 The viewer shows one synchronized viewport per selected model. It supports source-time playback, speed changes, looping, frame stepping, scrubbing, shared pan/zoom, confidence filtering, inference timing, and a sparse `Recorded` baseline when the MCAP contains detections.

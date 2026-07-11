@@ -21,6 +21,8 @@ enum Command {
         recording: PathBuf,
         #[arg(long)]
         cache_dir: Option<PathBuf>,
+        #[command(flatten)]
+        frames: FrameRangeArguments,
     },
     /// Run one or more models through the actual ROS-Z detection node.
     Prerender {
@@ -33,16 +35,48 @@ enum Command {
         confidence: f32,
         #[arg(long, default_value_t = 0.4)]
         iou: f32,
-        /// Stop after this many total frames. Useful for provider smoke tests.
+        /// Stop after this many frames in the selected range. Useful for provider smoke tests.
         #[arg(long)]
         limit: Option<usize>,
+        #[command(flatten)]
+        frames: FrameRangeArguments,
     },
     /// Open the synchronized multi-model viewer.
     View {
         recording: PathBuf,
         #[arg(long)]
         cache_dir: Option<PathBuf>,
+        #[command(flatten)]
+        frames: FrameRangeArguments,
     },
+}
+
+#[derive(Clone, Copy, Debug, clap::Args)]
+struct FrameRangeArguments {
+    /// First frame ID to process or display.
+    #[arg(long, default_value_t = 0)]
+    start_frame: usize,
+    /// Last frame ID to process or display, inclusive.
+    #[arg(long)]
+    end_frame: Option<usize>,
+}
+
+impl FrameRangeArguments {
+    fn resolve(self, frame_count: usize) -> Result<(usize, usize)> {
+        let end = self
+            .end_frame
+            .unwrap_or_else(|| frame_count.saturating_sub(1));
+        if self.start_frame > end {
+            color_eyre::eyre::bail!(
+                "start frame {} is greater than end frame {end}",
+                self.start_frame
+            );
+        }
+        if end >= frame_count {
+            color_eyre::eyre::bail!("end frame {end} is out of range for {frame_count} frames");
+        }
+        Ok((self.start_frame, end))
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -78,18 +112,28 @@ fn main() -> Result<()> {
         Command::Index {
             recording,
             cache_dir,
+            frames,
         } => {
             let recording_path = resolve_recording(recording);
             let cache_dir = cache_dir.unwrap_or_else(|| default_cache_dir(&recording_path));
             let recording = Recording::open(&recording_path, &cache_dir)?;
+            let (start_frame, end_frame) = frames.resolve(recording.frame_count())?;
             let recorded_predictions = recording
                 .load_runs()?
                 .into_iter()
                 .find(|run| run.key == "recorded")
-                .map(|run| run.predictions.into_iter().filter(Option::is_some).count())
+                .map(|run| {
+                    run.predictions[start_frame..=end_frame]
+                        .iter()
+                        .filter(|prediction| prediction.is_some())
+                        .count()
+                })
                 .unwrap_or_default();
             println!(
-                "indexed {} frames and {} aligned recorded prediction frames from {} into {}",
+                "indexed frames {}..={} ({} of {}) and {} aligned recorded prediction frames from {} into {}",
+                start_frame,
+                end_frame,
+                end_frame - start_frame + 1,
                 recording.frame_count(),
                 recorded_predictions,
                 recording_path.display(),
@@ -106,10 +150,12 @@ fn main() -> Result<()> {
             confidence,
             iou,
             limit,
+            frames,
         } => {
             let recording_path = resolve_recording(recording);
             let cache_dir = cache_dir.unwrap_or_else(|| default_cache_dir(&recording_path));
             let recording = Recording::open(&recording_path, &cache_dir)?;
+            let (start_frame, end_frame) = frames.resolve(recording.frame_count())?;
             let thresholds = DetectionThresholds {
                 minimum_candidate_confidence: confidence,
                 maximum_intersection_over_union: iou,
@@ -128,6 +174,8 @@ fn main() -> Result<()> {
                     let mut config = ModelRunConfig::new(model.label.clone(), model.path);
                     config.thresholds = thresholds;
                     config.frame_limit = limit;
+                    config.start_frame = start_frame;
+                    config.end_frame = Some(end_frame);
                     config.output_timeout = Duration::from_secs(120);
                     let mut last_reported = usize::MAX;
                     let manifest = runtime.block_on(run_model(
@@ -153,7 +201,7 @@ fn main() -> Result<()> {
                         manifest.label,
                         manifest.state,
                         manifest.completed_frame_count,
-                        manifest.total_frame_count
+                        end_frame - start_frame + 1
                     );
                 }
                 Ok(())
@@ -164,10 +212,13 @@ fn main() -> Result<()> {
         Command::View {
             recording,
             cache_dir,
+            frames,
         } => {
             let recording_path = resolve_recording(recording);
             let cache_dir = cache_dir.unwrap_or_else(|| default_cache_dir(&recording_path));
-            app::run(Recording::open(recording_path, cache_dir)?)?;
+            let recording = Recording::open(recording_path, cache_dir)?;
+            let (start_frame, end_frame) = frames.resolve(recording.frame_count())?;
+            app::run(recording, start_frame, end_frame)?;
         }
     }
 

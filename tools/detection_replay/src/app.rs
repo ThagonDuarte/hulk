@@ -18,7 +18,7 @@ use types::object_detection::{Object, RobocupObjectLabel};
 const MIN_ZOOM: f32 = 1.0;
 const MAX_ZOOM: f32 = 20.0;
 
-pub fn run(recording: Recording) -> Result<()> {
+pub fn run(recording: Recording, start_frame: usize, end_frame: usize) -> Result<()> {
     let runs = recording.load_runs()?;
     let recording = Arc::new(recording);
     let loader = FrameLoader::new(Arc::clone(&recording))?;
@@ -34,6 +34,8 @@ pub fn run(recording: Recording) -> Result<()> {
                 recording,
                 runs,
                 loader,
+                start_frame,
+                end_frame,
             )))
         }),
     )
@@ -58,6 +60,8 @@ struct ReplayApp {
     confidence_filter: f32,
     camera_zoom: f32,
     camera_pan: Vec2,
+    start_frame: usize,
+    end_frame: usize,
 }
 
 impl ReplayApp {
@@ -66,8 +70,10 @@ impl ReplayApp {
         recording: Arc<Recording>,
         runs: Vec<LoadedPredictionRun>,
         mut loader: FrameLoader,
+        start_frame: usize,
+        end_frame: usize,
     ) -> Self {
-        loader.request(0);
+        loader.request(start_frame);
         creation_context.egui_ctx.set_visuals(egui::Visuals::dark());
         let visible_runs = vec![true; runs.len()];
         let available_counts = runs
@@ -84,7 +90,7 @@ impl ReplayApp {
             runs,
             visible_runs,
             available_counts,
-            selected_frame: 0,
+            selected_frame: start_frame,
             displayed_frame: None,
             texture: None,
             loader,
@@ -97,11 +103,13 @@ impl ReplayApp {
             confidence_filter: 0.05,
             camera_zoom: 1.0,
             camera_pan: Vec2::ZERO,
+            start_frame,
+            end_frame,
         }
     }
 
     fn select_frame(&mut self, frame: usize) {
-        self.selected_frame = frame.min(self.recording.frame_count().saturating_sub(1));
+        self.selected_frame = frame.clamp(self.start_frame, self.end_frame);
         self.playback_accumulator = 0.0;
         self.last_playback_update = Instant::now();
         self.loader.request(self.selected_frame);
@@ -131,7 +139,7 @@ impl ReplayApp {
     }
 
     fn advance_playback(&mut self, context: &egui::Context) {
-        if !self.is_playing || self.recording.frame_count() <= 1 {
+        if !self.is_playing || self.start_frame == self.end_frame {
             self.last_playback_update = Instant::now();
             return;
         }
@@ -141,7 +149,7 @@ impl ReplayApp {
         self.last_playback_update = now;
 
         let mut next_frame = self.selected_frame;
-        while next_frame + 1 < self.recording.frame_count() {
+        while next_frame < self.end_frame {
             let current = self.recording.frames()[next_frame].timestamp_nanos;
             let next = self.recording.frames()[next_frame + 1].timestamp_nanos;
             let frame_duration = ((next - current).max(1) as f64) / 1.0e9;
@@ -151,9 +159,9 @@ impl ReplayApp {
             self.playback_accumulator -= frame_duration;
             next_frame += 1;
         }
-        if next_frame + 1 == self.recording.frame_count() {
+        if next_frame == self.end_frame {
             if self.loop_playback {
-                next_frame = 0;
+                next_frame = self.start_frame;
                 self.playback_accumulator = 0.0;
             } else {
                 self.is_playing = false;
@@ -183,7 +191,7 @@ impl ReplayApp {
         }
         if previous {
             self.is_playing = false;
-            self.select_frame(self.selected_frame.saturating_sub(1));
+            self.select_frame(self.selected_frame.saturating_sub(1).max(self.start_frame));
         }
         if next {
             self.is_playing = false;
@@ -204,7 +212,7 @@ impl ReplayApp {
                 }
                 if ui.button("Previous").clicked() {
                     self.is_playing = false;
-                    self.select_frame(self.selected_frame.saturating_sub(1));
+                    self.select_frame(self.selected_frame.saturating_sub(1).max(self.start_frame));
                 }
                 if ui.button("Next").clicked() {
                     self.is_playing = false;
@@ -224,20 +232,16 @@ impl ReplayApp {
                     });
                 ui.separator();
                 ui.label(format!(
-                    "frame {}/{}",
-                    self.selected_frame + 1,
-                    self.recording.frame_count()
+                    "frame {} ({}..={})",
+                    self.selected_frame, self.start_frame, self.end_frame
                 ));
                 ui.label(format!("{:.3}s", self.relative_time(self.selected_frame)));
             });
             let mut frame = self.selected_frame;
             if ui
                 .add(
-                    egui::Slider::new(
-                        &mut frame,
-                        0..=self.recording.frame_count().saturating_sub(1),
-                    )
-                    .show_value(false),
+                    egui::Slider::new(&mut frame, self.start_frame..=self.end_frame)
+                        .show_value(false),
                 )
                 .changed()
             {
@@ -427,7 +431,7 @@ impl ReplayApp {
     }
 
     fn relative_time(&self, frame: usize) -> f64 {
-        let first = self.recording.frames()[0].timestamp_nanos;
+        let first = self.recording.frames()[self.start_frame].timestamp_nanos;
         (self.recording.frames()[frame].timestamp_nanos - first) as f64 / 1.0e9
     }
 }

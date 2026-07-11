@@ -2,6 +2,7 @@ use std::{
     collections::BTreeMap,
     fs::{self, File},
     io::{BufReader, BufWriter, Write},
+    ops::RangeInclusive,
     path::{Path, PathBuf},
     sync::Arc,
     time::UNIX_EPOCH,
@@ -148,14 +149,20 @@ impl ModelRunManifest {
         recording_fingerprint: RecordingFingerprint,
         thresholds: DetectionThresholds,
         total_frame_count: usize,
+        frame_range: RangeInclusive<usize>,
     ) -> Result<Self> {
         let label = label.into();
         let thresholds = thresholds.validate()?;
+        let frame_start = *frame_range.start();
+        let frame_end = *frame_range.end();
         let run_key = model_run_key(
             &canonical_model_path,
             &model_hash,
             &recording_fingerprint,
             thresholds,
+            frame_start,
+            frame_end,
+            total_frame_count,
         )?;
         Ok(Self {
             run_key,
@@ -208,10 +215,17 @@ pub struct PredictionStore {
     run_directory: PathBuf,
     manifest: ModelRunManifest,
     predictions: Vec<Prediction>,
+    frame_start: usize,
+    frame_count: usize,
 }
 
 impl PredictionStore {
-    pub fn open(cache_directory: impl AsRef<Path>, proposed: ModelRunManifest) -> Result<Self> {
+    pub fn open(
+        cache_directory: impl AsRef<Path>,
+        proposed: ModelRunManifest,
+        frame_start: usize,
+        frame_count: usize,
+    ) -> Result<Self> {
         let root = cache_directory.as_ref().join(MODEL_RUNS_DIRECTORY);
         fs::create_dir_all(&root)
             .wrap_err_with(|| format!("failed to create {}", root.display()))?;
@@ -233,13 +247,18 @@ impl PredictionStore {
         };
 
         let predictions = load_contiguous_predictions(&run_directory, manifest.total_frame_count)?;
+        if predictions
+            .first()
+            .is_some_and(|prediction| prediction.frame_index != frame_start)
+            || predictions.len() > frame_count
+        {
+            bail!("prediction cache does not match the requested frame range");
+        }
         if manifest.completed_frame_count != predictions.len() {
             manifest.completed_frame_count = predictions.len();
             write_bincode_atomic(&manifest_path, &manifest)?;
         }
-        if manifest.state == ModelRunState::Complete
-            && predictions.len() != manifest.total_frame_count
-        {
+        if manifest.state == ModelRunState::Complete && predictions.len() != frame_count {
             manifest.state = ModelRunState::Incomplete;
             write_bincode_atomic(&manifest_path, &manifest)?;
         }
@@ -248,6 +267,8 @@ impl PredictionStore {
             run_directory,
             manifest,
             predictions,
+            frame_start,
+            frame_count,
         })
     }
 
@@ -271,7 +292,7 @@ impl PredictionStore {
     }
 
     pub fn append(&mut self, prediction: Prediction) -> Result<()> {
-        let expected_frame = self.predictions.len();
+        let expected_frame = self.frame_start + self.predictions.len();
         if prediction.frame_index != expected_frame {
             bail!(
                 "prediction frame {} is not contiguous; expected {}",
@@ -279,7 +300,7 @@ impl PredictionStore {
                 expected_frame
             );
         }
-        if expected_frame >= self.manifest.total_frame_count {
+        if self.predictions.len() >= self.frame_count {
             bail!("prediction exceeds the manifest frame count");
         }
 
@@ -294,7 +315,7 @@ impl PredictionStore {
 
     pub fn finish(&mut self) -> Result<()> {
         self.persist_pending()?;
-        self.manifest.state = if self.predictions.len() == self.manifest.total_frame_count {
+        self.manifest.state = if self.predictions.len() == self.frame_count {
             ModelRunState::Complete
         } else {
             ModelRunState::Incomplete
@@ -321,7 +342,7 @@ impl PredictionStore {
         let chunk_index = (self.predictions.len() - 1) / PREDICTION_CHUNK_SIZE;
         let chunk_start = chunk_index * PREDICTION_CHUNK_SIZE;
         let chunk = PredictionChunkRef {
-            start_frame: chunk_start,
+            start_frame: self.frame_start + chunk_start,
             predictions: &self.predictions[chunk_start..],
         };
         write_bincode_atomic(&chunk_path(&self.run_directory, chunk_index), &chunk)?;
@@ -434,9 +455,6 @@ fn load_model_run(
     }
     let predictions = load_contiguous_predictions(directory, total_frame_count)?;
     manifest.completed_frame_count = predictions.len();
-    if manifest.state == ModelRunState::Complete && predictions.len() != total_frame_count {
-        manifest.state = ModelRunState::Incomplete;
-    }
     let mut sparse = vec![None; total_frame_count];
     for prediction in predictions {
         let frame_index = prediction.frame_index;
@@ -505,14 +523,29 @@ fn model_run_key(
     model_hash: &[u8; 32],
     recording_fingerprint: &RecordingFingerprint,
     thresholds: DetectionThresholds,
+    frame_start: usize,
+    frame_end: usize,
+    total_frame_count: usize,
 ) -> Result<String> {
-    let identity = bincode::serialize(&(
-        canonical_model_path,
-        model_hash,
-        recording_fingerprint,
-        thresholds,
-        CACHE_VERSION,
-    ))
+    let identity = if frame_start == 0 && frame_end + 1 == total_frame_count {
+        bincode::serialize(&(
+            canonical_model_path,
+            model_hash,
+            recording_fingerprint,
+            thresholds,
+            CACHE_VERSION,
+        ))
+    } else {
+        bincode::serialize(&(
+            canonical_model_path,
+            model_hash,
+            recording_fingerprint,
+            thresholds,
+            CACHE_VERSION,
+            frame_start,
+            frame_end,
+        ))
+    }
     .wrap_err("failed to serialize model run identity")?;
     let digest = blake3::hash(&identity).to_hex().to_string();
     Ok(format!("model-{}", &digest[..16]))
@@ -578,6 +611,7 @@ fn load_contiguous_predictions(directory: &Path, total_frames: usize) -> Result<
     }
 
     let mut predictions = Vec::new();
+    let mut expected_frame = None;
     let chunk_count = chunk_paths.len();
     for (position, (chunk_index, path)) in chunk_paths.into_iter().enumerate() {
         if chunk_index != position {
@@ -587,8 +621,8 @@ fn load_contiguous_predictions(directory: &Path, total_frames: usize) -> Result<
             );
         }
         let chunk: PredictionChunk = read_bincode(&path)?;
-        let expected_start = chunk_index * PREDICTION_CHUNK_SIZE;
-        if chunk.start_frame != expected_start || chunk.start_frame != predictions.len() {
+        let expected_start = expected_frame.unwrap_or(chunk.start_frame);
+        if chunk.start_frame != expected_start {
             bail!(
                 "prediction chunk {} has an invalid start frame",
                 path.display()
@@ -603,12 +637,14 @@ fn load_contiguous_predictions(directory: &Path, total_frames: usize) -> Result<
                 path.display()
             );
         }
-        for prediction in chunk.predictions {
-            if prediction.frame_index != predictions.len() {
+        let chunk_length = chunk.predictions.len();
+        for (offset, prediction) in chunk.predictions.into_iter().enumerate() {
+            if prediction.frame_index != expected_start + offset {
                 bail!("prediction chunk {} contains a frame gap", path.display());
             }
             predictions.push(prediction);
         }
+        expected_frame = Some(chunk.start_frame + chunk_length);
     }
     if predictions.len() > total_frames {
         bail!("prediction cache contains more frames than the recording");
@@ -653,6 +689,7 @@ mod tests {
             fingerprint(),
             DetectionThresholds::default(),
             total,
+            0..=total - 1,
         )
         .unwrap()
     }
@@ -660,18 +697,18 @@ mod tests {
     #[test]
     fn chunks_resume_and_distinguish_empty_from_absent() {
         let cache = tempfile::tempdir().unwrap();
-        let mut store = PredictionStore::open(cache.path(), manifest(130)).unwrap();
+        let mut store = PredictionStore::open(cache.path(), manifest(130), 0, 130).unwrap();
         for frame_index in 0..129 {
             store.append(prediction(frame_index)).unwrap();
         }
         drop(store);
 
-        let mut resumed = PredictionStore::open(cache.path(), manifest(130)).unwrap();
+        let mut resumed = PredictionStore::open(cache.path(), manifest(130), 0, 130).unwrap();
         assert_eq!(resumed.completed_count(), 128);
         resumed.append(prediction(128)).unwrap();
         resumed.finish().unwrap();
         drop(resumed);
-        let resumed = PredictionStore::open(cache.path(), manifest(130)).unwrap();
+        let resumed = PredictionStore::open(cache.path(), manifest(130), 0, 130).unwrap();
         assert_eq!(resumed.completed_count(), 129);
         let run_directory = cache
             .path()
@@ -695,5 +732,40 @@ mod tests {
         let key = manifest(1).run_key;
         assert!(!key.contains('/'));
         assert!(!key.contains(".."));
+    }
+
+    #[test]
+    fn nonzero_frame_range_is_stored_in_global_slots() {
+        let cache = tempfile::tempdir().unwrap();
+        let proposed = ModelRunManifest::new(
+            "range",
+            PathBuf::from("/tmp/model.onnx"),
+            [7; 32],
+            fingerprint(),
+            DetectionThresholds::default(),
+            100,
+            40..=42,
+        )
+        .unwrap();
+        let mut store = PredictionStore::open(cache.path(), proposed, 40, 3).unwrap();
+        for frame_index in 40..=42 {
+            store.append(prediction(frame_index)).unwrap();
+        }
+        store.finish().unwrap();
+        drop(store);
+
+        let loaded = load_all_runs(cache.path(), &fingerprint(), 100).unwrap();
+        let model = loaded
+            .iter()
+            .find(|run| run.source == PredictionSource::Model)
+            .unwrap();
+        assert!(model.predictions[39].is_none());
+        assert!(model.predictions[40].is_some());
+        assert!(model.predictions[42].is_some());
+        assert!(model.predictions[43].is_none());
+        assert_eq!(
+            model.manifest.as_ref().unwrap().state,
+            ModelRunState::Complete
+        );
     }
 }
