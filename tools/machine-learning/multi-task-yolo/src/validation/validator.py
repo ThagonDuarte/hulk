@@ -14,9 +14,12 @@ from model.hydra import (
     get_backbone,
     set_backbone,
 )
+from ultralytics_dfine import DFINE
+from ultralytics_dfine.data import load_dataset_yaml
 from utils.model_naming import (
     HYDRA_MODEL_NAME_TYPE,
     HydraModelName,
+    ModelFamily,
     ModelName,
     TaskType,
 )
@@ -69,8 +72,9 @@ class ValidationConfig:
 
 def save_validation_results(
     save_dir: Path,
-    metrics: dict[str, float],
+    metrics: dict[str, Any],
     config: ValidationConfig,
+    metadata: dict[str, Any] | None = None,
 ) -> None:
     """
     Save validation results to JSON files in the specified directory.
@@ -93,6 +97,19 @@ def save_validation_results(
     with open(config_path, "w") as f:
         json.dump(config.to_dict(), f, indent=2, default=str)
     logger.info("Saved config to %s", config_path)
+
+    metadata_path = save_dir / "metadata.json"
+    with open(metadata_path, "w") as f:
+        json.dump(metadata or {"task": "detect"}, f, indent=2, default=str)
+    logger.info("Saved metadata to %s", metadata_path)
+
+
+def metadata_task(task_type: TaskType) -> str:
+    return {
+        TaskType.OBJECT: "detect",
+        TaskType.POSE: "pose",
+        TaskType.SEGMENTATION: "segment",
+    }[task_type]
 
 
 def dataset_name_for_task(
@@ -146,13 +163,41 @@ def validate_original_model(
     model_val_folder = Path("val") / str(model_name)
     validation_run_folder = Path(config.project) / model_val_folder
 
+    if model_name.family() == ModelFamily.DFINE:
+        definition = load_dataset_yaml(config.data)
+        model = DFINE(model_name.name, names=definition.names)
+        metrics = model.val(
+            data=config.data,
+            split=config.split,
+            device=str(config.device),
+            batch=config.batch,
+            workers=config.workers,
+            render_dir=validation_run_folder / "renders",
+        )
+        model.save(validation_run_folder / f"{model_name}.pt")
+        save_validation_results(
+            validation_run_folder,
+            metrics,
+            config,
+            {"task": "detect", "architecture": "dfine"},
+        )
+        return
+
     yolo_model_wrapper = YOLO(assets_dir / model_name.name)
     yolo_model_wrapper.eval()
 
     metrics = yolo_model_wrapper.val(**config.to_dict(name=model_val_folder))
     metrics = cast(DetMetrics, metrics)
 
-    save_validation_results(validation_run_folder, metrics.results_dict, config)
+    save_validation_results(
+        validation_run_folder,
+        metrics.results_dict,
+        config,
+        {
+            "task": metadata_task(model_name.task_type()),
+            "architecture": "yolo",
+        },
+    )
 
 
 def validate_hydra_model(
@@ -160,6 +205,30 @@ def validate_hydra_model(
 ) -> None:
     model_val_folder = Path("val") / str(hydra_model)
     validation_run_folder = Path(config.project) / model_val_folder
+
+    if hydra_model.family() == ModelFamily.DFINE:
+        definition = load_dataset_yaml(config.data)
+        model = DFINE(str(hydra_model.backbone), names=definition.names)
+        metrics = model.val(
+            data=config.data,
+            split=config.split,
+            device=str(config.device),
+            batch=config.batch,
+            workers=config.workers,
+            render_dir=validation_run_folder / "renders",
+        )
+        model.save(validation_run_folder / f"{hydra_model}.pt")
+        save_validation_results(
+            validation_run_folder,
+            metrics,
+            config,
+            {
+                "task": "detect",
+                "architecture": "dfine",
+                "hydra_model_name": str(hydra_model),
+            },
+        )
+        return
 
     backbone_model = cast(
         DetectionModel, YOLO(assets_dir / hydra_model.backbone.name).model
@@ -185,7 +254,16 @@ def validate_hydra_model(
     )
     metrics = cast(DetMetrics, metrics)
 
-    save_validation_results(validation_run_folder, metrics.results_dict, config)
+    save_validation_results(
+        validation_run_folder,
+        metrics.results_dict,
+        config,
+        {
+            "task": metadata_task(hydra_model.heads[0].task_type()),
+            "architecture": "yolo",
+            "hydra_model_name": str(hydra_model),
+        },
+    )
 
 
 @click.command()

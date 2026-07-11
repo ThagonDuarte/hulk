@@ -1,7 +1,7 @@
 # multi-task-yolo
 
-Utilities for building, validating, and exporting a Hydra-style multi-task
-YOLO model that shares one backbone across detection and pose heads.
+Utilities for building, validating, and exporting Hydra-style YOLO and D-FINE
+models. A Hydra model shares one family-compatible backbone across task heads.
 
 ## Requirements
 
@@ -22,6 +22,8 @@ This project uses `uv run ...` for all commands.
 
 - `src/model/hydra.py`: Hydra model assembly (shared backbone + per-task heads).
 - `src/model/train.py`: Click CLI for single-task YOLO tuning/training.
+- `src/model/train_dfine.py`: distributed D-FINE-S training CLI.
+- `src/ultralytics_dfine/`: external D-FINE model-family plugin.
 - `src/validation/validator.py`: validation pipeline for original models and Hydra heads.
 - `src/validation/compare_results.py`: compare two saved validation runs.
 - `src/validation/predictor.py`: local smoke predictor/visualizer for detection + pose.
@@ -42,6 +44,9 @@ uv run ruff format src
 # Training CLI help
 uv run python src/model/train.py --help
 
+# D-FINE training CLI help
+uv run -m model.train_dfine --help
+
 # Validation CLI help
 uv run -m validation.validator --help
 
@@ -56,6 +61,82 @@ uv run -m utils.export_hydra --help
 
 # Model complexity help
 uv run -m utils.model_complexity --help
+```
+
+## Hydra model names
+
+Hydra names use `BACKBONE=fN+HEAD[+HEAD...]`.
+
+- YOLO example: `yolo26m=f11+yolo26m+yolo26m-pose`
+- D-FINE example: `dfine-s=f1+dfine-s`
+- Fine-tuned D-FINE example:
+  `dfine-s=f1+dfine-s~hslvision-132e`
+
+Family compatibility is validated while parsing. YOLO backbones accept only
+YOLO heads. D-FINE backbones currently accept exactly one D-FINE detection
+head and use `f1` as the semantic HGNetv2 split. D-FINE pose/segmentation heads
+and cross-family head transplantation are intentionally unsupported.
+
+## D-FINE plugin
+
+The plugin uses the pinned converted official D-FINE-S HGNetv2-B0 checkpoint
+and replaces the Transformers training loss assembly with the official D-FINE
+criterion contract. It includes GO-LSD union matching, FDR/FGL, DDF,
+preliminary, encoder, decoder-auxiliary, and contrastive-denoising losses.
+Inference uses NMS-free flattened query/class top-k selection.
+
+The normal plugin output is `[B, 300, 6]` normalized
+`[cx, cy, width, height, score, class]`. Hydra deployment converts this to the
+existing `object_output` `[B, 300, 6]` pixel
+`[x_min, y_min, x_max, y_max, score, class]` contract.
+
+```python
+from ultralytics_dfine import DFINE
+
+model = DFINE("dfine-s")
+model.train(
+    data="assets/datasets/hslvision_yolo/data.yaml",
+    output_dir="runs/train/dfine-s=f1+dfine-s~experiment",
+)
+metrics = model.val(data="assets/datasets/hslvision_yolo/data.yaml")
+model.predict("images", output_dir="runs/predict/dfine-s")
+model.export("runs/export/dfine-s.onnx")
+```
+
+Official 132-epoch distributed training:
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1 torchrun --standalone --nproc_per_node=2 \
+  -m model.train_dfine \
+  --model dfine-s \
+  --data assets/datasets/hslvision_yolo/data.yaml \
+  --output-dir runs/train/dfine-s=f1+dfine-s~hslvision-132e \
+  --epochs 132 \
+  --transition-epoch 120 \
+  --batch 32 \
+  --no-amp
+```
+
+`--no-amp` is the safe setting on hardware where FP16 Hungarian/FGL training
+produces non-finite gradients. Finite output, loss, and gradient checks abort
+rather than silently skipping corrupt steps. Training writes resumable current
+and EMA checkpoints, pure state dicts, manifests, complete loss JSONL, rendered
+validation predictions, and W&B media every epoch.
+
+Validate and export through the Hydra schema:
+
+```bash
+uv run -m validation.validator \
+  --hydra_model_name dfine-s=f1+dfine-s \
+  --object_dataset_name hslvision_yolo/data.yaml \
+  --device cuda
+
+uv run -m utils.export_hydra \
+  dfine-s=f1+dfine-s~hslvision-132e \
+  runs/export/hydra \
+  --runs_dir runs \
+  --imgsz 640 \
+  --opset 17
 ```
 
 ## Single-task training (`src/model/train.py`)
