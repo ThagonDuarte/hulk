@@ -1,14 +1,15 @@
 import logging
 from collections.abc import Mapping, Sequence
+from pathlib import Path
 from typing import Any, cast
-from zipfile import Path
 
 import torch
 import torch.nn as nn
 from ultralytics.models.yolo.model import YOLO
 from ultralytics.nn.tasks import DetectionModel
 
-from utils.model_naming import TaskType
+from ultralytics_dfine.nn import DFINEDetectionModel
+from utils.model_naming import ModelFamily, TaskType
 
 logger = logging.getLogger(__name__)
 
@@ -81,8 +82,18 @@ class Hydra(nn.Module):
         backbone_path: str,
         task_dict: dict[TaskType, Path],
         number_of_frozen_modules: int | None = None,
+        family: ModelFamily = ModelFamily.YOLO,
     ) -> None:
         super().__init__()
+
+        self.family = family
+        if family == ModelFamily.DFINE:
+            self._initialize_dfine(
+                backbone_path,
+                task_dict,
+                number_of_frozen_modules,
+            )
+            return
 
         logger.info("Loading backbone from: %s", backbone_path)
         backbone_yolo = YOLO(backbone_path)
@@ -149,7 +160,60 @@ class Hydra(nn.Module):
             else:
                 self.head_kpt_shapes[task_type] = None
 
+    def _initialize_dfine(
+        self,
+        backbone_path: str,
+        task_dict: dict[TaskType, Path],
+        number_of_frozen_modules: int | None,
+    ) -> None:
+        if number_of_frozen_modules != 1:
+            raise ValueError(  # noqa: TRY003
+                "D-FINE Hydra models require the f1 split"
+            )
+        if set(task_dict) != {TaskType.OBJECT}:
+            raise ValueError(  # noqa: TRY003
+                "D-FINE Hydra supports one object-detection head"
+            )
+        head_path = task_dict[TaskType.OBJECT]
+        detector = DFINEDetectionModel.from_checkpoint(head_path)
+        source_path = Path(backbone_path)
+        if source_path.is_file():
+            backbone_model = DFINEDetectionModel.from_checkpoint(source_path)
+            detector.replace_backbone(backbone_model.backbone)
+        elif backbone_path == "dfine-s":
+            # The only current D-FINE head is a complete trained model. Its
+            # backbone is the shared Hydra backbone until multiple heads exist.
+            pass
+        else:
+            raise ValueError(  # noqa: TRY003
+                f"Unsupported D-FINE backbone: {backbone_path}"
+            )
+        self.dfine_detector = detector
+        self.backbone_length = 1
+        self.backbone_name = source_path.stem
+        self.head_class_names = {str(TaskType.OBJECT): detector.names}
+        self.head_model_names = {str(TaskType.OBJECT): head_path.stem}
+        self.head_strides = {str(TaskType.OBJECT): detector.stride}
+        self.head_end2end = {str(TaskType.OBJECT): True}
+        self.head_kpt_shapes = {str(TaskType.OBJECT): None}
+
     def forward(self, x: torch.Tensor) -> dict[str, Any]:
+        if self.family == ModelFamily.DFINE:
+            raw = self.dfine_detector.forward_raw(x)
+            normalized = self.dfine_detector.postprocessor(raw)
+            sizes = torch.tensor(
+                [[x.shape[-2], x.shape[-1]]],
+                device=x.device,
+            ).expand(x.shape[0], -1)
+            return {
+                TaskType.OBJECT.output_names()[0]: (
+                    self.dfine_detector.postprocessor.to_pixel_xyxy(
+                        normalized,
+                        sizes,
+                    )
+                )
+            }
+
         y_backbone: list[torch.Tensor | None] = []
         backbone_activations: Any = x
 

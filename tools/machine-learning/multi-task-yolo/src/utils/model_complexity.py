@@ -223,6 +223,7 @@ def profile_hydra_model(
             number_of_frozen_modules=(
                 hydra_model_name.number_of_frozen_modules
             ),
+            family=hydra_model_name.family(),
         ).to(device)
         hydra_model.eval()
         set_export_mode(hydra_model)

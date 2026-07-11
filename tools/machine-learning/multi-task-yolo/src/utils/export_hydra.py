@@ -8,7 +8,12 @@ import torch
 from torch import ByteTensor, Tensor, nn
 
 from model.hydra import Hydra
-from utils.model_naming import HYDRA_MODEL_NAME_TYPE, HydraModelName, TaskType
+from utils.model_naming import (
+    HYDRA_MODEL_NAME_TYPE,
+    HydraModelName,
+    ModelFamily,
+    TaskType,
+)
 from utils.nv12_to_rgb import NV12ToRgb
 
 
@@ -69,6 +74,19 @@ def build_task_dict(
     train_folder_path: Path,
     val_folder_path: Path,
 ) -> dict[TaskType, Path]:
+    if hydra_model_name.family() == ModelFamily.DFINE:
+        return {
+            head.task_type(): (
+                train_folder_path
+                / hydra_model_name.integrated_model_name(head)
+                / "best.pt"
+                if head.is_finetuned_model()
+                else val_folder_path
+                / hydra_model_name.integrated_model_name(head)
+                / (hydra_model_name.integrated_model_name(head) + ".pt")
+            )
+            for head in hydra_model_name.heads
+        }
     return {
         head.task_type(): (
             train_folder_path
@@ -91,6 +109,7 @@ def export_onnx(
     opset: int,
     *,
     with_nv12: bool,
+    static_shapes: bool = False,
 ) -> None:
     input_name = "images"
     dynamic_axes: dict[str, dict[int, str]]
@@ -116,7 +135,7 @@ def export_onnx(
         export_path,
         input_names=[input_name],
         output_names=output_names,
-        dynamic_axes=dynamic_axes,
+        dynamic_axes=None if static_shapes else dynamic_axes,
         opset_version=opset,
         external_data=False,
         dynamo=False,
@@ -244,6 +263,7 @@ def main(
             number_of_frozen_modules=(
                 hydra_model_name.number_of_frozen_modules
             ),
+            family=hydra_model_name.family(),
         ).to(device)
         hydra_model.eval()
         set_export_mode(hydra_model)
@@ -279,17 +299,18 @@ def main(
                 task_dict=task_dict.keys(),
                 opset=opset,
                 with_nv12=with_nv12_layer,
+                static_shapes=(hydra_model_name.family() == ModelFamily.DFINE),
             )
             click.echo(
                 "Exported Hydra ONNX model to: "
                 f"{os.path.abspath(export_folder)}"
             )
-            return
+            continue
 
         export_torchscript(
             wrapper=wrapper,
             dummy_input=dummy_input,
-            export_path=export_folder / (str(hydra_model_name) + ".onnx"),
+            export_path=export_folder / (str(hydra_model_name) + ".pt"),
         )
         click.echo(
             "Exported Hydra TorchScript model to: "

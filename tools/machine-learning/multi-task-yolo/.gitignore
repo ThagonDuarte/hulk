@@ -8,3 +8,4 @@
 assets/output/
 assets/datasets
 runs
+wandb/

@@ -9,9 +9,11 @@ import yaml
 from ultralytics.models.yolo.model import YOLO
 from wonderwords import RandomWord
 
+from ultralytics_dfine import DFINE
 from utils.model_naming import (
     HYDRA_MODEL_NAME_TYPE,
     HydraModelName,
+    ModelFamily,
     TaskType,
 )
 from validation.validator import DatasetNotFoundError
@@ -176,7 +178,7 @@ def do_hyperparameter_tuning(config: TrainingConfig, model_path: Path) -> Path:
     show_default=True,
     help="Load best_hyperparameters.yaml and pass to train().",
 )
-def main(
+def main(  # noqa: C901
     *,
     hydra_model_name: list[HydraModelName],
     object_dataset_name: Path,
@@ -200,7 +202,7 @@ def main(
         for head in hydra_model_name.heads
     ]
 
-    repo_root = os.path.abspath(".")
+    repo_root = Path(os.path.abspath("."))
     runs_dir = repo_root / runs_dir
     val_path = runs_dir / val_dir
 
@@ -218,6 +220,44 @@ def main(
         if dataset_name is None:
             raise DatasetNotFoundError(hydra_model.heads[0].task_type())
         data = assets_dir / "datasets" / dataset_name
+
+        if hydra_model.family() == ModelFamily.DFINE:
+            if do_tuning:
+                raise click.UsageError(  # noqa: TRY003
+                    "D-FINE uses a dedicated tuning space, which is not yet "
+                    "available through this YOLO tuning flag"
+                )
+            run_name = (
+                str(hydra_model)
+                + "~"
+                + RandomWord().word(
+                    word_min_length=4,
+                    word_max_length=8,
+                    include_categories=["nouns"],
+                )
+            )
+            source: str | Path = (
+                model_path
+                if model_path.is_file()
+                else str(hydra_model.backbone)
+            )
+            dfine = DFINE(source)
+            dfine_device = "cuda" if device == "-1" else device
+            if "," in dfine_device:
+                raise click.UsageError(  # noqa: TRY003
+                    "Launch multi-GPU D-FINE training with torchrun and "
+                    "model.train_dfine"
+                )
+            dfine.train(
+                data=data,
+                output_dir=runs_dir / "train" / run_name,
+                epochs=epochs,
+                batch=32,
+                device=dfine_device,
+                wandb_project="multi-task-yolo-dfine",
+                name=run_name,
+            )
+            continue
 
         best_params = {}
         tuned_hyperparameters_path = None
