@@ -28,13 +28,17 @@ use types::{
 pub const NUMBER_OF_DETECTIONS: usize = 300;
 
 #[derive(Clone, Copy, Debug, Default)]
+/// Selects the ordered ONNX Runtime providers registered for a detection session.
 pub enum ExecutionProviderPolicy {
+    /// Try TensorRT, CUDA, WebGPU, then ORT's implicit CPU fallback when compiled in.
     #[default]
     Automatic,
+    /// Require WebGPU registration while still permitting per-operator CPU fallback.
     WebGpuRequired,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// Capabilities reported after the ONNX session has been created.
 pub struct DetectionModelInfo {
     pub has_pose_output: bool,
 }
@@ -79,6 +83,7 @@ pub fn run_boxed(ctx: Arc<Context>) -> Pin<Box<dyn Future<Output = Result<()>> +
     run_boxed_with_provider_policy(ctx, ExecutionProviderPolicy::Automatic)
 }
 
+/// Runs detection with an explicit provider-registration policy.
 pub fn run_boxed_with_provider_policy(
     ctx: Arc<Context>,
     provider_policy: ExecutionProviderPolicy,
@@ -86,6 +91,9 @@ pub fn run_boxed_with_provider_policy(
     Box::pin(run(ctx, provider_policy, None))
 }
 
+/// Runs detection and reports model capabilities once session creation succeeds.
+///
+/// The one-shot notification does not indicate that ROS-Z publishers and subscribers are ready.
 pub fn run_boxed_with_model_info(
     ctx: Arc<Context>,
     provider_policy: ExecutionProviderPolicy,
@@ -335,11 +343,19 @@ fn check_image(image: &Image) -> Result<()> {
 fn extract_outputs<'a>(outputs: &'a SessionOutputs<'a>) -> Result<ModelOutputs<'a>> {
     let objects_output = outputs
         .get(TaskHead::ObjectDetection.output_name())
-        .map(|output| output.try_extract_array::<f32>())
+        .map(|output| {
+            output.try_extract_array::<f32>().map_err(|error| {
+                eyre!(error).wrap_err("failed to extract model output `object_output`")
+            })
+        })
         .transpose()?;
     let poses_output = outputs
         .get(TaskHead::PoseDetection.output_name())
-        .map(|output| output.try_extract_array::<f32>())
+        .map(|output| {
+            output.try_extract_array::<f32>().map_err(|error| {
+                eyre!(error).wrap_err("failed to extract model output `pose_output`")
+            })
+        })
         .transpose()?;
 
     model_outputs_from_arrays(objects_output, poses_output)

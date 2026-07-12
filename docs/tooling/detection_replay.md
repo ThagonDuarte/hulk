@@ -1,6 +1,6 @@
 # Detection Replay
 
-`detection-replay` prerenders object detections from ROS-Z MCAP recordings and compares models on a synchronized image feed. Inference uses the production `detection::run_boxed` node; viewing only reads cached predictions.
+`detection-replay` prerenders object detections from ROS-Z MCAP recordings and compares models on a synchronized image feed. Inference uses the production detection implementation through `run_boxed_with_model_info` with WebGPU required; viewing only reads cached predictions.
 
 ## Recording index
 
@@ -33,7 +33,9 @@ Use `--limit 10` for a short provider/model compatibility check. The default con
 
 Models must accept `raw_bytes_input` as a rank-three `uint8` tensor with shape `[height / 2, width / 2, 6]`. Its contiguous bytes are the full-resolution NV12 Y plane followed by the half-height interleaved UV plane; image width and height must be multiples of 32.
 
-`object_output` is mandatory and must be a `float32` tensor with shape `[1, 300, 6]`. Each row is `[x_min, y_min, x_max, y_max, confidence, class_index]`. `pose_output` is optional and, when present, must be `float32 [1, 300, 57]`: the same six object values followed by 17 `(x, y, confidence)` triples. Object-only models still publish an empty timestamp-matched pose result on ROS-Z; replay stores model capability separately so it can distinguish unavailable poses from a valid empty pose result.
+`object_output` is mandatory and must be a `float32` tensor with shape `[1, 300, 6]`. Each row is `[x_min, y_min, x_max, y_max, confidence, class_index]`; coordinates are full input-image pixel coordinates. Class indices must be integral values from 0 through 6: Ball, GoalPost, LSpot, PenaltySpot, Robot, TSpot, and XSpot.
+
+`pose_output` is optional and, when present, must be `float32 [1, 300, 57]`: the same six object values followed by 17 `(x, y, confidence)` triples in this order: left eye, right eye, nose, left ear, right ear, left shoulder, right shoulder, left elbow, right elbow, left hand, right hand, left hip, right hip, left knee, right knee, left foot, right foot. Coordinates use the same full-image pixel space. Object-only models still publish an empty timestamp-matched pose result on ROS-Z; replay stores model capability separately so it can distinguish unavailable poses from a valid empty pose result.
 
 The desktop replay build bundles the x86-64 ONNX Runtime 1.22 WebGPU distribution and Dawn. The wrapper prevents a CPU-only system runtime discovered through `pkg-config` from overriding it. Operators unsupported by WebGPU may still use ORT's CPU fallback. Robot builds dynamically load the runtime image and retain the provider order TensorRT, CUDA, WebGPU, then implicit CPU; WebGPU registration succeeds there only when that runtime image provides it.
 
@@ -60,3 +62,16 @@ Useful controls:
 - Double-click: reset pan and zoom
 
 An unavailable prediction is shown separately from a valid empty detection result.
+
+## Validation
+
+Use a short range before prerendering an entire recording:
+
+```bash
+./detection-replay index /path/to/recording.mcap --start-frame 100 --end-frame 109
+./detection-replay prerender /path/to/recording.mcap \
+  --model test=etc/neural_networks/model.onnx \
+  --start-frame 100 --end-frame 109 --limit 10
+```
+
+The prerender must report 10 of 10 frames without a provider or shape error. Repeating it should immediately report the cached 10 frames. Open the same range with `view`; the timeline should show ten source frames, the run should be `complete`, empty detections should differ from unavailable predictions, and any damaged MCAP tail should appear as a warning.
