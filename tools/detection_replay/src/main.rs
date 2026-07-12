@@ -123,12 +123,7 @@ fn main() -> Result<()> {
                 .load_runs()?
                 .into_iter()
                 .find(|run| run.key == "recorded")
-                .map(|run| {
-                    run.predictions[start_frame..=end_frame]
-                        .iter()
-                        .filter(|prediction| prediction.is_some())
-                        .count()
-                })
+                .map(|run| run.available_count(start_frame..=end_frame))
                 .unwrap_or_default();
             println!(
                 "indexed frames {}..={} ({} of {}) and {} aligned recorded prediction frames from {} into {}",
@@ -179,24 +174,17 @@ fn main() -> Result<()> {
                     config.end_frame = Some(end_frame);
                     config.output_timeout = Duration::from_secs(120);
                     let mut last_reported = usize::MAX;
-                    let manifest = runtime.block_on(run_model(
-                        &recording,
-                        &cache_dir,
-                        config,
-                        |progress| {
-                            if progress.completed_frames == progress.target_frames
-                                || progress.completed_frames / 100 != last_reported / 100
-                            {
-                                println!(
-                                    "{}: {}/{} frames",
-                                    progress.label,
-                                    progress.completed_frames,
-                                    progress.target_frames
-                                );
-                                last_reported = progress.completed_frames;
-                            }
-                        },
-                    ))?;
+                    let manifest = runtime.block_on(run_model(&recording, config, |progress| {
+                        if progress.completed_frames == progress.target_frames
+                            || progress.completed_frames / 100 != last_reported / 100
+                        {
+                            println!(
+                                "{}: {}/{} frames",
+                                progress.label, progress.completed_frames, progress.target_frames
+                            );
+                            last_reported = progress.completed_frames;
+                        }
+                    }))?;
                     println!(
                         "{}: {:?} ({}/{} frames)",
                         manifest.label,

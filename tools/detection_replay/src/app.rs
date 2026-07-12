@@ -7,7 +7,8 @@ use std::{
 
 use color_eyre::{Result, eyre::eyre};
 use detection_replay::{
-    LoadedPredictionRun, ModelRunState, Prediction, PredictionSource, Recording, RunUiMetadata,
+    BookmarkCollection, LoadedPredictionRun, ModelRunState, Prediction, PredictionSource,
+    Recording, RunUiMetadata,
 };
 use eframe::{
     App, Frame, NativeOptions, Renderer,
@@ -16,13 +17,13 @@ use eframe::{
         Sense, Stroke, StrokeKind, TextureHandle, TextureOptions, Ui, Vec2, WidgetText, pos2, vec2,
     },
 };
-use egui_dock::{DockArea, DockState, Node, Split, TabViewer, tab_viewer::OnCloseResponse};
+use egui_dock::{DockArea, DockState, Node, Split, TabViewer};
 use types::{
     object_detection::{Object, RobocupObjectLabel, YOLOObjectLabel},
     pose_detection::{Keypoint, Pose},
 };
 
-use crate::timeline::{BookmarkCollection, TimelineState};
+use crate::timeline::TimelineState;
 
 const MIN_ZOOM: f32 = 1.0;
 const MAX_ZOOM: f32 = 20.0;
@@ -48,7 +49,25 @@ const POSE_SKELETON_KEYPOINT_LINE_MAPPING: [(usize, usize); 16] = [
 
 pub fn run(recording: Recording, start_frame: usize, end_frame: usize) -> Result<()> {
     let mut runs = recording.load_runs()?;
-    let run_metadata = recording.load_run_ui_metadata()?;
+    let bookmarks_file_exists = recording.bookmarks_exist()?;
+    let legacy_bookmark_storage_key = format!(
+        "detection-replay-bookmarks-{}",
+        recording.fingerprint().cache_key()?
+    );
+    let (run_metadata, metadata_error) = match recording.load_run_ui_metadata() {
+        Ok(metadata) => (metadata, None),
+        Err(error) => (
+            BTreeMap::new(),
+            Some(format!("failed to load run GUI metadata: {error:#}")),
+        ),
+    };
+    let (bookmarks, bookmark_error) = match recording.load_bookmarks() {
+        Ok(bookmarks) => (bookmarks, None),
+        Err(error) => (
+            BookmarkCollection::default(),
+            Some(format!("failed to load bookmarks: {error:#}")),
+        ),
+    };
     for run in &mut runs {
         if let Some(label) = run_metadata
             .get(&run.key)
@@ -58,7 +77,10 @@ pub fn run(recording: Recording, start_frame: usize, end_frame: usize) -> Result
         }
     }
     let recording = Arc::new(recording);
-    let loader = FrameLoader::new(Arc::clone(&recording))?;
+    let startup_errors = [metadata_error.clone(), bookmark_error]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
     eframe::run_native(
         "Detection Replay",
         NativeOptions {
@@ -66,6 +88,34 @@ pub fn run(recording: Recording, start_frame: usize, end_frame: usize) -> Result
             ..Default::default()
         },
         Box::new(move |creation_context| {
+            let mut bookmarks = bookmarks;
+            let mut startup_errors = startup_errors;
+            let mut legacy_bookmarks_to_clear = None;
+            if !bookmarks_file_exists
+                && let Some(serialized) = creation_context
+                    .storage
+                    .and_then(|storage| storage.get_string(&legacy_bookmark_storage_key))
+            {
+                match serde_json::from_str::<BookmarkCollection>(&serialized) {
+                    Ok(legacy_bookmarks) => {
+                        if let Err(error) = recording.save_bookmarks(&legacy_bookmarks) {
+                            startup_errors
+                                .push(format!("failed to migrate legacy bookmarks: {error:#}"));
+                        } else {
+                            bookmarks = legacy_bookmarks;
+                            legacy_bookmarks_to_clear = Some(legacy_bookmark_storage_key.clone());
+                        }
+                    }
+                    Err(error) => {
+                        startup_errors.push(format!("failed to decode legacy bookmarks: {error}"))
+                    }
+                }
+            }
+            let loader =
+                FrameLoader::new(Arc::clone(&recording), creation_context.egui_ctx.clone())
+                    .map_err(|error| -> Box<dyn std::error::Error + Send + Sync> {
+                        error.into()
+                    })?;
             Ok(Box::new(ReplayApp::new(
                 creation_context,
                 recording,
@@ -74,6 +124,10 @@ pub fn run(recording: Recording, start_frame: usize, end_frame: usize) -> Result
                 start_frame,
                 end_frame,
                 run_metadata,
+                bookmarks,
+                metadata_error.is_some(),
+                (!startup_errors.is_empty()).then(|| startup_errors.join("\n")),
+                legacy_bookmarks_to_clear,
             )))
         }),
     )
@@ -103,10 +157,12 @@ struct ReplayApp {
     start_frame: usize,
     end_frame: usize,
     dock_state: DockState<PanelTab>,
-    open_tabs: OpenTabs,
     timeline: TimelineState,
-    bookmark_storage_key: String,
     run_metadata: BTreeMap<String, RunUiMetadata>,
+    metadata_needs_repair: bool,
+    bookmarks_dirty: bool,
+    legacy_bookmarks_to_clear: Option<String>,
+    prediction_errors: BTreeMap<String, String>,
     rename_edits: BTreeMap<String, String>,
     management_error: Option<String>,
     pending_delete: Option<String>,
@@ -119,12 +175,6 @@ enum PanelTab {
     Model(String),
 }
 
-struct OpenTabs {
-    timeline: bool,
-    models: bool,
-    model: BTreeMap<String, bool>,
-}
-
 enum RunAction {
     Open(String),
     Rename { key: String, label: String },
@@ -133,6 +183,7 @@ enum RunAction {
 }
 
 impl ReplayApp {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         creation_context: &eframe::CreationContext<'_>,
         recording: Arc<Recording>,
@@ -141,17 +192,16 @@ impl ReplayApp {
         start_frame: usize,
         end_frame: usize,
         run_metadata: BTreeMap<String, RunUiMetadata>,
+        bookmarks: BookmarkCollection,
+        metadata_needs_repair: bool,
+        startup_error: Option<String>,
+        legacy_bookmarks_to_clear: Option<String>,
     ) -> Self {
         loader.request(start_frame, end_frame);
         creation_context.egui_ctx.set_visuals(egui::Visuals::dark());
         let available_counts: Vec<usize> = runs
             .iter()
-            .map(|run| {
-                run.predictions[start_frame..=end_frame]
-                    .iter()
-                    .filter(|value| value.is_some())
-                    .count()
-            })
+            .map(|run| run.available_count(start_frame..=end_frame))
             .collect();
         let visible_run_count = runs
             .iter()
@@ -184,35 +234,11 @@ impl ReplayApp {
             central_fraction,
             Node::leaf(PanelTab::Timeline),
         );
-        let bookmark_storage_key = format!(
-            "detection-replay-bookmarks-{}",
-            recording
-                .fingerprint()
-                .cache_key()
-                .unwrap_or_else(|_| "unknown-recording".to_string())
-        );
         let mut timeline = TimelineState::new(&recording, start_frame, end_frame);
-        if let Some(bookmarks) = creation_context
-            .storage
-            .and_then(|storage| storage.get_string(&bookmark_storage_key))
-            .and_then(|value| serde_json::from_str::<BookmarkCollection>(&value).ok())
-        {
-            timeline.bookmarks = bookmarks;
-        }
+        timeline.bookmarks = bookmarks;
         let rename_edits = runs
             .iter()
             .map(|run| (run.key.clone(), run.label.clone()))
-            .collect();
-        let open_models = runs
-            .iter()
-            .map(|run| {
-                (
-                    run.key.clone(),
-                    !run_metadata
-                        .get(&run.key)
-                        .is_some_and(|metadata| metadata.hidden),
-                )
-            })
             .collect();
         Self {
             recording,
@@ -237,16 +263,14 @@ impl ReplayApp {
             start_frame,
             end_frame,
             dock_state,
-            open_tabs: OpenTabs {
-                timeline: true,
-                models: true,
-                model: open_models,
-            },
             timeline,
-            bookmark_storage_key,
             run_metadata,
+            metadata_needs_repair,
+            bookmarks_dirty: false,
+            legacy_bookmarks_to_clear,
+            prediction_errors: BTreeMap::new(),
             rename_edits,
-            management_error: None,
+            management_error: startup_error,
             pending_delete: None,
         }
     }
@@ -310,41 +334,30 @@ impl ReplayApp {
             * f64::from(self.playback_speed);
         self.last_playback_update = now;
 
-        let mut next_frame = self.selected_frame;
-        while next_frame < self.end_frame {
-            let current = self.recording.frames()[next_frame].timestamp_nanos;
-            let next = self.recording.frames()[next_frame + 1].timestamp_nanos;
-            let frame_duration = ((next - current).max(1) as f64) / 1.0e9;
-            if self.playback_accumulator < frame_duration {
-                break;
-            }
-            self.playback_accumulator -= frame_duration;
-            next_frame += 1;
-        }
-        if next_frame == self.end_frame {
-            if self.loop_playback {
-                next_frame = self.start_frame;
-                self.playback_accumulator = 0.0;
-            } else {
-                self.is_playing = false;
-            }
-        }
+        let mut accumulator = self.playback_accumulator;
+        let (next_frame, is_playing) = consume_playback_time(
+            self.selected_frame,
+            self.start_frame,
+            self.end_frame,
+            &mut accumulator,
+            self.loop_playback,
+            |frame| self.playback_frame_duration(frame),
+        );
+        self.playback_accumulator = accumulator;
+        self.is_playing = is_playing;
         if next_frame != self.selected_frame {
             self.selected_frame = next_frame;
             if !self.decoded_frames.contains_key(&next_frame) {
                 self.loader.request(next_frame, self.end_frame);
             }
         }
-        let repaint_after = if next_frame < self.end_frame {
-            let current = self.recording.frames()[next_frame].timestamp_nanos;
-            let next = self.recording.frames()[next_frame + 1].timestamp_nanos;
-            (((next - current).max(1) as f64 / 1.0e9 - self.playback_accumulator)
+        if self.is_playing {
+            let repaint_after = ((self.playback_frame_duration(next_frame)
+                - self.playback_accumulator)
                 / f64::from(self.playback_speed))
-            .max(0.001)
-        } else {
-            0.001
-        };
-        context.request_repaint_after(Duration::from_secs_f64(repaint_after));
+            .max(0.001);
+            context.request_repaint_after(Duration::from_secs_f64(repaint_after));
+        }
     }
 
     fn handle_keys(&mut self, context: &egui::Context) {
@@ -376,6 +389,7 @@ impl ReplayApp {
         }
         if bookmark {
             self.timeline.bookmarks.toggle(self.selected_frame);
+            self.persist_bookmarks();
         }
         if previous_bookmark
             && let Some(frame) = self.timeline.bookmarks.previous(
@@ -437,14 +451,16 @@ impl ReplayApp {
                 ui.label(format!("{:.3}s", self.relative_time(self.selected_frame)));
                 ui.separator();
                 ui.menu_button("View", |ui| {
-                    if !self.open_tabs.timeline && ui.button("Timeline").clicked() {
+                    if self.dock_state.find_tab(&PanelTab::Timeline).is_none()
+                        && ui.button("Timeline").clicked()
+                    {
                         self.dock_state.push_to_focused_leaf(PanelTab::Timeline);
-                        self.open_tabs.timeline = true;
                         ui.close();
                     }
-                    if !self.open_tabs.models && ui.button("Models").clicked() {
+                    if self.dock_state.find_tab(&PanelTab::Models).is_none()
+                        && ui.button("Models").clicked()
+                    {
                         self.dock_state.push_to_focused_leaf(PanelTab::Models);
-                        self.open_tabs.models = true;
                         ui.close();
                     }
                     for run in &self.runs {
@@ -452,21 +468,23 @@ impl ReplayApp {
                             .run_metadata
                             .get(&run.key)
                             .is_some_and(|metadata| metadata.hidden);
-                        let open = self.open_tabs.model.get(&run.key).copied().unwrap_or(false);
+                        let tab = PanelTab::Model(run.key.clone());
+                        let open = self.dock_state.find_tab(&tab).is_some();
                         if !hidden && !open && ui.button(&run.label).clicked() {
-                            self.dock_state
-                                .push_to_focused_leaf(PanelTab::Model(run.key.clone()));
-                            self.open_tabs.model.insert(run.key.clone(), true);
+                            self.dock_state.push_to_focused_leaf(tab);
                             ui.close();
                         }
                     }
-                    if self.open_tabs.timeline
-                        && self.open_tabs.models
+                    if self.dock_state.find_tab(&PanelTab::Timeline).is_some()
+                        && self.dock_state.find_tab(&PanelTab::Models).is_some()
                         && self.runs.iter().all(|run| {
                             self.run_metadata
                                 .get(&run.key)
                                 .is_some_and(|metadata| metadata.hidden)
-                                || self.open_tabs.model.get(&run.key).copied().unwrap_or(false)
+                                || self
+                                    .dock_state
+                                    .find_tab(&PanelTab::Model(run.key.clone()))
+                                    .is_some()
                         })
                     {
                         ui.label("All panels are open");
@@ -487,7 +505,7 @@ impl ReplayApp {
         });
     }
 
-    fn models_panel(&mut self, ui: &mut Ui) -> Vec<RunAction> {
+    fn models_panel(&mut self, ui: &mut Ui, open_models: &BTreeSet<String>) -> Vec<RunAction> {
         let mut actions = Vec::new();
         ui.heading("Models");
         ui.add(
@@ -537,7 +555,7 @@ impl ReplayApp {
                         hidden,
                     });
                 }
-                let open = self.open_tabs.model.get(&key).copied().unwrap_or(false);
+                let open = open_models.contains(&key);
                 if !hidden && !open && ui.small_button("Open viewport").clicked() {
                     actions.push(RunAction::Open(key.clone()));
                 }
@@ -573,12 +591,21 @@ impl ReplayApp {
 
     fn dock_area(&mut self, context: &egui::Context) {
         egui::CentralPanel::default().show(context, |ui| {
+            let open_models = self
+                .dock_state
+                .iter_all_tabs()
+                .filter_map(|(_, tab)| match tab {
+                    PanelTab::Model(key) => Some(key.clone()),
+                    _ => None,
+                })
+                .collect();
             let mut dock_state =
                 std::mem::replace(&mut self.dock_state, DockState::new(Vec::new()));
             let mut viewer = DetectionTabViewer {
                 app: self,
                 selected_frame: None,
                 run_actions: Vec::new(),
+                open_models,
             };
             DockArea::new(&mut dock_state).show_inside(ui, &mut viewer);
             let selected_frame = viewer.selected_frame;
@@ -597,9 +624,10 @@ impl ReplayApp {
         self.management_error = None;
         match action {
             RunAction::Open(key) => {
-                if !self.is_hidden(&key) {
-                    dock_state.push_to_focused_leaf(PanelTab::Model(key.clone()));
-                    self.open_tabs.model.insert(key, true);
+                let hidden = self.is_hidden(&key);
+                let tab = PanelTab::Model(key);
+                if !hidden && dock_state.find_tab(&tab).is_none() {
+                    dock_state.push_to_focused_leaf(tab);
                 }
             }
             RunAction::Rename { key, label } => {
@@ -616,7 +644,17 @@ impl ReplayApp {
                         Some("the Recorded baseline cannot be renamed".to_string());
                     return;
                 }
-                self.run_metadata = match self.recording.rename_run(&key, label) {
+                let metadata_result = if self.metadata_needs_repair {
+                    let mut metadata = self.run_metadata.clone();
+                    metadata.entry(key.clone()).or_default().renamed_label =
+                        Some(label.to_string());
+                    self.recording
+                        .save_run_ui_metadata(&metadata)
+                        .map(|()| metadata)
+                } else {
+                    self.recording.rename_run(&key, label)
+                };
+                self.run_metadata = match metadata_result {
                     Ok(metadata) => metadata,
                     Err(error) => {
                         self.management_error =
@@ -624,13 +662,23 @@ impl ReplayApp {
                         return;
                     }
                 };
+                self.metadata_needs_repair = false;
                 if let Some(run) = self.runs.iter_mut().find(|run| run.key == key) {
                     run.label = label.to_string();
                 }
                 self.rename_edits.insert(key, label.to_string());
             }
             RunAction::SetHidden { key, hidden } => {
-                self.run_metadata = match self.recording.set_run_hidden(&key, hidden) {
+                let metadata_result = if self.metadata_needs_repair {
+                    let mut metadata = self.run_metadata.clone();
+                    metadata.entry(key.clone()).or_default().hidden = hidden;
+                    self.recording
+                        .save_run_ui_metadata(&metadata)
+                        .map(|()| metadata)
+                } else {
+                    self.recording.set_run_hidden(&key, hidden)
+                };
+                self.run_metadata = match metadata_result {
                     Ok(metadata) => metadata,
                     Err(error) => {
                         self.management_error =
@@ -638,14 +686,13 @@ impl ReplayApp {
                         return;
                     }
                 };
+                self.metadata_needs_repair = false;
                 if hidden {
                     dock_state.retain_tabs(
                         |tab| !matches!(tab, PanelTab::Model(tab_key) if tab_key == &key),
                     );
-                    self.open_tabs.model.insert(key, false);
-                } else {
-                    dock_state.push_to_focused_leaf(PanelTab::Model(key.clone()));
-                    self.open_tabs.model.insert(key, true);
+                } else if dock_state.find_tab(&PanelTab::Model(key.clone())).is_none() {
+                    dock_state.push_to_focused_leaf(PanelTab::Model(key));
                 }
             }
             RunAction::RequestDelete(key) => self.pending_delete = Some(key),
@@ -665,8 +712,20 @@ impl ReplayApp {
             return;
         }
 
-        match self.recording.remove_run_ui_metadata(key) {
-            Ok(metadata) => self.run_metadata = metadata,
+        let metadata_result = if self.metadata_needs_repair {
+            let mut metadata = self.run_metadata.clone();
+            metadata.remove(key);
+            self.recording
+                .save_run_ui_metadata(&metadata)
+                .map(|()| metadata)
+        } else {
+            self.recording.remove_run_ui_metadata(key)
+        };
+        match metadata_result {
+            Ok(metadata) => {
+                self.run_metadata = metadata;
+                self.metadata_needs_repair = false;
+            }
             Err(error) => {
                 self.run_metadata.remove(key);
                 self.management_error = Some(format!(
@@ -680,7 +739,6 @@ impl ReplayApp {
             self.runs.remove(index);
             self.available_counts.remove(index);
         }
-        self.open_tabs.model.remove(key);
         self.rename_edits.remove(key);
         self.pending_delete = None;
     }
@@ -729,6 +787,11 @@ impl ReplayApp {
         if let Some(error) = &self.load_error {
             ui.colored_label(Color32::LIGHT_RED, error);
         }
+        let run_key = self.runs[run_index].key.clone();
+        let had_prediction_error = self.prediction_errors.contains_key(&run_key);
+        if let Some(error) = self.prediction_errors.get(&run_key) {
+            ui.colored_label(Color32::LIGHT_RED, error);
+        }
         let Some(texture) = self.texture.clone() else {
             ui.centered_and_justified(|ui| ui.spinner());
             return;
@@ -736,7 +799,17 @@ impl ReplayApp {
         let Some(frame_index) = self.displayed_frame else {
             return;
         };
-        let prediction = self.runs[run_index].predictions[frame_index].clone();
+        let prediction = match self.runs[run_index].prediction(frame_index) {
+            Ok(prediction) => prediction,
+            Err(error) => {
+                let error = format!("failed to load prediction for frame {frame_index}: {error:#}");
+                if !had_prediction_error {
+                    ui.colored_label(Color32::LIGHT_RED, &error);
+                }
+                self.prediction_errors.insert(run_key, error);
+                None
+            }
+        };
         self.model_view(ui, &texture, frame_index, prediction.as_deref());
     }
 
@@ -865,6 +938,32 @@ impl ReplayApp {
         let first = self.recording.frames()[self.start_frame].timestamp_nanos;
         (self.recording.frames()[frame].timestamp_nanos - first) as f64 / 1.0e9
     }
+
+    fn playback_frame_duration(&self, frame: usize) -> f64 {
+        let frames = self.recording.frames();
+        let (current, next) = if frame < self.end_frame {
+            (
+                frames[frame].timestamp_nanos,
+                frames[frame + 1].timestamp_nanos,
+            )
+        } else {
+            (
+                frames[frame - 1].timestamp_nanos,
+                frames[frame].timestamp_nanos,
+            )
+        };
+        ((next - current).max(1) as f64) / 1.0e9
+    }
+
+    fn persist_bookmarks(&mut self) {
+        match self.recording.save_bookmarks(&self.timeline.bookmarks) {
+            Ok(()) => self.bookmarks_dirty = false,
+            Err(error) => {
+                self.bookmarks_dirty = true;
+                self.management_error = Some(format!("failed to persist bookmarks: {error:#}"));
+            }
+        }
+    }
 }
 
 impl App for ReplayApp {
@@ -879,8 +978,11 @@ impl App for ReplayApp {
     }
 
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
-        if let Ok(bookmarks) = serde_json::to_string(&self.timeline.bookmarks) {
-            storage.set_string(&self.bookmark_storage_key, bookmarks);
+        if self.bookmarks_dirty {
+            self.persist_bookmarks();
+        }
+        if let Some(key) = self.legacy_bookmarks_to_clear.take() {
+            storage.set_string(&key, String::new());
         }
     }
 }
@@ -889,6 +991,7 @@ struct DetectionTabViewer<'a> {
     app: &'a mut ReplayApp,
     selected_frame: Option<usize>,
     run_actions: Vec<RunAction>,
+    open_models: BTreeSet<String>,
 }
 
 impl TabViewer for DetectionTabViewer<'_> {
@@ -937,24 +1040,15 @@ impl TabViewer for DetectionTabViewer<'_> {
                     self.selected_frame = response.selected_frame;
                 }
             }
-            PanelTab::Models => self.run_actions.extend(self.app.models_panel(ui)),
+            PanelTab::Models => self
+                .run_actions
+                .extend(self.app.models_panel(ui, &self.open_models)),
             PanelTab::Model(key) => {
                 if let Some(index) = self.app.runs.iter().position(|run| &run.key == key) {
                     self.app.model_panel(ui, index);
                 }
             }
         }
-    }
-
-    fn on_close(&mut self, tab: &mut Self::Tab) -> OnCloseResponse {
-        match tab {
-            PanelTab::Timeline => self.app.open_tabs.timeline = false,
-            PanelTab::Models => self.app.open_tabs.models = false,
-            PanelTab::Model(key) => {
-                self.app.open_tabs.model.insert(key.clone(), false);
-            }
-        }
-        OnCloseResponse::Close
     }
 
     fn scroll_bars(&self, tab: &Self::Tab) -> [bool; 2] {
@@ -970,6 +1064,7 @@ struct FrameLoader {
     requests: mpsc::Sender<FrameRequest>,
     results: mpsc::Receiver<FrameResult>,
     requested: Option<usize>,
+    failed: BTreeSet<usize>,
     generation: u64,
 }
 
@@ -987,7 +1082,7 @@ struct FrameResult {
 }
 
 impl FrameLoader {
-    fn new(recording: Arc<Recording>) -> Result<Self> {
+    fn new(recording: Arc<Recording>, context: egui::Context) -> Result<Self> {
         let (request_sender, request_receiver) = mpsc::channel::<FrameRequest>();
         let (result_sender, result_receiver) =
             mpsc::sync_channel::<FrameResult>(PREFETCH_FRAMES * 2);
@@ -1029,6 +1124,7 @@ impl FrameLoader {
                         {
                             return;
                         }
+                        context.request_repaint();
                     }
                     let Ok(next) = request_receiver.recv() else {
                         return;
@@ -1041,12 +1137,13 @@ impl FrameLoader {
             requests: request_sender,
             results: result_receiver,
             requested: None,
+            failed: BTreeSet::new(),
             generation: 0,
         })
     }
 
     fn request(&mut self, frame: usize, end_frame: usize) {
-        if self.requested == Some(frame) {
+        if self.requested == Some(frame) || self.failed.contains(&frame) {
             return;
         }
         self.generation = self.generation.wrapping_add(1);
@@ -1073,6 +1170,14 @@ impl FrameLoader {
         if self.requested == Some(result.frame) {
             self.requested = None;
         }
+        match &result.image {
+            Ok(_) => {
+                self.failed.remove(&result.frame);
+            }
+            Err(_) => {
+                self.failed.insert(result.frame);
+            }
+        }
         Some(result.image.map(|image| (result.frame, image)))
     }
 }
@@ -1086,6 +1191,31 @@ fn fitted_scale(viewport: Vec2, image: Vec2) -> f32 {
     (viewport.x / image.x.max(1.0))
         .min(viewport.y / image.y.max(1.0))
         .max(0.01)
+}
+
+fn consume_playback_time(
+    mut frame: usize,
+    start_frame: usize,
+    end_frame: usize,
+    accumulator: &mut f64,
+    loop_playback: bool,
+    frame_duration: impl Fn(usize) -> f64,
+) -> (usize, bool) {
+    loop {
+        let duration = frame_duration(frame);
+        if *accumulator < duration {
+            return (frame, true);
+        }
+        *accumulator -= duration;
+        if frame < end_frame {
+            frame += 1;
+        } else if loop_playback {
+            frame = start_frame;
+        } else {
+            *accumulator = 0.0;
+            return (frame, false);
+        }
+    }
 }
 
 fn draw_objects(
@@ -1212,5 +1342,33 @@ fn label_color(label: RobocupObjectLabel) -> Color32 {
         RobocupObjectLabel::Robot => Color32::from_rgb(255, 89, 123),
         RobocupObjectLabel::TSpot => Color32::from_rgb(179, 136, 255),
         RobocupObjectLabel::XSpot => Color32::from_rgb(93, 230, 129),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn loop_playback_displays_end_before_wrapping() {
+        let mut accumulator = 2.0;
+        let (frame, playing) = consume_playback_time(0, 0, 2, &mut accumulator, true, |_| 1.0);
+        assert_eq!(frame, 2);
+        assert!(playing);
+        assert_eq!(accumulator, 0.0);
+
+        accumulator = 1.0;
+        let (frame, playing) = consume_playback_time(2, 0, 2, &mut accumulator, true, |_| 1.0);
+        assert_eq!(frame, 0);
+        assert!(playing);
+    }
+
+    #[test]
+    fn non_loop_playback_stops_after_end_duration() {
+        let mut accumulator = 1.0;
+        let (frame, playing) = consume_playback_time(2, 0, 2, &mut accumulator, false, |_| 1.0);
+        assert_eq!(frame, 2);
+        assert!(!playing);
+        assert_eq!(accumulator, 0.0);
     }
 }

@@ -15,9 +15,15 @@ use image::{RgbImage, codecs::jpeg::JpegEncoder};
 use mcap::{
     Channel, McapError, Schema, parse_record,
     records::{Record, op},
-    sans_io::{LinearReadEvent, LinearReader, LinearReaderOptions},
+    sans_io::{
+        IndexedReadEvent, IndexedReader, IndexedReaderOptions, LinearReadEvent, LinearReader,
+        LinearReaderOptions, SummaryReadEvent, SummaryReader, indexed_reader::ReadOrder,
+    },
 };
-use ros_z::{Message, SerdeCdrCodec, message::WireDecoder};
+use ros_z::{
+    Message, SerdeCdrCodec,
+    message::{WireDecoder, WireEncoder},
+};
 use ros2::sensor_msgs::image::Image;
 use serde::{Deserialize, Serialize};
 use tempfile::NamedTempFile;
@@ -30,13 +36,16 @@ use types::{
 
 use crate::cache::{
     CACHE_VERSION, Prediction, RecordedBaseline, RecordingFingerprint, read_bincode,
-    recorded_baseline_path, recording_cache_directory, save_recorded_baseline,
+    recorded_baseline_path, recording_cache_directory, save_recorded_baseline, validate_baseline,
     write_bincode_atomic,
 };
 
 const RECORDING_INDEX_FILE: &str = "index.bin";
 const PROXY_FILE: &str = "frames.jpg";
+const ORIGINAL_FRAMES_FILE: &str = "original-frames.cdr";
 const JPEG_QUALITY: u8 = 85;
+const MAX_MCAP_RECORD_BYTES: usize = 512 * 1024 * 1024;
+const IMAGE_CACHE_OVERHEAD_BYTES: usize = 1024 * 1024;
 const LEFT_IMAGE_TOPIC: &str = "inputs/left_image";
 const STEREO_IMAGE_TOPIC: &str = "inputs/stereo_image_pair";
 const DETECTED_OBJECTS_TOPIC: &str = "detected_objects";
@@ -64,6 +73,19 @@ pub struct FrameIndexEntry {
     pub byte_length: u64,
     pub width: u32,
     pub height: u32,
+    pub source_sequence: u32,
+    pub source_log_time: u64,
+    pub source_publish_time: u64,
+    pub source_data_hash: [u8; 32],
+    pub source_byte_offset: Option<u64>,
+    pub source_byte_length: Option<u64>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum OriginalImageSource {
+    IndexedMcap,
+    CachedCdr,
+    LinearMcap,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -71,8 +93,61 @@ pub struct RecordingCacheIndex {
     pub cache_version: u32,
     pub fingerprint: RecordingFingerprint,
     pub image_topic: ImageTopic,
+    pub original_image_source: OriginalImageSource,
     pub frames: Vec<FrameIndexEntry>,
     pub tail_warning: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct LegacyFrameIndexEntry {
+    frame_index: usize,
+    timestamp_nanos: i64,
+    byte_offset: u64,
+    byte_length: u64,
+    width: u32,
+    height: u32,
+}
+
+#[derive(Deserialize)]
+struct LegacyRecordingCacheIndex {
+    cache_version: u32,
+    fingerprint: RecordingFingerprint,
+    image_topic: ImageTopic,
+    frames: Vec<LegacyFrameIndexEntry>,
+    tail_warning: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct LegacyRecordedBaseline {
+    cache_version: u32,
+    recording_fingerprint: RecordingFingerprint,
+    total_frame_count: usize,
+    predictions: Vec<Option<Prediction>>,
+}
+
+#[derive(Deserialize)]
+struct InterimFrameIndexEntry {
+    frame_index: usize,
+    timestamp_nanos: i64,
+    byte_offset: u64,
+    byte_length: u64,
+    width: u32,
+    height: u32,
+    source_sequence: u32,
+    source_log_time: u64,
+    source_publish_time: u64,
+    source_byte_offset: Option<u64>,
+    source_byte_length: Option<u64>,
+}
+
+#[derive(Deserialize)]
+struct InterimRecordingCacheIndex {
+    cache_version: u32,
+    fingerprint: RecordingFingerprint,
+    image_topic: ImageTopic,
+    original_image_source: OriginalImageSource,
+    frames: Vec<InterimFrameIndexEntry>,
+    tail_warning: Option<String>,
 }
 
 #[derive(Debug)]
@@ -111,13 +186,37 @@ impl Recording {
 
         let index_path = recording_cache_directory.join(RECORDING_INDEX_FILE);
         let proxy_path = recording_cache_directory.join(PROXY_FILE);
+        let original_frames_path = recording_cache_directory.join(ORIGINAL_FRAMES_FILE);
         let baseline_path = recorded_baseline_path(&cache_directory, &fingerprint)?;
-        let index = if index_path.exists() && proxy_path.exists() && baseline_path.exists() {
-            match read_bincode::<RecordingCacheIndex>(&index_path).and_then(|index| {
-                validate_cached_index(&index, &fingerprint, &proxy_path)?;
+        let legacy_baseline_path = recording_cache_directory.join("recorded-baseline.bin");
+        let index = if index_path.exists()
+            && proxy_path.exists()
+            && (baseline_path.exists() || legacy_baseline_path.exists())
+        {
+            let load_current = || -> Result<RecordingCacheIndex> {
+                let index: RecordingCacheIndex = read_bincode(&index_path)?;
+                validate_cached_index(&index, &fingerprint, &proxy_path, &original_frames_path)?;
                 let baseline: RecordedBaseline = read_bincode(&baseline_path)?;
-                validate_cached_baseline(&baseline, &fingerprint, &index.frames)?;
+                validate_cached_baseline(
+                    baseline_path
+                        .parent()
+                        .wrap_err("baseline path has no parent")?,
+                    &baseline,
+                    &fingerprint,
+                    &index.frames,
+                )?;
                 Ok(index)
+            };
+            match load_current().or_else(|current_error| {
+                migrate_legacy_recording_cache(
+                    &fingerprint,
+                    &cache_directory,
+                    &recording_cache_directory,
+                    &index_path,
+                    &proxy_path,
+                    &legacy_baseline_path,
+                )
+                .wrap_err_with(|| format!("current cache is invalid: {current_error:#}"))
             }) {
                 Ok(index) => index,
                 Err(error) => {
@@ -198,13 +297,38 @@ impl Recording {
         }
 
         let path = self.index.fingerprint.canonical_path.clone();
+        let original_frames_path = self.recording_cache_directory.join(ORIGINAL_FRAMES_FILE);
         let image_topic = self.index.image_topic;
+        let original_image_source = self.index.original_image_source;
         let index = Arc::clone(&self.index);
         let (sender, receiver) = mpsc::channel(1);
         let task = tokio::task::spawn_blocking(move || {
-            if let Err(error) =
-                scan_original_images(&path, image_topic, &index.frames, skip, take, &sender)
-            {
+            let result = match original_image_source {
+                OriginalImageSource::IndexedMcap => scan_indexed_original_images(
+                    &path,
+                    image_topic,
+                    &index.frames,
+                    skip,
+                    take,
+                    &sender,
+                ),
+                OriginalImageSource::CachedCdr => scan_cached_original_images(
+                    &original_frames_path,
+                    &index.frames,
+                    skip,
+                    take,
+                    &sender,
+                ),
+                OriginalImageSource::LinearMcap => scan_linear_original_images(
+                    &path,
+                    image_topic,
+                    &index.frames,
+                    skip,
+                    take,
+                    &sender,
+                ),
+            };
+            if let Err(error) = result {
                 let _ = sender.blocking_send(Err(error));
             }
         });
@@ -227,6 +351,18 @@ impl Recording {
 
     pub fn load_run_ui_metadata(&self) -> Result<BTreeMap<String, crate::cache::RunUiMetadata>> {
         crate::cache::load_run_ui_metadata(&self.cache_directory, self.fingerprint())
+    }
+
+    pub fn load_bookmarks(&self) -> Result<crate::cache::BookmarkCollection> {
+        crate::cache::load_bookmarks(&self.cache_directory, self.fingerprint())
+    }
+
+    pub fn bookmarks_exist(&self) -> Result<bool> {
+        crate::cache::bookmarks_exist(&self.cache_directory, self.fingerprint())
+    }
+
+    pub fn save_bookmarks(&self, bookmarks: &crate::cache::BookmarkCollection) -> Result<()> {
+        crate::cache::save_bookmarks(&self.cache_directory, self.fingerprint(), bookmarks)
     }
 
     pub fn save_run_ui_metadata(
@@ -308,6 +444,105 @@ impl Drop for OriginalImageStream {
     }
 }
 
+fn migrate_legacy_recording_cache(
+    fingerprint: &RecordingFingerprint,
+    cache_directory: &Path,
+    recording_cache_directory: &Path,
+    index_path: &Path,
+    proxy_path: &Path,
+    baseline_path: &Path,
+) -> Result<RecordingCacheIndex> {
+    if let Ok(interim) = read_bincode::<InterimRecordingCacheIndex>(index_path)
+        && interim.cache_version == CACHE_VERSION
+        && &interim.fingerprint == fingerprint
+    {
+        let original_image_source = match interim.original_image_source {
+            OriginalImageSource::IndexedMcap => OriginalImageSource::LinearMcap,
+            source => source,
+        };
+        let index = RecordingCacheIndex {
+            cache_version: CACHE_VERSION,
+            fingerprint: interim.fingerprint,
+            image_topic: interim.image_topic,
+            original_image_source,
+            frames: interim
+                .frames
+                .into_iter()
+                .map(|frame| FrameIndexEntry {
+                    frame_index: frame.frame_index,
+                    timestamp_nanos: frame.timestamp_nanos,
+                    byte_offset: frame.byte_offset,
+                    byte_length: frame.byte_length,
+                    width: frame.width,
+                    height: frame.height,
+                    source_sequence: frame.source_sequence,
+                    source_log_time: frame.source_log_time,
+                    source_publish_time: frame.source_publish_time,
+                    source_data_hash: [0; 32],
+                    source_byte_offset: frame.source_byte_offset,
+                    source_byte_length: frame.source_byte_length,
+                })
+                .collect(),
+            tail_warning: interim.tail_warning,
+        };
+        validate_cached_index(
+            &index,
+            fingerprint,
+            proxy_path,
+            &recording_cache_directory.join(ORIGINAL_FRAMES_FILE),
+        )?;
+        write_bincode_atomic(index_path, &index)?;
+        return Ok(index);
+    }
+    let legacy: LegacyRecordingCacheIndex = read_bincode(index_path)?;
+    if legacy.cache_version != 1 || &legacy.fingerprint != fingerprint || legacy.frames.is_empty() {
+        bail!("legacy recording index does not match the recording");
+    }
+    let baseline: LegacyRecordedBaseline = read_bincode(baseline_path)?;
+    if baseline.cache_version != 1
+        || baseline.recording_fingerprint != legacy.fingerprint
+        || baseline.total_frame_count != legacy.frames.len()
+        || baseline.predictions.len() != legacy.frames.len()
+    {
+        bail!("legacy recorded baseline does not match its index");
+    }
+    let index = RecordingCacheIndex {
+        cache_version: CACHE_VERSION,
+        fingerprint: legacy.fingerprint,
+        image_topic: legacy.image_topic,
+        original_image_source: OriginalImageSource::LinearMcap,
+        frames: legacy
+            .frames
+            .into_iter()
+            .map(|frame| FrameIndexEntry {
+                frame_index: frame.frame_index,
+                timestamp_nanos: frame.timestamp_nanos,
+                byte_offset: frame.byte_offset,
+                byte_length: frame.byte_length,
+                width: frame.width,
+                height: frame.height,
+                source_sequence: 0,
+                source_log_time: 0,
+                source_publish_time: 0,
+                source_data_hash: [0; 32],
+                source_byte_offset: None,
+                source_byte_length: None,
+            })
+            .collect(),
+        tail_warning: legacy.tail_warning,
+    };
+    validate_cached_index(
+        &index,
+        fingerprint,
+        proxy_path,
+        &recording_cache_directory.join(ORIGINAL_FRAMES_FILE),
+    )?;
+    save_recorded_baseline(cache_directory, fingerprint, &baseline.predictions)?;
+    write_bincode_atomic(index_path, &index)?;
+    tracing::info!("migrated detection replay recording cache without rescanning the MCAP");
+    Ok(index)
+}
+
 fn build_cache(
     fingerprint: &RecordingFingerprint,
     cache_directory: &Path,
@@ -319,10 +554,17 @@ fn build_cache(
             recording_cache_directory.display()
         )
     })?;
+    let has_chunk_index = load_summary(&fingerprint.canonical_path)?
+        .is_some_and(|summary| !summary.chunk_indexes.is_empty());
+    let mut original_frames = Some(
+        NamedTempFile::new_in(recording_cache_directory)
+            .wrap_err("failed to create original-frame cache")?,
+    );
     let mut frames = Vec::new();
     let mut active_image_topic = None;
     let mut recorded_objects = BTreeMap::new();
     let mut proxy_offset = 0_u64;
+    let mut source_offset = 0_u64;
     let mut tail_warning = None;
 
     let scan_end = scan_messages(&fingerprint.canonical_path, |message| {
@@ -348,6 +590,19 @@ fn build_cache(
                 .write_all(&jpeg)
                 .wrap_err("failed to append proxy JPEG")?;
             let byte_length = u64::try_from(jpeg.len()).wrap_err("proxy JPEG length overflow")?;
+            let source_bytes = original_frames
+                .as_ref()
+                .map(|_| SerdeCdrCodec::<Image>::serialize(&image))
+                .transpose()
+                .wrap_err_with(|| format!("failed to encode original frame {}", frames.len()))?;
+            if let (Some(file), Some(bytes)) = (&mut original_frames, source_bytes.as_ref()) {
+                file.write_all(bytes)
+                    .wrap_err("failed to append original image data")?;
+            }
+            let source_length = source_bytes
+                .as_ref()
+                .map(|bytes| u64::try_from(bytes.len()).wrap_err("original frame length overflow"))
+                .transpose()?;
             frames.push(FrameIndexEntry {
                 frame_index: frames.len(),
                 timestamp_nanos,
@@ -355,10 +610,21 @@ fn build_cache(
                 byte_length,
                 width: image.width,
                 height: image.height,
+                source_sequence: message.sequence,
+                source_log_time: message.log_time,
+                source_publish_time: message.publish_time,
+                source_data_hash: *blake3::hash(message.data.as_ref()).as_bytes(),
+                source_byte_offset: source_length.map(|_| source_offset),
+                source_byte_length: source_length,
             });
             proxy_offset = proxy_offset
                 .checked_add(byte_length)
                 .wrap_err("concatenated proxy length overflow")?;
+            if let Some(source_length) = source_length {
+                source_offset = source_offset
+                    .checked_add(source_length)
+                    .wrap_err("original frame cache length overflow")?;
+            }
         } else if message.channel.topic == DETECTED_OBJECTS_TOPIC {
             validate_channel::<TimeWrapper<Vec<Object<RobocupObjectLabel>>>>(message)?;
             let detected =
@@ -395,6 +661,53 @@ fn build_cache(
         .persist(recording_cache_directory.join(PROXY_FILE))
         .map_err(|error| error.error)
         .wrap_err("failed to atomically replace proxy file")?;
+    let indexed_images_verified = if has_chunk_index
+        && frames
+            .windows(2)
+            .all(|window| window[0].source_log_time <= window[1].source_log_time)
+    {
+        match verify_indexed_images(&fingerprint.canonical_path, image_topic, &frames) {
+            Ok(verified) => verified,
+            Err(error) => {
+                tracing::warn!(?error, "MCAP index cannot safely replay source images");
+                false
+            }
+        }
+    } else {
+        false
+    };
+    let original_image_source = if indexed_images_verified {
+        for frame in &mut frames {
+            frame.source_byte_offset = None;
+            frame.source_byte_length = None;
+        }
+        OriginalImageSource::IndexedMcap
+    } else {
+        OriginalImageSource::CachedCdr
+    };
+    if original_image_source == OriginalImageSource::CachedCdr {
+        let mut original_frames = original_frames
+            .take()
+            .wrap_err("original-frame cache was not created")?;
+        original_frames
+            .flush()
+            .wrap_err("failed to flush original-frame cache")?;
+        original_frames
+            .as_file_mut()
+            .sync_all()
+            .wrap_err("failed to sync original-frame cache")?;
+        original_frames
+            .persist(recording_cache_directory.join(ORIGINAL_FRAMES_FILE))
+            .map_err(|error| error.error)
+            .wrap_err("failed to atomically replace original-frame cache")?;
+    } else {
+        drop(original_frames);
+        let stale = recording_cache_directory.join(ORIGINAL_FRAMES_FILE);
+        if stale.exists() {
+            fs::remove_file(&stale)
+                .wrap_err_with(|| format!("failed to remove {}", stale.display()))?;
+        }
+    }
 
     let mut baseline_predictions = vec![None; frames.len()];
     for frame in &frames {
@@ -410,20 +723,13 @@ fn build_cache(
             });
         }
     }
-    save_recorded_baseline(
-        cache_directory,
-        &RecordedBaseline {
-            cache_version: CACHE_VERSION,
-            recording_fingerprint: fingerprint.clone(),
-            total_frame_count: frames.len(),
-            predictions: baseline_predictions,
-        },
-    )?;
+    save_recorded_baseline(cache_directory, fingerprint, &baseline_predictions)?;
 
     let index = RecordingCacheIndex {
         cache_version: CACHE_VERSION,
         fingerprint: fingerprint.clone(),
         image_topic,
+        original_image_source,
         frames,
         tail_warning,
     };
@@ -434,7 +740,7 @@ fn build_cache(
     Ok(index)
 }
 
-fn scan_original_images(
+fn scan_linear_original_images(
     path: &Path,
     image_topic: ImageTopic,
     expected_frames: &[FrameIndexEntry],
@@ -447,7 +753,6 @@ fn scan_original_images(
     }
     let mut selected_frame = 0_usize;
     let mut emitted = 0_usize;
-
     scan_messages(path, |message| {
         if message.channel.topic != image_topic.name() {
             return Ok(ScanControl::Continue);
@@ -461,40 +766,283 @@ fn scan_original_images(
         if frame_index < skip {
             return Ok(ScanControl::Continue);
         }
-        if emitted == take {
-            return Ok(ScanControl::Stop);
-        }
-        let image = decode_image_data(message, image_topic)?;
-        let timestamp_nanos = image_timestamp_nanos(&image)?;
         let expected = expected_frames
             .get(frame_index)
             .wrap_err("original recording has more frames than its cache index")?;
-        if timestamp_nanos != expected.timestamp_nanos
-            || image.width != expected.width
-            || image.height != expected.height
-        {
-            bail!("original frame {frame_index} does not match its cache index");
-        }
-        if sender
-            .blocking_send(Ok(OriginalFrame {
-                frame_index,
-                timestamp_nanos,
-                image,
-            }))
-            .is_err()
-        {
-            return Ok(ScanControl::Stop);
-        }
+        let image = decode_image_data(message, image_topic)?;
+        send_original_frame(sender, frame_index, expected, image)?;
         emitted += 1;
-        if emitted == take {
-            return Ok(ScanControl::Stop);
-        }
-        Ok(ScanControl::Continue)
+        Ok(if emitted == take {
+            ScanControl::Stop
+        } else {
+            ScanControl::Continue
+        })
     })?;
     if emitted != take {
         bail!("recording ended after {emitted} of {take} requested original frames");
     }
     Ok(())
+}
+
+fn scan_indexed_original_images(
+    path: &Path,
+    image_topic: ImageTopic,
+    expected_frames: &[FrameIndexEntry],
+    skip: usize,
+    take: usize,
+    sender: &mpsc::Sender<Result<OriginalFrame>>,
+) -> Result<()> {
+    if take == 0 {
+        return Ok(());
+    }
+    let summary = load_summary(path)?.wrap_err("recording no longer has a usable MCAP summary")?;
+    let first = expected_frames
+        .get(skip)
+        .wrap_err("requested original frame is outside the cache index")?;
+    let options = IndexedReaderOptions::new()
+        .with_order(ReadOrder::File)
+        .include_topics([image_topic.name()])
+        .log_time_on_or_after(first.source_log_time)
+        .with_record_length_limit(MAX_MCAP_RECORD_BYTES);
+    let mut reader = IndexedReader::new_with_options(&summary, options)
+        .wrap_err("failed to initialize indexed MCAP reader")?;
+    let mut file = File::open(path)
+        .wrap_err_with(|| format!("failed to open recording {}", path.display()))?;
+    let file_length = file
+        .metadata()
+        .wrap_err("failed to inspect indexed MCAP")?
+        .len();
+    let mut buffer = Vec::new();
+    let mut emitted = 0_usize;
+    while let Some(event) = reader.next_event() {
+        if sender.is_closed() {
+            return Ok(());
+        }
+        match event.wrap_err("failed to read indexed MCAP messages")? {
+            IndexedReadEvent::ReadChunkRequest { offset, length } => {
+                read_indexed_chunk(&mut file, file_length, offset, length, &mut buffer)?;
+                reader
+                    .insert_chunk_record_data(offset, &buffer)
+                    .wrap_err("failed to decode indexed MCAP chunk")?;
+            }
+            IndexedReadEvent::Message { header, data } => {
+                let frame_index = skip + emitted;
+                let expected = expected_frames
+                    .get(frame_index)
+                    .wrap_err("indexed MCAP contains more frames than its cache index")?;
+                if header.sequence != expected.source_sequence
+                    || header.log_time != expected.source_log_time
+                    || header.publish_time != expected.source_publish_time
+                    || blake3::hash(data).as_bytes() != &expected.source_data_hash
+                {
+                    if emitted == 0 {
+                        continue;
+                    }
+                    bail!("indexed original frame {frame_index} does not match its cache index");
+                }
+                let image = match image_topic {
+                    ImageTopic::LeftImage => SerdeCdrCodec::<Image>::deserialize(data)
+                        .wrap_err("failed to decode indexed original image")?,
+                    ImageTopic::StereoImagePair => {
+                        SerdeCdrCodec::<StereoImagePair>::deserialize(data)
+                            .wrap_err("failed to decode indexed original stereo pair")?
+                            .left
+                    }
+                };
+                send_original_frame(sender, frame_index, expected, image)?;
+                emitted += 1;
+                if emitted == take {
+                    return Ok(());
+                }
+            }
+        }
+    }
+    if emitted != take {
+        bail!("recording ended after {emitted} of {take} requested original frames");
+    }
+    Ok(())
+}
+
+fn verify_indexed_images(
+    path: &Path,
+    image_topic: ImageTopic,
+    expected_frames: &[FrameIndexEntry],
+) -> Result<bool> {
+    let Some(summary) = load_summary(path)? else {
+        return Ok(false);
+    };
+    let options = IndexedReaderOptions::new()
+        .with_order(ReadOrder::File)
+        .include_topics([image_topic.name()])
+        .with_record_length_limit(MAX_MCAP_RECORD_BYTES);
+    let mut reader = IndexedReader::new_with_options(&summary, options)
+        .wrap_err("failed to initialize indexed MCAP verification")?;
+    let mut file = File::open(path)
+        .wrap_err_with(|| format!("failed to open recording {}", path.display()))?;
+    let file_length = file
+        .metadata()
+        .wrap_err("failed to inspect indexed MCAP")?
+        .len();
+    let mut buffer = Vec::new();
+    let mut frame_index = 0;
+    while let Some(event) = reader.next_event() {
+        match event.wrap_err("failed to verify indexed MCAP messages")? {
+            IndexedReadEvent::ReadChunkRequest { offset, length } => {
+                read_indexed_chunk(&mut file, file_length, offset, length, &mut buffer)?;
+                reader
+                    .insert_chunk_record_data(offset, &buffer)
+                    .wrap_err("failed to decode indexed MCAP chunk")?;
+            }
+            IndexedReadEvent::Message { header, data } => {
+                let Some(expected) = expected_frames.get(frame_index) else {
+                    return Ok(false);
+                };
+                if header.sequence != expected.source_sequence
+                    || header.log_time != expected.source_log_time
+                    || header.publish_time != expected.source_publish_time
+                    || blake3::hash(data).as_bytes() != &expected.source_data_hash
+                {
+                    return Ok(false);
+                }
+                frame_index += 1;
+            }
+        }
+    }
+    Ok(frame_index == expected_frames.len())
+}
+
+fn read_indexed_chunk(
+    file: &mut File,
+    file_length: u64,
+    offset: u64,
+    length: usize,
+    buffer: &mut Vec<u8>,
+) -> Result<()> {
+    if length > MAX_MCAP_RECORD_BYTES
+        || offset
+            .checked_add(u64::try_from(length).wrap_err("MCAP chunk length overflow")?)
+            .is_none_or(|end| end > file_length)
+    {
+        bail!("indexed MCAP chunk request is outside the recording");
+    }
+    buffer.clear();
+    if buffer.capacity() < length {
+        buffer
+            .try_reserve_exact(length - buffer.capacity())
+            .wrap_err("failed to allocate indexed MCAP chunk")?;
+    }
+    buffer.resize(length, 0);
+    file.seek(SeekFrom::Start(offset))
+        .wrap_err("failed to seek to indexed MCAP chunk")?;
+    file.read_exact(buffer)
+        .wrap_err("failed to read indexed MCAP chunk")
+}
+
+fn scan_cached_original_images(
+    path: &Path,
+    expected_frames: &[FrameIndexEntry],
+    skip: usize,
+    take: usize,
+    sender: &mpsc::Sender<Result<OriginalFrame>>,
+) -> Result<()> {
+    let mut file = File::open(path)
+        .wrap_err_with(|| format!("failed to open original-frame cache {}", path.display()))?;
+    for (frame_index, expected) in expected_frames.iter().enumerate().skip(skip).take(take) {
+        if sender.is_closed() {
+            return Ok(());
+        }
+        let offset = expected
+            .source_byte_offset
+            .wrap_err("original-frame cache offset is missing")?;
+        let length = usize::try_from(
+            expected
+                .source_byte_length
+                .wrap_err("original-frame cache length is missing")?,
+        )
+        .wrap_err("original frame is too large for this platform")?;
+        let pixel_count = usize::try_from(expected.width)
+            .ok()
+            .and_then(|width| {
+                usize::try_from(expected.height)
+                    .ok()
+                    .and_then(|height| width.checked_mul(height))
+            })
+            .wrap_err("cached original frame dimensions overflow")?;
+        let maximum_length = pixel_count
+            .checked_mul(2)
+            .and_then(|length| length.checked_add(IMAGE_CACHE_OVERHEAD_BYTES))
+            .wrap_err("cached original frame size limit overflow")?;
+        if length > maximum_length {
+            bail!("cached original frame {frame_index} is implausibly large");
+        }
+        let mut bytes = Vec::new();
+        bytes
+            .try_reserve_exact(length)
+            .wrap_err("failed to allocate cached original frame")?;
+        bytes.resize(length, 0);
+        file.seek(SeekFrom::Start(offset))
+            .wrap_err("failed to seek original-frame cache")?;
+        file.read_exact(&mut bytes)
+            .wrap_err("failed to read original-frame cache")?;
+        let image = SerdeCdrCodec::<Image>::deserialize(&bytes)
+            .wrap_err("failed to decode cached original image")?;
+        send_original_frame(sender, frame_index, expected, image)?;
+    }
+    Ok(())
+}
+
+fn send_original_frame(
+    sender: &mpsc::Sender<Result<OriginalFrame>>,
+    frame_index: usize,
+    expected: &FrameIndexEntry,
+    image: Image,
+) -> Result<()> {
+    let timestamp_nanos = image_timestamp_nanos(&image)?;
+    if timestamp_nanos != expected.timestamp_nanos
+        || image.width != expected.width
+        || image.height != expected.height
+    {
+        bail!("original frame {frame_index} does not match its cache index");
+    }
+    let _ = sender.blocking_send(Ok(OriginalFrame {
+        frame_index,
+        timestamp_nanos,
+        image,
+    }));
+    Ok(())
+}
+
+fn load_summary(path: &Path) -> Result<Option<mcap::Summary>> {
+    let mut file = File::open(path)
+        .wrap_err_with(|| format!("failed to open recording {}", path.display()))?;
+    let mut reader = SummaryReader::new();
+    while let Some(event) = reader.next_event() {
+        let event = match event {
+            Ok(event) => event,
+            Err(error @ McapError::Io(_)) => {
+                return Err(error).wrap_err("failed to read MCAP summary");
+            }
+            Err(error) => {
+                tracing::warn!(?error, "ignoring unusable MCAP summary");
+                return Ok(None);
+            }
+        };
+        match event {
+            SummaryReadEvent::SeekRequest(position) => {
+                let position = file
+                    .seek(position)
+                    .wrap_err("failed to seek MCAP summary")?;
+                reader.notify_seeked(position);
+            }
+            SummaryReadEvent::ReadRequest(length) => {
+                let read = file
+                    .read(reader.insert(length))
+                    .wrap_err("failed to read MCAP summary")?;
+                reader.notify_read(read);
+            }
+        }
+    }
+    Ok(reader.finish())
 }
 
 #[derive(Clone, Copy)]
@@ -534,98 +1082,106 @@ fn scan_messages(
                     .wrap_err_with(|| format!("failed to read {}", path.display()))?;
                 reader.notify_read(read);
             }
-            Ok(LinearReadEvent::Record { data, opcode }) => match parse_record(opcode, data)? {
-                Record::Schema { header, data } => {
-                    let schema = Arc::new(Schema {
-                        id: header.id,
-                        name: header.name,
-                        encoding: header.encoding,
-                        data: Cow::Owned(data.into_owned()),
-                    });
-                    if let Some(existing) = schemas.insert(schema.id, Arc::clone(&schema))
-                        && existing.as_ref() != schema.as_ref()
-                    {
-                        bail!(
-                            "MCAP contains conflicting schema records for id {}",
-                            schema.id
-                        );
+            Ok(LinearReadEvent::Record { data, opcode }) => {
+                let record = match parse_record(opcode, data) {
+                    Ok(record) => record,
+                    Err(error) => {
+                        return classify_scan_error(path, &mut file, file_length, error);
                     }
-                }
-                Record::Channel(channel) => {
-                    let schema = if channel.schema_id == 0 {
-                        None
-                    } else {
-                        Some(schemas.get(&channel.schema_id).cloned().wrap_err_with(|| {
-                            format!(
-                                "MCAP channel {} references unknown schema {}",
-                                channel.topic, channel.schema_id
-                            )
-                        })?)
-                    };
-                    let channel = Arc::new(Channel {
-                        id: channel.id,
-                        topic: channel.topic,
-                        schema,
-                        message_encoding: channel.message_encoding,
-                        metadata: channel.metadata,
-                    });
-                    if let Some(existing) = channels.insert(channel.id, Arc::clone(&channel))
-                        && existing.as_ref() != channel.as_ref()
-                    {
-                        bail!(
-                            "MCAP contains conflicting channel records for id {}",
-                            channel.id
-                        );
+                };
+                match record {
+                    Record::Schema { header, data } => {
+                        let schema = Arc::new(Schema {
+                            id: header.id,
+                            name: header.name,
+                            encoding: header.encoding,
+                            data: Cow::Owned(data.into_owned()),
+                        });
+                        if let Some(existing) = schemas.insert(schema.id, Arc::clone(&schema))
+                            && existing.as_ref() != schema.as_ref()
+                        {
+                            bail!(
+                                "MCAP contains conflicting schema records for id {}",
+                                schema.id
+                            );
+                        }
                     }
-                }
-                Record::Message { header, data } => {
-                    let channel =
-                        channels
-                            .get(&header.channel_id)
-                            .cloned()
-                            .wrap_err_with(|| {
+                    Record::Channel(channel) => {
+                        let schema = if channel.schema_id == 0 {
+                            None
+                        } else {
+                            Some(schemas.get(&channel.schema_id).cloned().wrap_err_with(|| {
                                 format!(
-                                    "MCAP message {} references unknown channel {}",
-                                    header.sequence, header.channel_id
+                                    "MCAP channel {} references unknown schema {}",
+                                    channel.topic, channel.schema_id
                                 )
-                            })?;
-                    let message = mcap::Message {
-                        channel,
-                        sequence: header.sequence,
-                        log_time: header.log_time,
-                        publish_time: header.publish_time,
-                        data,
-                    };
-                    if matches!(handle_message(&message)?, ScanControl::Stop) {
-                        return Ok(ScanEnd::Complete);
+                            })?)
+                        };
+                        let channel = Arc::new(Channel {
+                            id: channel.id,
+                            topic: channel.topic,
+                            schema,
+                            message_encoding: channel.message_encoding,
+                            metadata: channel.metadata,
+                        });
+                        if let Some(existing) = channels.insert(channel.id, Arc::clone(&channel))
+                            && existing.as_ref() != channel.as_ref()
+                        {
+                            bail!(
+                                "MCAP contains conflicting channel records for id {}",
+                                channel.id
+                            );
+                        }
                     }
+                    Record::Message { header, data } => {
+                        let channel =
+                            channels
+                                .get(&header.channel_id)
+                                .cloned()
+                                .wrap_err_with(|| {
+                                    format!(
+                                        "MCAP message {} references unknown channel {}",
+                                        header.sequence, header.channel_id
+                                    )
+                                })?;
+                        let message = mcap::Message {
+                            channel,
+                            sequence: header.sequence,
+                            log_time: header.log_time,
+                            publish_time: header.publish_time,
+                            data,
+                        };
+                        if matches!(handle_message(&message)?, ScanControl::Stop) {
+                            return Ok(ScanEnd::Complete);
+                        }
+                    }
+                    _ => {}
                 }
-                _ => {}
-            },
-            Err(error) => {
-                let position = file
-                    .stream_position()
-                    .wrap_err_with(|| format!("failed to inspect {}", path.display()))?;
-                let current_chunk_extends_to_eof =
-                    current_chunk_record_extends_to_eof(&mut file, position, file_length)?;
-                if is_recoverable_tail_error(
-                    &error,
-                    position,
-                    file_length,
-                    current_chunk_extends_to_eof,
-                ) {
-                    return Ok(ScanEnd::DamagedTail(error));
-                }
-                return Err(error).wrap_err_with(|| {
-                    format!(
-                        "failed while scanning MCAP messages at byte {position} of {file_length}"
-                    )
-                });
             }
+            Err(error) => return classify_scan_error(path, &mut file, file_length, error),
         }
     }
 
     Ok(ScanEnd::Complete)
+}
+
+fn classify_scan_error(
+    path: &Path,
+    file: &mut File,
+    file_length: u64,
+    error: McapError,
+) -> Result<ScanEnd> {
+    let position = file
+        .stream_position()
+        .wrap_err_with(|| format!("failed to inspect {}", path.display()))?;
+    let current_chunk_extends_to_eof =
+        current_chunk_record_extends_to_eof(file, position, file_length)?;
+    if is_recoverable_tail_error(&error, position, file_length, current_chunk_extends_to_eof) {
+        return Ok(ScanEnd::DamagedTail(error));
+    }
+    Err(error).wrap_err_with(|| {
+        format!("failed while scanning MCAP messages at byte {position} of {file_length}")
+    })
 }
 
 fn decode_image_message(message: &mcap::Message<'_>, topic: ImageTopic) -> Result<Image> {
@@ -754,9 +1310,12 @@ fn is_recoverable_tail_error(
     current_chunk_extends_to_eof: bool,
 ) -> bool {
     match error {
-        McapError::UnexpectedEof | McapError::UnexpectedEoc | McapError::BadChunkLength { .. } => {
-            read_position == file_length || current_chunk_extends_to_eof
-        }
+        McapError::UnexpectedEof
+        | McapError::UnexpectedEoc
+        | McapError::BadChunkLength { .. }
+        | McapError::BadSchemaLength { .. }
+        | McapError::BadAttachmentLength { .. }
+        | McapError::Parse(_) => read_position == file_length || current_chunk_extends_to_eof,
         McapError::RecordTooLarge { .. } | McapError::ChunkTooLarge(_) => {
             current_chunk_extends_to_eof
         }
@@ -768,6 +1327,7 @@ fn validate_cached_index(
     index: &RecordingCacheIndex,
     fingerprint: &RecordingFingerprint,
     proxy_path: &Path,
+    original_frames_path: &Path,
 ) -> Result<()> {
     if index.cache_version != CACHE_VERSION || &index.fingerprint != fingerprint {
         bail!("recording cache fingerprint or version does not match");
@@ -776,6 +1336,7 @@ fn validate_cached_index(
         bail!("recording cache contains no frames");
     }
     let mut expected_offset = 0_u64;
+    let mut expected_source_offset = 0_u64;
     for (frame_index, frame) in index.frames.iter().enumerate() {
         if frame.frame_index != frame_index
             || frame.byte_offset != expected_offset
@@ -784,6 +1345,25 @@ fn validate_cached_index(
             || frame.height == 0
         {
             bail!("recording cache frame {frame_index} is invalid");
+        }
+        match index.original_image_source {
+            OriginalImageSource::IndexedMcap | OriginalImageSource::LinearMcap => {
+                if frame.source_byte_offset.is_some() || frame.source_byte_length.is_some() {
+                    bail!("indexed recording frame {frame_index} has cached source offsets");
+                }
+            }
+            OriginalImageSource::CachedCdr => {
+                let length = frame
+                    .source_byte_length
+                    .filter(|length| *length > 0)
+                    .wrap_err("cached original frame has an invalid length")?;
+                if frame.source_byte_offset != Some(expected_source_offset) {
+                    bail!("cached original frame {frame_index} has an invalid offset");
+                }
+                expected_source_offset = expected_source_offset
+                    .checked_add(length)
+                    .wrap_err("original-frame cache offset overflow")?;
+            }
         }
         expected_offset = expected_offset
             .checked_add(frame.byte_length)
@@ -796,30 +1376,30 @@ fn validate_cached_index(
     if proxy_length != expected_offset {
         bail!("proxy length does not match recording cache index");
     }
+    if index.original_image_source == OriginalImageSource::CachedCdr {
+        let source_length = original_frames_path
+            .metadata()
+            .wrap_err_with(|| {
+                format!(
+                    "failed to read metadata for {}",
+                    original_frames_path.display()
+                )
+            })?
+            .len();
+        if source_length != expected_source_offset {
+            bail!("original-frame cache length does not match recording cache index");
+        }
+    }
     Ok(())
 }
 
 fn validate_cached_baseline(
+    directory: &Path,
     baseline: &RecordedBaseline,
     fingerprint: &RecordingFingerprint,
     frames: &[FrameIndexEntry],
 ) -> Result<()> {
-    if baseline.cache_version != CACHE_VERSION
-        || &baseline.recording_fingerprint != fingerprint
-        || baseline.total_frame_count != frames.len()
-        || baseline.predictions.len() != frames.len()
-    {
-        bail!("recorded baseline does not match its recording index");
-    }
-    for (frame_index, prediction) in baseline.predictions.iter().enumerate() {
-        if prediction.as_ref().is_some_and(|prediction| {
-            prediction.frame_index != frame_index
-                || prediction.timestamp_nanos != frames[frame_index].timestamp_nanos
-        }) {
-            bail!("recorded baseline frame {frame_index} is invalid");
-        }
-    }
-    Ok(())
+    validate_baseline(directory, baseline, fingerprint, frames.len())
 }
 
 #[cfg(test)]
@@ -888,6 +1468,20 @@ mod tests {
         assert_eq!(recording.frames()[0].timestamp_nanos, 12_000_000_345);
         let proxy = recording.load_proxy_frame(0).unwrap();
         assert_eq!(proxy.dimensions(), (32, 32));
+        assert_eq!(
+            recording.index().original_image_source,
+            OriginalImageSource::IndexedMcap
+        );
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let mut originals = recording.original_images(0, Some(1)).unwrap();
+            let original = originals.next().await.unwrap().unwrap();
+            assert_eq!(original.timestamp_nanos, 12_000_000_345);
+            assert_eq!(original.image.data, image.data);
+        });
     }
 
     #[test]

@@ -1,67 +1,14 @@
-use std::{
-    collections::{BTreeMap, BTreeSet},
-    ops::RangeInclusive,
-};
+use std::{collections::BTreeSet, ops::RangeInclusive};
 
-use detection_replay::{LoadedPredictionRun, Recording};
+use detection_replay::{BookmarkCollection, LoadedPredictionRun, Recording};
 use eframe::egui::{
     self, Align2, Color32, FontId, Rect, Response, Sense, Stroke, StrokeKind, Ui, pos2, vec2,
 };
-use serde::{Deserialize, Serialize};
 
 const LABEL_WIDTH: f32 = 150.0;
 const TICK_HEIGHT: f32 = 34.0;
 const ROW_HEIGHT: f32 = 28.0;
 const MIN_VIEW_NANOS: f64 = 1_000_000.0;
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct Bookmark {
-    pub name: String,
-}
-
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
-pub struct BookmarkCollection(pub BTreeMap<usize, Bookmark>);
-
-impl BookmarkCollection {
-    pub fn toggle(&mut self, frame: usize) {
-        if self.0.remove(&frame).is_none() {
-            let next_number = self
-                .0
-                .values()
-                .filter_map(|bookmark| bookmark.name.strip_prefix('#')?.parse::<usize>().ok())
-                .max()
-                .unwrap_or(0)
-                + 1;
-            self.0.insert(
-                frame,
-                Bookmark {
-                    name: format!("#{next_number}"),
-                },
-            );
-        }
-    }
-
-    pub fn next(&self, frame: usize, start: usize, end: usize) -> Option<usize> {
-        self.0
-            .range((frame.saturating_add(1))..=end)
-            .next()
-            .map(|(frame, _)| *frame)
-            .or_else(|| self.0.range(start..frame).next().map(|(frame, _)| *frame))
-    }
-
-    pub fn previous(&self, frame: usize, start: usize, end: usize) -> Option<usize> {
-        self.0
-            .range(start..frame)
-            .next_back()
-            .map(|(frame, _)| *frame)
-            .or_else(|| {
-                self.0
-                    .range((frame.saturating_add(1))..=end)
-                    .next_back()
-                    .map(|(frame, _)| *frame)
-            })
-    }
-}
 
 #[derive(Clone, Debug)]
 pub struct TimelineState {
@@ -168,16 +115,20 @@ pub fn show(
     }
 
     paint_ticks(ui, plot, recording, start_frame, selected_frame, state);
-    paint_track(
-        ui,
+    let column_ranges = visible_column_ranges(
         plot,
-        0,
-        "Source images",
         recording,
         start_frame,
         end_frame,
         state,
         state.nominal_frame_duration,
+    );
+    paint_track(
+        ui,
+        plot,
+        0,
+        "Source images",
+        &column_ranges,
         |_| true,
         Color32::from_rgb(70, 115, 155),
     );
@@ -191,12 +142,8 @@ pub fn show(
             plot,
             index + 1,
             &run.label,
-            recording,
-            start_frame,
-            end_frame,
-            state,
-            state.nominal_frame_duration,
-            |frame| run.predictions[frame].is_some(),
+            &column_ranges,
+            |range| run.any_available(range),
             run_color(index),
         );
     }
@@ -274,7 +221,7 @@ pub fn show(
                 relative_seconds(recording, start_frame, frame)
             ));
             for run in runs.iter().filter(|run| !hidden_runs.contains(&run.key)) {
-                let available = if run.predictions[frame].is_some() {
+                let available = if run.is_available(frame) {
                     "available"
                 } else {
                     "missing"
@@ -290,18 +237,13 @@ pub fn show(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 fn paint_track(
     ui: &Ui,
     plot: Rect,
     row: usize,
     label: &str,
-    recording: &Recording,
-    start_frame: usize,
-    end_frame: usize,
-    state: &TimelineState,
-    frame_duration: f64,
-    available: impl Fn(usize) -> bool,
+    column_ranges: &[(f32, f32, Option<RangeInclusive<usize>>)],
+    available: impl Fn(RangeInclusive<usize>) -> bool,
     color: Color32,
 ) {
     let top = plot.top() + TICK_HEIGHT + row as f32 * ROW_HEIGHT;
@@ -322,50 +264,75 @@ fn paint_track(
     );
     ui.painter().rect_filled(rect, 0.0, Color32::from_gray(30));
 
-    let frames = recording.frames();
-    let visible = &frames[start_frame..=end_frame];
-    let first_visible = visible
-        .partition_point(|frame| frame.timestamp_nanos as f64 <= state.viewport_start)
-        .saturating_sub(1)
-        + start_frame;
-    let last_visible = visible
-        .partition_point(|frame| frame.timestamp_nanos as f64 <= state.viewport_end)
-        .saturating_add(start_frame)
-        .min(end_frame);
     let mut span = None;
-    for frame in first_visible..=last_visible {
-        if !available(frame) {
+    for (left, right, range) in column_ranges {
+        if !range.clone().is_some_and(&available) {
             if let Some((left, right)) = span.take() {
                 paint_span(ui, rect, left, right, color);
             }
             continue;
         }
-        let start = frames[frame].timestamp_nanos as f64;
-        let next = if frame < end_frame {
-            frames[frame + 1].timestamp_nanos as f64
-        } else {
-            start + frame_duration
-        };
-        // Cap each band at the nominal cadence so dropped source frames remain visible as gaps.
-        let end = next.min(start + frame_duration * 1.1);
-        let left = time_to_x(plot, state, start).clamp(plot.left(), plot.right());
-        let right = time_to_x(plot, state, end).clamp(plot.left(), plot.right());
         if right > left {
             match &mut span {
-                Some((_, span_right)) if left <= *span_right + 0.5 => {
-                    *span_right = span_right.max(right);
+                Some((_, span_right)) if *left <= *span_right + 0.5 => {
+                    *span_right = span_right.max(*right);
                 }
                 Some(_) => {
-                    let (span_left, span_right) = span.replace((left, right)).unwrap();
+                    let (span_left, span_right) = span.replace((*left, *right)).unwrap();
                     paint_span(ui, rect, span_left, span_right, color);
                 }
-                None => span = Some((left, right)),
+                None => span = Some((*left, *right)),
             }
         }
     }
     if let Some((left, right)) = span {
         paint_span(ui, rect, left, right, color);
     }
+}
+
+fn visible_column_ranges(
+    plot: Rect,
+    recording: &Recording,
+    start_frame: usize,
+    end_frame: usize,
+    state: &TimelineState,
+    frame_duration: f64,
+) -> Vec<(f32, f32, Option<RangeInclusive<usize>>)> {
+    let frames = recording.frames();
+    let visible = &frames[start_frame..=end_frame];
+    let columns = plot.width().ceil().max(1.0) as usize;
+    (0..columns)
+        .map(|column| {
+            let left = plot.left() + column as f32;
+            let right = (left + 1.0).min(plot.right());
+            let column_start = x_to_time(plot, state, left);
+            let column_end = x_to_time(plot, state, right);
+            let search_start = column_start - frame_duration * 1.1;
+            let mut first = visible
+                .partition_point(|frame| (frame.timestamp_nanos as f64) < search_start)
+                .saturating_add(start_frame);
+            let last = visible
+                .partition_point(|frame| frame.timestamp_nanos as f64 <= column_end)
+                .saturating_sub(1)
+                .saturating_add(start_frame)
+                .min(end_frame);
+            while first <= last && first <= end_frame {
+                let frame_start = frames[first].timestamp_nanos as f64;
+                let next_start = if first < end_frame {
+                    frames[first + 1].timestamp_nanos as f64
+                } else {
+                    frame_start + frame_duration
+                };
+                let frame_end = next_start.min(frame_start + frame_duration * 1.1);
+                if frame_end >= column_start {
+                    break;
+                }
+                first += 1;
+            }
+            let range = (first <= last && first <= end_frame).then_some(first..=last);
+            (left, right, range)
+        })
+        .collect()
 }
 
 fn paint_span(ui: &Ui, row: Rect, left: f32, right: f32, color: Color32) {
