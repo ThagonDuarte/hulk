@@ -36,6 +36,8 @@ const RECORDED_BASELINE_DIRECTORY: &str = "recorded-baseline";
 const RECORDED_BASELINE_FILE: &str = "manifest.bin";
 const RUN_METADATA_FILE: &str = "run-metadata.bin";
 const RUN_METADATA_LOCK_FILE: &str = ".run-metadata.lock";
+const RUN_KEY_REMAPPINGS_FILE: &str = "run-key-remappings.bin";
+const RUN_KEY_REMAPPINGS_LOCK_FILE: &str = ".run-key-remappings.lock";
 const BOOKMARKS_FILE: &str = "bookmarks.bin";
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -458,6 +460,13 @@ struct RunUiMetadataFile {
     runs: BTreeMap<String, RunUiMetadata>,
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+struct RunKeyRemappingsFile {
+    cache_version: u32,
+    recording_fingerprint: RecordingFingerprint,
+    mappings: BTreeMap<String, String>,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct BookmarkFile {
     cache_version: u32,
@@ -731,9 +740,23 @@ pub fn load_all_runs(
     recording_fingerprint: &RecordingFingerprint,
     total_frame_count: usize,
 ) -> Result<Vec<LoadedPredictionRun>> {
+    let (runs, errors) =
+        load_all_runs_with_errors(cache_directory, recording_fingerprint, total_frame_count)?;
+    for error in errors {
+        tracing::warn!(%error, "skipping invalid detection replay model cache");
+    }
+    Ok(runs)
+}
+
+pub(crate) fn load_all_runs_with_errors(
+    cache_directory: impl AsRef<Path>,
+    recording_fingerprint: &RecordingFingerprint,
+    total_frame_count: usize,
+) -> Result<(Vec<LoadedPredictionRun>, Vec<String>)> {
     let cache_directory = cache_directory.as_ref();
     migrate_legacy_model_runs(cache_directory, recording_fingerprint, total_frame_count)?;
     let mut runs = Vec::new();
+    let mut errors = Vec::new();
     let baseline_directory = recording_cache_directory(cache_directory, recording_fingerprint)?
         .join(RECORDED_BASELINE_DIRECTORY);
     let baseline_path = baseline_directory.join(RECORDED_BASELINE_FILE);
@@ -762,7 +785,7 @@ pub fn load_all_runs(
 
     let model_root = cache_directory.join(MODEL_RUNS_DIRECTORY);
     if !model_root.exists() {
-        return Ok(runs);
+        return Ok((runs, errors));
     }
     let mut directories = fs::read_dir(&model_root)
         .wrap_err_with(|| format!("failed to read {}", model_root.display()))?
@@ -794,15 +817,11 @@ pub fn load_all_runs(
         match load_model_run(&directory, recording_fingerprint, total_frame_count) {
             Ok(Some(run)) => runs.push(run),
             Ok(None) => {}
-            Err(error) => tracing::warn!(
-                path = %directory.display(),
-                ?error,
-                "skipping invalid detection replay model cache"
-            ),
+            Err(error) => errors.push(format!("{}: {error:#}", directory.display())),
         }
     }
 
-    Ok(runs)
+    Ok((runs, errors))
 }
 
 pub fn load_run_ui_metadata(
@@ -958,7 +977,15 @@ fn migrate_legacy_model_runs(
     total_frame_count: usize,
 ) -> Result<()> {
     let root = cache_directory.join(MODEL_RUNS_DIRECTORY);
-    let mut remapped_keys = BTreeMap::new();
+    let recording_directory = recording_cache_directory(cache_directory, recording_fingerprint)?;
+    fs::create_dir_all(&recording_directory)
+        .wrap_err_with(|| format!("failed to create {}", recording_directory.display()))?;
+    let _remapping_lock = lock_file(
+        &recording_directory.join(RUN_KEY_REMAPPINGS_LOCK_FILE),
+        false,
+    )?;
+    let mut remapped_keys =
+        load_pending_run_key_remappings(cache_directory, recording_fingerprint)?;
     let mut directories = if root.exists() {
         fs::read_dir(&root)
             .wrap_err_with(|| format!("failed to read {}", root.display()))?
@@ -970,7 +997,12 @@ fn migrate_legacy_model_runs(
     directories.sort();
     for directory in &directories {
         if directory.join(MIGRATED_MANIFEST_FILE).exists() {
-            match finish_staged_model_migration(&root, directory) {
+            match finish_staged_model_migration(
+                cache_directory,
+                recording_fingerprint,
+                &root,
+                directory,
+            ) {
                 Ok(Some((old_key, new_key))) => {
                     remapped_keys.insert(old_key, new_key);
                 }
@@ -993,8 +1025,13 @@ fn migrate_legacy_model_runs(
     };
     directories.sort();
     for directory in directories {
-        match migrate_legacy_model_run(&root, &directory, recording_fingerprint, total_frame_count)
-        {
+        match migrate_legacy_model_run(
+            cache_directory,
+            &root,
+            &directory,
+            recording_fingerprint,
+            total_frame_count,
+        ) {
             Ok(Some((old_key, new_key))) => {
                 remapped_keys.insert(old_key, new_key);
             }
@@ -1006,15 +1043,15 @@ fn migrate_legacy_model_runs(
             ),
         }
     }
-    if let Err(error) =
-        migrate_legacy_run_ui_metadata(cache_directory, recording_fingerprint, &remapped_keys)
-    {
-        tracing::warn!(?error, "failed to migrate legacy run GUI metadata");
+    match migrate_legacy_run_ui_metadata(cache_directory, recording_fingerprint, &remapped_keys) {
+        Ok(()) => clear_pending_run_key_remappings(cache_directory, recording_fingerprint)?,
+        Err(error) => tracing::warn!(?error, "failed to migrate legacy run GUI metadata"),
     }
     Ok(())
 }
 
 fn migrate_legacy_model_run(
+    cache_directory: &Path,
     root: &Path,
     directory: &Path,
     recording_fingerprint: &RecordingFingerprint,
@@ -1040,8 +1077,33 @@ fn migrate_legacy_model_run(
     }
     let _source_lock = lock_model_run(root, &legacy.run_key, true)?;
     let first_cached_frame = first_cached_frame(directory)?;
-    let (frame_start, frame_end) =
-        recover_legacy_frame_range(&legacy, first_cached_frame, total_frame_count)?;
+    let (frame_start, frame_end) = match recover_legacy_frame_range(
+        &legacy,
+        first_cached_frame,
+        total_frame_count,
+    ) {
+        Ok(range) => range,
+        Err(error) if first_cached_frame.is_none() => {
+            let mut visible = ModelRunManifest::new(
+                legacy.label,
+                legacy.canonical_model_path,
+                legacy.model_hash,
+                legacy.recording_fingerprint,
+                legacy.thresholds,
+                legacy.total_frame_count,
+                0..=total_frame_count - 1,
+            )?;
+            visible.run_key = legacy.run_key;
+            visible.state = ModelRunState::Failed;
+            visible.error = Some(format!(
+                "legacy run range could not be recovered because it contains no cached frames: {error:#}"
+            ));
+            visible.provider_note = legacy.provider_note;
+            write_bincode_atomic(&directory.join(MANIFEST_FILE), &visible)?;
+            return Ok(None);
+        }
+        Err(error) => return Err(error),
+    };
     let mut migrated = ModelRunManifest::new(
         legacy.label,
         legacy.canonical_model_path,
@@ -1074,10 +1136,23 @@ fn migrate_legacy_model_run(
     migrated.provider_note = legacy.provider_note;
 
     let target = root.join(&migrated.run_key);
-    if target != directory && target.exists() {
-        bail!("new model run cache {} already exists", target.display());
-    }
     let _target_lock = lock_model_run(root, &migrated.run_key, true)?;
+    if target != directory && target.exists() {
+        let target_manifest: ModelRunManifest = read_bincode(&target.join(MANIFEST_FILE))?;
+        validate_model_run_manifest(&target_manifest)?;
+        validate_same_run(&target_manifest, &migrated)?;
+        if target_manifest.completed_frame_count >= migrated.completed_frame_count {
+            persist_run_key_remapping(
+                cache_directory,
+                recording_fingerprint,
+                &legacy.run_key,
+                &migrated.run_key,
+            )?;
+            backup_model_run(root, directory)?;
+            return Ok(Some((legacy.run_key, migrated.run_key)));
+        }
+        backup_model_run(root, &target)?;
+    }
     write_bincode_atomic(&directory.join(MIGRATED_MANIFEST_FILE), &migrated)?;
     if target != directory {
         fs::rename(directory, &target).wrap_err_with(|| {
@@ -1089,6 +1164,12 @@ fn migrate_legacy_model_run(
         })?;
         sync_directory(root)?;
     }
+    persist_run_key_remapping(
+        cache_directory,
+        recording_fingerprint,
+        &legacy.run_key,
+        &migrated.run_key,
+    )?;
     fs::rename(
         target.join(MIGRATED_MANIFEST_FILE),
         target.join(MANIFEST_FILE),
@@ -1102,7 +1183,37 @@ fn migrate_legacy_model_run(
     Ok(Some((legacy.run_key, migrated.run_key)))
 }
 
+fn backup_model_run(root: &Path, directory: &Path) -> Result<()> {
+    let backup_root = root.join(".migration-backups");
+    fs::create_dir_all(&backup_root)
+        .wrap_err_with(|| format!("failed to create {}", backup_root.display()))?;
+    let name = directory
+        .file_name()
+        .wrap_err("model run backup source has no file name")?;
+    let mut suffix = 0_usize;
+    let target = loop {
+        let candidate = backup_root.join(format!("{}-{suffix}", name.to_string_lossy()));
+        if !candidate.exists() {
+            break candidate;
+        }
+        suffix = suffix
+            .checked_add(1)
+            .wrap_err("model run backup suffix overflow")?;
+    };
+    fs::rename(directory, &target).wrap_err_with(|| {
+        format!(
+            "failed to preserve colliding model run {} in {}",
+            directory.display(),
+            target.display()
+        )
+    })?;
+    sync_directory(&backup_root)?;
+    sync_directory(root)
+}
+
 fn finish_staged_model_migration(
+    cache_directory: &Path,
+    recording_fingerprint: &RecordingFingerprint,
     root: &Path,
     directory: &Path,
 ) -> Result<Option<(String, String)>> {
@@ -1113,14 +1224,17 @@ fn finish_staged_model_migration(
     let _target_lock = lock_model_run(root, &migrated.run_key, true)?;
     if target != directory {
         if target.exists() {
-            bail!(
-                "staged migration target {} already exists",
-                target.display()
-            );
+            backup_model_run(root, &target)?;
         }
         fs::rename(directory, &target).wrap_err("failed to resume model run migration")?;
         sync_directory(root)?;
     }
+    persist_run_key_remapping(
+        cache_directory,
+        recording_fingerprint,
+        &legacy.run_key,
+        &migrated.run_key,
+    )?;
     fs::rename(
         target.join(MIGRATED_MANIFEST_FILE),
         target.join(MANIFEST_FILE),
@@ -1242,6 +1356,54 @@ fn migrate_legacy_run_ui_metadata(
     write_bincode_atomic(&path, &metadata)
 }
 
+fn load_pending_run_key_remappings(
+    cache_directory: &Path,
+    recording_fingerprint: &RecordingFingerprint,
+) -> Result<BTreeMap<String, String>> {
+    let path = recording_cache_directory(cache_directory, recording_fingerprint)?
+        .join(RUN_KEY_REMAPPINGS_FILE);
+    if !path.exists() {
+        return Ok(BTreeMap::new());
+    }
+    let file: RunKeyRemappingsFile = read_bincode(&path)?;
+    if file.cache_version != CACHE_VERSION || &file.recording_fingerprint != recording_fingerprint {
+        bail!("run key remappings do not match the recording cache");
+    }
+    Ok(file.mappings)
+}
+
+fn persist_run_key_remapping(
+    cache_directory: &Path,
+    recording_fingerprint: &RecordingFingerprint,
+    old_key: &str,
+    new_key: &str,
+) -> Result<()> {
+    let directory = recording_cache_directory(cache_directory, recording_fingerprint)?;
+    let mut mappings = load_pending_run_key_remappings(cache_directory, recording_fingerprint)?;
+    mappings.insert(old_key.to_string(), new_key.to_string());
+    write_bincode_atomic(
+        &directory.join(RUN_KEY_REMAPPINGS_FILE),
+        &RunKeyRemappingsFile {
+            cache_version: CACHE_VERSION,
+            recording_fingerprint: recording_fingerprint.clone(),
+            mappings,
+        },
+    )
+}
+
+fn clear_pending_run_key_remappings(
+    cache_directory: &Path,
+    recording_fingerprint: &RecordingFingerprint,
+) -> Result<()> {
+    let directory = recording_cache_directory(cache_directory, recording_fingerprint)?;
+    let path = directory.join(RUN_KEY_REMAPPINGS_FILE);
+    if path.exists() {
+        fs::remove_file(&path).wrap_err_with(|| format!("failed to remove {}", path.display()))?;
+        sync_directory(&directory)?;
+    }
+    Ok(())
+}
+
 fn load_model_run(
     directory: &Path,
     recording_fingerprint: &RecordingFingerprint,
@@ -1267,10 +1429,14 @@ fn load_model_run(
         bail!("model run cache version does not match");
     }
     let target_count = manifest.target_frame_count()?;
-    let inspection = inspect_model_chunks(directory, &manifest);
+    let active = model_run_is_active(directory, &manifest.run_key)?;
+    let inspection = if active {
+        Ok(())
+    } else {
+        inspect_model_chunks(directory, &manifest)
+    };
     let availability = match inspection {
         Ok(()) => {
-            let active = model_run_is_active(directory, &manifest.run_key)?;
             if manifest.state == ModelRunState::Running && !active
                 || manifest.state == ModelRunState::Complete
                     && manifest.completed_frame_count != target_count
@@ -2241,7 +2407,73 @@ mod tests {
         )
         .unwrap();
 
-        assert!(load_all_runs(cache.path(), &fingerprint, 10).is_ok());
+        let runs = load_all_runs(cache.path(), &fingerprint, 10).unwrap();
+        let run = runs.iter().find(|run| run.key != "recorded").unwrap();
+        assert_eq!(run.manifest.as_ref().unwrap().state, ModelRunState::Failed);
         assert!(old_directory.exists());
+    }
+
+    #[test]
+    fn legacy_collision_preserves_both_caches_and_loads_v2() {
+        let cache = tempfile::tempdir().unwrap();
+        let fingerprint = fingerprint();
+        let thresholds = DetectionThresholds::default();
+        let model_path = PathBuf::from("/tmp/model.onnx");
+        let old_key =
+            legacy_model_run_key(&model_path, &[7; 32], &fingerprint, thresholds, None).unwrap();
+        let old_directory = cache.path().join(MODEL_RUNS_DIRECTORY).join(&old_key);
+        fs::create_dir_all(&old_directory).unwrap();
+        write_bincode_atomic(
+            &old_directory.join(MANIFEST_FILE),
+            &LegacyModelRunManifest {
+                run_key: old_key,
+                label: "legacy".to_string(),
+                canonical_model_path: model_path.clone(),
+                model_hash: [7; 32],
+                recording_fingerprint: fingerprint.clone(),
+                thresholds,
+                total_frame_count: 1,
+                completed_frame_count: 1,
+                cache_version: 1,
+                state: ModelRunState::Complete,
+                error: None,
+                provider_note: None,
+            },
+        )
+        .unwrap();
+        write_bincode_atomic(
+            &chunk_path(&old_directory, 0),
+            &PredictionChunk {
+                start_frame: 0,
+                predictions: vec![prediction(0)],
+            },
+        )
+        .unwrap();
+        let proposed = ModelRunManifest::new(
+            "current".to_string(),
+            model_path,
+            [7; 32],
+            fingerprint.clone(),
+            thresholds,
+            1,
+            0..=0,
+        )
+        .unwrap();
+        let current_key = proposed.run_key.clone();
+        let mut store = PredictionStore::open(cache.path(), proposed).unwrap();
+        store.begin("WebGPU required").unwrap();
+        store.append(prediction(0)).unwrap();
+        store.finish().unwrap();
+        drop(store);
+
+        let runs = load_all_runs(cache.path(), &fingerprint, 1).unwrap();
+        assert!(runs.iter().any(|run| run.key == current_key));
+        assert!(
+            cache
+                .path()
+                .join(MODEL_RUNS_DIRECTORY)
+                .join(".migration-backups")
+                .exists()
+        );
     }
 }

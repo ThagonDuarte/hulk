@@ -92,6 +92,8 @@ where
         config.start_frame..=frame_end,
     )?;
     let frame_count = proposed.target_frame_count()?;
+    // Migrate matching legacy cache keys before creating a potentially colliding v2 run.
+    recording.load_runs()?;
     let mut store = PredictionStore::open(cache_directory, proposed)?;
 
     let target_frames =
