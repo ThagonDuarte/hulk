@@ -20,10 +20,10 @@ pub const VISUAL_REFEREE_KEYPOINT_INDEX_MASK: [usize; 8] = [5, 6, 7, 8, 9, 10, 1
 pub const NUMBER_OF_VALUES_PER_POSE: usize = 57;
 pub const POSE_KEYPOINT_OFFSET: usize = NUMBER_OF_VALUES_PER_OBJECT;
 pub const POSE_SKELETON_EDGES: [(usize, usize); 16] = [
-    (0, 1),
-    (0, 2),
-    (1, 3),
-    (2, 4),
+    (2, 0),
+    (2, 1),
+    (0, 3),
+    (1, 4),
     (5, 6),
     (5, 11),
     (6, 12),
