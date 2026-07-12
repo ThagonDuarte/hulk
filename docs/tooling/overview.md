@@ -4,6 +4,7 @@ Apart from the NAO code our repository contains several tools to aid in the deve
 
 - [Pepsi](./pepsi.md): A multi-tool to automate repetitive tasks like compiling and deployment
 - [Twix](./twix.md): The ROS-Z debugging UI
+- [Detection Replay](./detection_replay.md): Prerender and compare detection models on ROS-Z MCAP recordings
 - [Depp](./depp.md): TODO: Irgendwas mit dependencies
 - [Fanta](./fanta.md): TODO: Irgendwas mit live data auf der CLI
 - [Machine Learning](./machine-learning.md): Our tooling to create datasets and neural networks

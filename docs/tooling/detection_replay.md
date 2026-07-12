@@ -10,7 +10,7 @@ Build the random-access JPEG proxy and import any recorded `detected_objects` me
 ./detection-replay index /path/to/recording.mcap
 ```
 
-The source MCAP is opened read-only. A recording that ends in an incomplete final chunk remains usable: complete chunks are indexed and the damaged tail is reported. The tool supports `inputs/left_image` and `inputs/stereo_image_pair` recordings.
+The source MCAP is opened read-only. A recording that ends in an incomplete final chunk remains usable: complete chunks are indexed and the damaged tail is reported. The tool supports `inputs/left_image` and `inputs/stereo_image_pair` recordings. Prerender resumes seek through the MCAP chunk index when a summary is available; damaged or unindexed recordings keep a direct-seek CDR copy of original images in the cache.
 
 By default the cache is written next to the recording as `recording.detection-replay-cache`. Use `--cache-dir` to put it elsewhere.
 
@@ -31,9 +31,11 @@ Each input frame is published only after the preceding result has been received.
 
 Use `--limit 10` for a short provider/model compatibility check. The default confidence threshold is `0.05` and the default NMS IoU is `0.4`; use `--confidence` and `--iou` to change them. Thresholds and the model hash are part of the cache identity.
 
-Models must accept the production `raw_bytes_input` NV12 tensor and expose `object_output` with shape `[1, 300, 6]`. `pose_output` is optional; object-only models publish an empty timestamp-matched pose result.
+Models must accept `raw_bytes_input` as a rank-three `uint8` tensor with shape `[height / 2, width / 2, 6]`. Its contiguous bytes are the full-resolution NV12 Y plane followed by the half-height interleaved UV plane; image width and height must be multiples of 32.
 
-The desktop build requires successful ONNX Runtime WebGPU registration. The wrapper prevents a CPU-only system ONNX Runtime discovered through `pkg-config` from overriding the WebGPU runtime. Operators unsupported by WebGPU may still use ORT's CPU fallback. Robot builds retain the provider order TensorRT, CUDA, WebGPU, CPU.
+`object_output` is mandatory and must be a `float32` tensor with shape `[1, 300, 6]`. Each row is `[x_min, y_min, x_max, y_max, confidence, class_index]`. `pose_output` is optional and, when present, must be `float32 [1, 300, 57]`: the same six object values followed by 17 `(x, y, confidence)` triples. Object-only models still publish an empty timestamp-matched pose result on ROS-Z; replay stores model capability separately so it can distinguish unavailable poses from a valid empty pose result.
+
+The desktop replay build bundles the x86-64 ONNX Runtime 1.22 WebGPU distribution and Dawn. The wrapper prevents a CPU-only system runtime discovered through `pkg-config` from overriding it. Operators unsupported by WebGPU may still use ORT's CPU fallback. Robot builds dynamically load the runtime image and retain the provider order TensorRT, CUDA, WebGPU, then implicit CPU; WebGPU registration succeeds there only when that runtime image provides it.
 
 ## Viewing
 
@@ -41,9 +43,9 @@ The desktop build requires successful ONNX Runtime WebGPU registration. The wrap
 ./detection-replay view /path/to/recording.mcap --start-frame 5000 --end-frame 5500
 ```
 
-The viewer opens the timeline, model controls, and every model viewport as tabs in one central dock node. Tabs can be reordered, detached, closed, and reopened from the top-bar `View` menu. Model viewports remain synchronized and share pan and zoom.
+The viewer initially opens model controls and model viewports as tabs in the upper dock, with the timeline in a lower dock. Tabs can be moved between dock nodes, reordered, detached, closed, and reopened from the top-bar `View` menu. Model viewports remain synchronized and share pan and zoom.
 
-The timestamp-proportional timeline shows source capture gaps and prediction availability for every run. Drag to scrub, scroll to zoom around the pointer, Shift+scroll to pan, and double-click to reset to the selected CLI frame range. Press `B` to toggle a bookmark and Page Up/Page Down to visit bookmarks; bookmarks are persisted per recording.
+The timestamp-proportional timeline shows source capture gaps and prediction availability for every run. Drag to scrub, scroll to zoom around the pointer, Shift+scroll to pan, and double-click to reset to the selected CLI frame range. Press `B` to toggle a bookmark and Page Up/Page Down to visit bookmarks; bookmarks are persisted in the recording-specific cache and persistence failures are shown in Models.
 
 The Models tab manages cached runs. Model runs can be renamed, hidden, or permanently deleted after confirming the `Are you sure?` dialog. Renames and hidden state persist in recording-specific cache metadata. Hidden runs are removed from the timeline, viewport tabs, and `View` menu but remain in Models for unhiding. The source-derived Recorded baseline can be hidden but cannot be renamed or deleted.
 

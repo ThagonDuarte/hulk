@@ -19,7 +19,7 @@ class TaskType(Enum):
         return self.value
 
     def output_specs(self) -> list[tuple[str, dict[int, str]]]:
-        base = (f"{self.value}_output", {0: "batch_size", 2: "num_predictions"})
+        base = (f"{self.value}_output", {0: "batch_size", 1: "num_predictions"})
         if self == TaskType.SEGMENTATION:
             return [base, (f"{self.value}_proto", {0: "batch_size"})]
         return [base]
