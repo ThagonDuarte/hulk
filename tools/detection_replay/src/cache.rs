@@ -279,7 +279,7 @@ impl PredictionAvailability {
     }
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct LoadedPredictionRun {
     pub key: String,
     pub label: String,
@@ -287,11 +287,11 @@ pub struct LoadedPredictionRun {
     pub manifest: Option<ModelRunManifest>,
     pub availability: PredictionAvailability,
     storage: PredictionStorage,
-    cached_chunk: Mutex<Option<CachedPredictionChunk>>,
-    failed_chunks: Mutex<BTreeMap<usize, String>>,
+    cached_chunk: Arc<Mutex<Option<CachedPredictionChunk>>>,
+    failed_chunks: Arc<Mutex<BTreeMap<usize, String>>>,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 enum PredictionStorage {
     RecordedBaseline {
         directory: PathBuf,
@@ -422,10 +422,14 @@ impl BookmarkCollection {
     }
 
     pub fn next(&self, frame: usize, start: usize, end: usize) -> Option<usize> {
-        self.0
-            .range(frame.saturating_add(1)..=end)
-            .next()
-            .map(|(frame, _)| *frame)
+        (frame < end)
+            .then(|| {
+                self.0
+                    .range(frame + 1..=end)
+                    .next()
+                    .map(|(frame, _)| *frame)
+            })
+            .flatten()
             .or_else(|| self.0.range(start..frame).next().map(|(frame, _)| *frame))
     }
 
@@ -435,10 +439,14 @@ impl BookmarkCollection {
             .next_back()
             .map(|(frame, _)| *frame)
             .or_else(|| {
-                self.0
-                    .range(frame.saturating_add(1)..=end)
-                    .next_back()
-                    .map(|(frame, _)| *frame)
+                (frame < end)
+                    .then(|| {
+                        self.0
+                            .range(frame + 1..=end)
+                            .next_back()
+                            .map(|(frame, _)| *frame)
+                    })
+                    .flatten()
             })
     }
 }
@@ -469,6 +477,12 @@ pub struct RecordedBaseline {
 struct RecordedBaselineChunk {
     start_frame: usize,
     predictions: Vec<Option<Prediction>>,
+}
+
+#[derive(Serialize)]
+struct RecordedBaselineChunkRef<'a> {
+    start_frame: usize,
+    predictions: &'a [Option<Prediction>],
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -507,7 +521,7 @@ impl PredictionStore {
         let root = cache_directory.as_ref().join(MODEL_RUNS_DIRECTORY);
         fs::create_dir_all(&root)
             .wrap_err_with(|| format!("failed to create {}", root.display()))?;
-        let lock_file = lock_model_run(&root, &proposed.run_key, false)?;
+        let lock_file = lock_model_run(&root, &proposed.run_key, true)?;
         let run_directory = root.join(&proposed.run_key);
         fs::create_dir_all(&run_directory)
             .wrap_err_with(|| format!("failed to create {}", run_directory.display()))?;
@@ -515,6 +529,7 @@ impl PredictionStore {
 
         let mut manifest = if manifest_path.exists() {
             let existing: ModelRunManifest = read_bincode(&manifest_path)?;
+            validate_model_run_manifest(&existing)?;
             validate_same_run(&existing, &proposed)?;
             ModelRunManifest {
                 label: proposed.label.clone(),
@@ -694,9 +709,9 @@ pub fn save_recorded_baseline(
     for (index, chunk) in predictions.chunks(PREDICTION_CHUNK_SIZE).enumerate() {
         write_bincode_atomic(
             &baseline_chunk_path(&directory, index),
-            &RecordedBaselineChunk {
+            &RecordedBaselineChunkRef {
                 start_frame: index * PREDICTION_CHUNK_SIZE,
-                predictions: chunk.to_vec(),
+                predictions: chunk,
             },
         )?;
     }
@@ -740,8 +755,8 @@ pub fn load_all_runs(
                 directory: baseline_directory,
                 total_frame_count,
             },
-            cached_chunk: Mutex::new(None),
-            failed_chunks: Mutex::new(BTreeMap::new()),
+            cached_chunk: Arc::new(Mutex::new(None)),
+            failed_chunks: Arc::new(Mutex::new(BTreeMap::new())),
         });
     }
 
@@ -1053,6 +1068,9 @@ fn migrate_legacy_model_run(
         _ => ModelRunState::Incomplete,
     };
     migrated.error = legacy.error;
+    if migrated.state == ModelRunState::Failed && migrated.error.is_none() {
+        migrated.error = Some("legacy model run failed without diagnostic details".to_string());
+    }
     migrated.provider_note = legacy.provider_note;
 
     let target = root.join(&migrated.run_key);
@@ -1230,6 +1248,7 @@ fn load_model_run(
     total_frame_count: usize,
 ) -> Result<Option<LoadedPredictionRun>> {
     let mut manifest: ModelRunManifest = read_bincode(&directory.join(MANIFEST_FILE))?;
+    validate_model_run_manifest(&manifest)?;
     if directory.file_name().and_then(|name| name.to_str()) != Some(&manifest.run_key) {
         bail!("model run directory name does not match its manifest key");
     }
@@ -1280,8 +1299,8 @@ fn load_model_run(
             directory: directory.to_path_buf(),
             frame_start,
         },
-        cached_chunk: Mutex::new(None),
-        failed_chunks: Mutex::new(BTreeMap::new()),
+        cached_chunk: Arc::new(Mutex::new(None)),
+        failed_chunks: Arc::new(Mutex::new(BTreeMap::new())),
     }))
 }
 
@@ -1477,6 +1496,22 @@ fn validate_same_run(existing: &ModelRunManifest, proposed: &ModelRunManifest) -
     Ok(())
 }
 
+fn validate_model_run_manifest(manifest: &ModelRunManifest) -> Result<()> {
+    let target_count = manifest.target_frame_count()?;
+    if manifest.cache_version != CACHE_VERSION
+        || manifest.completed_frame_count > target_count
+        || manifest.thresholds.validate()? != manifest.thresholds
+    {
+        bail!("model run manifest contains invalid values");
+    }
+    match (manifest.state, manifest.error.as_deref()) {
+        (ModelRunState::Failed, Some(error)) if !error.is_empty() => Ok(()),
+        (ModelRunState::Failed, _) => bail!("failed model run manifest has no error"),
+        (_, Some(_)) => bail!("non-failed model run manifest contains a stale error"),
+        (_, None) => Ok(()),
+    }
+}
+
 fn validate_frame_range(
     frame_start: usize,
     frame_end: usize,
@@ -1620,27 +1655,6 @@ fn inspect_model_chunks(directory: &Path, manifest: &ModelRunManifest) -> Result
         if length == 0 || length > MAX_CACHE_FILE_BYTES {
             bail!(
                 "prediction chunk {} has an invalid file size",
-                path.display()
-            );
-        }
-        let chunk: PredictionChunk = read_bincode(&path)?;
-        let relative_start = chunk_index
-            .checked_mul(PREDICTION_CHUNK_SIZE)
-            .wrap_err("prediction chunk index overflow")?;
-        let expected_start = manifest
-            .frame_start
-            .checked_add(relative_start)
-            .wrap_err("prediction chunk start overflow")?;
-        let is_final = position + 1 == expected_chunks;
-        validate_model_chunk(&path, &chunk, expected_start, is_final)?;
-        let expected_length = if is_final {
-            manifest.completed_frame_count - relative_start
-        } else {
-            PREDICTION_CHUNK_SIZE
-        };
-        if chunk.predictions.len() != expected_length {
-            bail!(
-                "prediction chunk {} disagrees with the manifest",
                 path.display()
             );
         }
@@ -2068,8 +2082,8 @@ mod tests {
             .iter()
             .find(|run| run.source == PredictionSource::Model)
             .unwrap();
-        assert_eq!(run.manifest.as_ref().unwrap().state, ModelRunState::Failed);
-        assert!(run.prediction(0).unwrap().is_none());
+        assert!(run.prediction(0).is_err());
+        assert!(run.prediction(0).is_err());
     }
 
     #[test]

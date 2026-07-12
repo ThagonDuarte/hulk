@@ -1,7 +1,7 @@
 use std::{
     borrow::Cow,
     collections::{BTreeMap, HashMap},
-    fs::{self, File},
+    fs::{self, File, OpenOptions},
     io::{Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     sync::Arc,
@@ -43,6 +43,7 @@ use crate::cache::{
 const RECORDING_INDEX_FILE: &str = "index.bin";
 const PROXY_FILE: &str = "frames.jpg";
 const ORIGINAL_FRAMES_FILE: &str = "original-frames.cdr";
+const RECORDING_LOCK_FILE: &str = ".recording.lock";
 const JPEG_QUALITY: u8 = 85;
 const MAX_MCAP_RECORD_BYTES: usize = 512 * 1024 * 1024;
 const IMAGE_CACHE_OVERHEAD_BYTES: usize = 1024 * 1024;
@@ -157,7 +158,14 @@ pub struct OriginalFrame {
     pub image: Image,
 }
 
+pub struct ProxyFrameReader {
+    file: File,
+    frames: Arc<RecordingCacheIndex>,
+    bytes: Vec<u8>,
+}
+
 pub struct Recording {
+    _cache_lock: File,
     cache_directory: PathBuf,
     recording_cache_directory: PathBuf,
     index: Arc<RecordingCacheIndex>,
@@ -189,49 +197,81 @@ impl Recording {
         let original_frames_path = recording_cache_directory.join(ORIGINAL_FRAMES_FILE);
         let baseline_path = recorded_baseline_path(&cache_directory, &fingerprint)?;
         let legacy_baseline_path = recording_cache_directory.join("recorded-baseline.bin");
-        let index = if index_path.exists()
-            && proxy_path.exists()
-            && (baseline_path.exists() || legacy_baseline_path.exists())
-        {
-            let load_current = || -> Result<RecordingCacheIndex> {
-                let index: RecordingCacheIndex = read_bincode(&index_path)?;
-                validate_cached_index(&index, &fingerprint, &proxy_path, &original_frames_path)?;
-                let baseline: RecordedBaseline = read_bincode(&baseline_path)?;
-                validate_cached_baseline(
-                    baseline_path
-                        .parent()
-                        .wrap_err("baseline path has no parent")?,
-                    &baseline,
-                    &fingerprint,
-                    &index.frames,
-                )?;
-                Ok(index)
-            };
-            match load_current().or_else(|current_error| {
-                migrate_legacy_recording_cache(
-                    &fingerprint,
-                    &cache_directory,
-                    &recording_cache_directory,
-                    &index_path,
-                    &proxy_path,
-                    &legacy_baseline_path,
-                )
-                .wrap_err_with(|| format!("current cache is invalid: {current_error:#}"))
-            }) {
-                Ok(index) => index,
-                Err(error) => {
-                    tracing::warn!(
-                        ?error,
-                        "rebuilding invalid detection replay recording cache"
-                    );
-                    build_cache(&fingerprint, &cache_directory, &recording_cache_directory)?
-                }
+        let cache_lock_path = recording_cache_directory.join(RECORDING_LOCK_FILE);
+        let cache_lock = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&cache_lock_path)
+            .wrap_err_with(|| format!("failed to open {}", cache_lock_path.display()))?;
+        let load_current = || -> Result<RecordingCacheIndex> {
+            if !index_path.exists() || !proxy_path.exists() || !baseline_path.exists() {
+                bail!("recording cache is incomplete");
             }
-        } else {
-            build_cache(&fingerprint, &cache_directory, &recording_cache_directory)?
+            let index: RecordingCacheIndex = read_bincode(&index_path)?;
+            validate_cached_index(&index, &fingerprint, &proxy_path, &original_frames_path)?;
+            let baseline: RecordedBaseline = read_bincode(&baseline_path)?;
+            validate_cached_baseline(
+                baseline_path
+                    .parent()
+                    .wrap_err("baseline path has no parent")?,
+                &baseline,
+                &fingerprint,
+                &index.frames,
+            )?;
+            Ok(index)
+        };
+        cache_lock
+            .lock_shared()
+            .wrap_err("failed to lock recording cache for reading")?;
+        let index = match load_current() {
+            Ok(index) => index,
+            Err(initial_error) => {
+                cache_lock
+                    .unlock()
+                    .wrap_err("failed to release recording cache read lock")?;
+                cache_lock
+                    .lock()
+                    .wrap_err("failed to lock recording cache for rebuilding")?;
+                let index = match load_current().or_else(|current_error| {
+                    let migration_error = format!(
+                        "initial cache validation failed: {initial_error:#}; exclusive validation failed: {current_error:#}"
+                    );
+                    if !legacy_baseline_path.exists() {
+                        bail!("{migration_error}");
+                    }
+                    migrate_legacy_recording_cache(
+                        &fingerprint,
+                        &cache_directory,
+                        &recording_cache_directory,
+                        &index_path,
+                        &proxy_path,
+                        &legacy_baseline_path,
+                    )
+                    .wrap_err(migration_error)
+                }) {
+                    Ok(index) => index,
+                    Err(error) => {
+                        tracing::warn!(
+                            ?error,
+                            "rebuilding invalid detection replay recording cache"
+                        );
+                        build_cache(&fingerprint, &cache_directory, &recording_cache_directory)?
+                    }
+                };
+                cache_lock
+                    .unlock()
+                    .wrap_err("failed to release recording cache rebuild lock")?;
+                cache_lock
+                    .lock_shared()
+                    .wrap_err("failed to lock rebuilt recording cache for reading")?;
+                index
+            }
         };
 
         Ok(Self {
+            _cache_lock: cache_lock,
             cache_directory,
             recording_cache_directory,
             index: Arc::new(index),
@@ -259,28 +299,17 @@ impl Recording {
     }
 
     pub fn load_proxy_frame(&self, frame_index: usize) -> Result<RgbImage> {
-        let entry = self
-            .index
-            .frames
-            .get(frame_index)
-            .wrap_err_with(|| format!("proxy frame {frame_index} is out of range"))?;
-        let length = usize::try_from(entry.byte_length)
-            .wrap_err("proxy JPEG is too large for this platform")?;
-        let mut bytes = vec![0; length];
+        self.proxy_frame_reader()?.load(frame_index)
+    }
+
+    pub fn proxy_frame_reader(&self) -> Result<ProxyFrameReader> {
         let proxy_path = self.recording_cache_directory.join(PROXY_FILE);
-        let mut file = File::open(&proxy_path)
-            .wrap_err_with(|| format!("failed to open {}", proxy_path.display()))?;
-        file.seek(SeekFrom::Start(entry.byte_offset))
-            .wrap_err_with(|| format!("failed to seek {}", proxy_path.display()))?;
-        file.read_exact(&mut bytes)
-            .wrap_err_with(|| format!("failed to read proxy frame {frame_index}"))?;
-        let image = image::load_from_memory_with_format(&bytes, image::ImageFormat::Jpeg)
-            .wrap_err_with(|| format!("failed to decode proxy frame {frame_index}"))?
-            .to_rgb8();
-        if image.width() != entry.width || image.height() != entry.height {
-            bail!("proxy frame {frame_index} dimensions do not match its index");
-        }
-        Ok(image)
+        Ok(ProxyFrameReader {
+            file: File::open(&proxy_path)
+                .wrap_err_with(|| format!("failed to open {}", proxy_path.display()))?,
+            frames: Arc::clone(&self.index),
+            bytes: Vec::new(),
+        })
     }
 
     pub fn original_images(&self, skip: usize, take: Option<usize>) -> Result<OriginalImageStream> {
@@ -397,6 +426,32 @@ impl Recording {
         run_key: &str,
     ) -> Result<BTreeMap<String, crate::cache::RunUiMetadata>> {
         crate::cache::remove_run_ui_metadata(&self.cache_directory, self.fingerprint(), run_key)
+    }
+}
+
+impl ProxyFrameReader {
+    pub fn load(&mut self, frame_index: usize) -> Result<RgbImage> {
+        let entry = self
+            .frames
+            .frames
+            .get(frame_index)
+            .wrap_err_with(|| format!("proxy frame {frame_index} is out of range"))?;
+        let length = usize::try_from(entry.byte_length)
+            .wrap_err("proxy JPEG is too large for this platform")?;
+        self.bytes.resize(length, 0);
+        self.file
+            .seek(SeekFrom::Start(entry.byte_offset))
+            .wrap_err("failed to seek proxy frame cache")?;
+        self.file
+            .read_exact(&mut self.bytes)
+            .wrap_err_with(|| format!("failed to read proxy frame {frame_index}"))?;
+        let image = image::load_from_memory_with_format(&self.bytes, image::ImageFormat::Jpeg)
+            .wrap_err_with(|| format!("failed to decode proxy frame {frame_index}"))?
+            .to_rgb8();
+        if image.width() != entry.width || image.height() != entry.height {
+            bail!("proxy frame {frame_index} dimensions do not match its index");
+        }
+        Ok(image)
     }
 }
 
@@ -556,10 +611,10 @@ fn build_cache(
     })?;
     let has_chunk_index = load_summary(&fingerprint.canonical_path)?
         .is_some_and(|summary| !summary.chunk_indexes.is_empty());
-    let mut original_frames = Some(
-        NamedTempFile::new_in(recording_cache_directory)
-            .wrap_err("failed to create original-frame cache")?,
-    );
+    let mut original_frames = (!has_chunk_index)
+        .then(|| NamedTempFile::new_in(recording_cache_directory))
+        .transpose()
+        .wrap_err("failed to create original-frame cache")?;
     let mut frames = Vec::new();
     let mut active_image_topic = None;
     let mut recorded_objects = BTreeMap::new();
@@ -686,20 +741,16 @@ fn build_cache(
         OriginalImageSource::CachedCdr
     };
     if original_image_source == OriginalImageSource::CachedCdr {
-        let mut original_frames = original_frames
-            .take()
-            .wrap_err("original-frame cache was not created")?;
-        original_frames
-            .flush()
-            .wrap_err("failed to flush original-frame cache")?;
-        original_frames
-            .as_file_mut()
-            .sync_all()
-            .wrap_err("failed to sync original-frame cache")?;
-        original_frames
-            .persist(recording_cache_directory.join(ORIGINAL_FRAMES_FILE))
-            .map_err(|error| error.error)
-            .wrap_err("failed to atomically replace original-frame cache")?;
+        if let Some(original_frames) = original_frames.take() {
+            persist_original_frame_cache(original_frames, recording_cache_directory)?;
+        } else {
+            build_original_frame_cache(
+                &fingerprint.canonical_path,
+                image_topic,
+                &mut frames,
+                recording_cache_directory,
+            )?;
+        }
     } else {
         drop(original_frames);
         let stale = recording_cache_directory.join(ORIGINAL_FRAMES_FILE);
@@ -738,6 +789,73 @@ fn build_cache(
         &index,
     )?;
     Ok(index)
+}
+
+fn persist_original_frame_cache(
+    mut original_frames: NamedTempFile,
+    recording_cache_directory: &Path,
+) -> Result<()> {
+    original_frames
+        .flush()
+        .wrap_err("failed to flush original-frame cache")?;
+    original_frames
+        .as_file_mut()
+        .sync_all()
+        .wrap_err("failed to sync original-frame cache")?;
+    original_frames
+        .persist(recording_cache_directory.join(ORIGINAL_FRAMES_FILE))
+        .map_err(|error| error.error)
+        .wrap_err("failed to atomically replace original-frame cache")?;
+    Ok(())
+}
+
+fn build_original_frame_cache(
+    path: &Path,
+    image_topic: ImageTopic,
+    expected_frames: &mut [FrameIndexEntry],
+    recording_cache_directory: &Path,
+) -> Result<()> {
+    let mut cache = NamedTempFile::new_in(recording_cache_directory)
+        .wrap_err("failed to create original-frame cache")?;
+    let mut frame_index = 0;
+    let mut offset = 0_u64;
+    scan_messages(path, |message| {
+        if message.channel.topic != image_topic.name() {
+            return Ok(ScanControl::Continue);
+        }
+        let expected = expected_frames
+            .get_mut(frame_index)
+            .wrap_err("recording contains more source images than its index")?;
+        if message.sequence != expected.source_sequence
+            || message.log_time != expected.source_log_time
+            || message.publish_time != expected.source_publish_time
+            || blake3::hash(message.data.as_ref()).as_bytes() != &expected.source_data_hash
+        {
+            bail!("source image {frame_index} changed while building its cache");
+        }
+        let image = decode_image_data(message, image_topic)?;
+        let bytes = SerdeCdrCodec::<Image>::serialize(&image)
+            .wrap_err_with(|| format!("failed to encode original frame {frame_index}"))?;
+        cache
+            .write_all(&bytes)
+            .wrap_err("failed to append original image data")?;
+        let length = u64::try_from(bytes.len()).wrap_err("original frame length overflow")?;
+        expected.source_byte_offset = Some(offset);
+        expected.source_byte_length = Some(length);
+        offset = offset
+            .checked_add(length)
+            .wrap_err("original frame cache length overflow")?;
+        frame_index += 1;
+        Ok(if frame_index == expected_frames.len() {
+            ScanControl::Stop
+        } else {
+            ScanControl::Continue
+        })
+    })?;
+    if frame_index != expected_frames.len() {
+        bail!("recording ended before the original-frame cache was complete");
+    }
+    persist_original_frame_cache(cache, recording_cache_directory)
 }
 
 fn scan_linear_original_images(
