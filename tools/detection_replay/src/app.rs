@@ -20,7 +20,7 @@ use eframe::{
 use egui_dock::{DockArea, DockState, Node, Split, TabViewer};
 use types::{
     object_detection::{Object, RobocupObjectLabel, YOLOObjectLabel},
-    pose_detection::{Keypoint, Pose},
+    pose_detection::{Keypoint, POSE_SKELETON_EDGES, Pose},
 };
 
 use crate::timeline::TimelineState;
@@ -28,24 +28,6 @@ use crate::timeline::TimelineState;
 const MIN_ZOOM: f32 = 1.0;
 const MAX_ZOOM: f32 = 20.0;
 const PREFETCH_FRAMES: usize = 12;
-const POSE_SKELETON_KEYPOINT_LINE_MAPPING: [(usize, usize); 16] = [
-    (0, 1),
-    (0, 2),
-    (1, 3),
-    (2, 4),
-    (5, 6),
-    (5, 11),
-    (6, 12),
-    (11, 12),
-    (5, 7),
-    (6, 8),
-    (7, 9),
-    (8, 10),
-    (11, 13),
-    (12, 14),
-    (13, 15),
-    (14, 16),
-];
 
 pub fn run(recording: Recording, start_frame: usize, end_frame: usize) -> Result<()> {
     let mut runs = recording.load_runs()?;
@@ -76,11 +58,23 @@ pub fn run(recording: Recording, start_frame: usize, end_frame: usize) -> Result
             run.label.clone_from(label);
         }
     }
+    tracing::info!(
+        cached_runs = runs.len(),
+        hidden_runs = runs
+            .iter()
+            .filter(|run| run_metadata.get(&run.key).is_some_and(|metadata| metadata.hidden))
+            .count(),
+        "loaded detection replay runs"
+    );
     let recording = Arc::new(recording);
-    let startup_errors = [metadata_error.clone(), bookmark_error]
-        .into_iter()
-        .flatten()
-        .collect::<Vec<_>>();
+    let startup_errors = [
+        metadata_error.clone(),
+        bookmark_error,
+        recording.index().tail_warning.clone(),
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>();
     eframe::run_native(
         "Detection Replay",
         NativeOptions {
@@ -116,11 +110,13 @@ pub fn run(recording: Recording, start_frame: usize, end_frame: usize) -> Result
                     .map_err(|error| -> Box<dyn std::error::Error + Send + Sync> {
                         error.into()
                     })?;
+            let prediction_loader = PredictionLoader::new(creation_context.egui_ctx.clone())?;
             Ok(Box::new(ReplayApp::new(
                 creation_context,
                 recording,
                 runs,
                 loader,
+                prediction_loader,
                 start_frame,
                 end_frame,
                 run_metadata,
@@ -143,6 +139,8 @@ struct ReplayApp {
     texture: Option<TextureHandle>,
     decoded_frames: BTreeMap<usize, ColorImage>,
     loader: FrameLoader,
+    prediction_loader: PredictionLoader,
+    loaded_predictions: BTreeMap<(String, usize), Option<Arc<Prediction>>>,
     load_error: Option<String>,
     is_playing: bool,
     loop_playback: bool,
@@ -189,6 +187,7 @@ impl ReplayApp {
         recording: Arc<Recording>,
         runs: Vec<LoadedPredictionRun>,
         mut loader: FrameLoader,
+        prediction_loader: PredictionLoader,
         start_frame: usize,
         end_frame: usize,
         run_metadata: BTreeMap<String, RunUiMetadata>,
@@ -249,6 +248,8 @@ impl ReplayApp {
             texture: None,
             decoded_frames: BTreeMap::new(),
             loader,
+            prediction_loader,
+            loaded_predictions: BTreeMap::new(),
             load_error: None,
             is_playing: false,
             loop_playback: true,
@@ -295,13 +296,45 @@ impl ReplayApp {
         }
         self.display_selected_frame(context);
         let retain_from = self.selected_frame.saturating_sub(1);
+        let retain_through = self
+            .selected_frame
+            .saturating_add(PREFETCH_FRAMES)
+            .min(self.end_frame);
         self.decoded_frames
-            .retain(|frame, _| *frame >= retain_from && *frame <= self.end_frame);
+            .retain(|frame, _| *frame >= retain_from && *frame <= retain_through);
         if self.displayed_frame != Some(self.selected_frame)
             && !self.decoded_frames.contains_key(&self.selected_frame)
         {
             self.loader.request(self.selected_frame, self.end_frame);
         }
+    }
+
+    fn poll_prediction_loader(&mut self) {
+        while let Some(result) = self.prediction_loader.try_receive() {
+            let key = (result.run_key.clone(), result.frame);
+            match result.prediction {
+                Ok(prediction) => {
+                    self.loaded_predictions.insert(key, prediction);
+                }
+                Err(error) => {
+                    self.loaded_predictions.insert(key, None);
+                    self.prediction_errors.insert(
+                        result.run_key,
+                        format!(
+                            "failed to load prediction for frame {}: {error}",
+                            result.frame
+                        ),
+                    );
+                }
+            }
+        }
+        let retain_from = self.selected_frame.saturating_sub(1);
+        let retain_through = self
+            .selected_frame
+            .saturating_add(PREFETCH_FRAMES)
+            .min(self.end_frame);
+        self.loaded_predictions
+            .retain(|(_, frame), _| retain_from <= *frame && *frame <= retain_through);
     }
 
     fn display_selected_frame(&mut self, context: &egui::Context) {
@@ -581,6 +614,16 @@ impl ReplayApp {
                     .small()
                     .color(Color32::GRAY),
             );
+            if let Some(error) = run
+                .manifest
+                .as_ref()
+                .filter(|manifest| manifest.state == ModelRunState::Failed)
+                .and_then(|manifest| manifest.error.as_deref())
+            {
+                ui.collapsing("Failure details", |ui| {
+                    ui.add(egui::Label::new(error).selectable(true));
+                });
+            }
             ui.add_space(6.0);
         }
         if self.runs.is_empty() {
@@ -788,7 +831,6 @@ impl ReplayApp {
             ui.colored_label(Color32::LIGHT_RED, error);
         }
         let run_key = self.runs[run_index].key.clone();
-        let had_prediction_error = self.prediction_errors.contains_key(&run_key);
         if let Some(error) = self.prediction_errors.get(&run_key) {
             ui.colored_label(Color32::LIGHT_RED, error);
         }
@@ -799,18 +841,22 @@ impl ReplayApp {
         let Some(frame_index) = self.displayed_frame else {
             return;
         };
-        let prediction = match self.runs[run_index].prediction(frame_index) {
-            Ok(prediction) => prediction,
-            Err(error) => {
-                let error = format!("failed to load prediction for frame {frame_index}: {error:#}");
-                if !had_prediction_error {
-                    ui.colored_label(Color32::LIGHT_RED, &error);
-                }
-                self.prediction_errors.insert(run_key, error);
-                None
+        let prediction_key = (run_key, frame_index);
+        let prediction = self.loaded_predictions.get(&prediction_key).cloned();
+        let prediction_pending = prediction.is_none();
+        if prediction_pending {
+            for frame in frame_index..=frame_index.saturating_add(2).min(self.end_frame) {
+                self.prediction_loader
+                    .request(self.runs[run_index].clone(), frame);
             }
-        };
-        self.model_view(ui, &texture, frame_index, prediction.as_deref());
+        }
+        self.model_view(
+            ui,
+            &texture,
+            frame_index,
+            prediction.flatten().as_deref(),
+            prediction_pending,
+        );
     }
 
     fn model_view(
@@ -819,6 +865,7 @@ impl ReplayApp {
         texture: &TextureHandle,
         frame_index: usize,
         prediction: Option<&Prediction>,
+        prediction_pending: bool,
     ) {
         let frame = &self.recording.frames()[frame_index];
         let image_size = vec2(frame.width as f32, frame.height as f32);
@@ -860,10 +907,20 @@ impl ReplayApp {
                         self.keypoint_confidence_filter,
                     );
                 }
-                let inference = prediction
-                    .inference_duration_nanos
-                    .map(|value| format!("{:.1} ms", value as f64 / 1.0e6))
-                    .unwrap_or_else(|| "recorded".to_string());
+                let timing = match (
+                    prediction.inference_duration_nanos,
+                    prediction.postprocessing_duration_nanos,
+                    prediction.non_maximum_suppression_duration_nanos,
+                ) {
+                    (Some(inference), Some(postprocessing), Some(nms)) => format!(
+                        "inference {:.1} ms, post {:.1} ms, NMS {:.1} ms, total {:.1} ms",
+                        inference as f64 / 1.0e6,
+                        postprocessing as f64 / 1.0e6,
+                        nms as f64 / 1.0e6,
+                        inference.saturating_add(postprocessing).saturating_add(nms) as f64 / 1.0e6,
+                    ),
+                    _ => "recorded".to_string(),
+                };
                 let object_count = prediction
                     .objects
                     .iter()
@@ -882,7 +939,7 @@ impl ReplayApp {
                     },
                 );
                 ui.label(format!(
-                    "{object_count} detections, {pose_status}, {inference}"
+                    "{object_count} detections, {pose_status}, {timing}"
                 ));
             }
             None => {
@@ -890,11 +947,19 @@ impl ReplayApp {
                 painter.text(
                     viewport.center(),
                     egui::Align2::CENTER_CENTER,
-                    "prediction unavailable",
+                    if prediction_pending {
+                        "loading prediction"
+                    } else {
+                        "prediction unavailable"
+                    },
                     FontId::proportional(16.0),
                     Color32::LIGHT_GRAY,
                 );
-                ui.label("No cached result for this frame");
+                ui.label(if prediction_pending {
+                    "Loading cached result"
+                } else {
+                    "No cached result for this frame"
+                });
             }
         }
     }
@@ -969,6 +1034,7 @@ impl ReplayApp {
 impl App for ReplayApp {
     fn update(&mut self, context: &egui::Context, _frame: &mut Frame) {
         self.poll_loader(context);
+        self.poll_prediction_loader();
         self.handle_keys(context);
         self.advance_playback(context);
         self.display_selected_frame(context);
@@ -1083,6 +1149,7 @@ struct FrameResult {
 
 impl FrameLoader {
     fn new(recording: Arc<Recording>, context: egui::Context) -> Result<Self> {
+        let mut proxy_reader = recording.proxy_frame_reader()?;
         let (request_sender, request_receiver) = mpsc::channel::<FrameRequest>();
         let (result_sender, result_receiver) =
             mpsc::sync_channel::<FrameResult>(PREFETCH_FRAMES * 2);
@@ -1105,8 +1172,8 @@ impl FrameLoader {
                             request = latest;
                             continue 'requests;
                         }
-                        let image = recording
-                            .load_proxy_frame(frame)
+                        let image = proxy_reader
+                            .load(frame)
                             .map(|image| {
                                 ColorImage::from_rgb(
                                     [image.width() as usize, image.height() as usize],
@@ -1182,6 +1249,73 @@ impl FrameLoader {
     }
 }
 
+struct PredictionLoader {
+    requests: mpsc::Sender<PredictionRequest>,
+    results: mpsc::Receiver<PredictionResult>,
+    requested: BTreeSet<(String, usize)>,
+}
+
+struct PredictionRequest {
+    run: LoadedPredictionRun,
+    frame: usize,
+}
+
+struct PredictionResult {
+    run_key: String,
+    frame: usize,
+    prediction: std::result::Result<Option<Arc<Prediction>>, String>,
+}
+
+impl PredictionLoader {
+    fn new(context: egui::Context) -> Result<Self> {
+        let (request_sender, request_receiver) = mpsc::channel::<PredictionRequest>();
+        let (result_sender, result_receiver) = mpsc::channel::<PredictionResult>();
+        thread::Builder::new()
+            .name("detection-replay-prediction-loader".to_string())
+            .spawn(move || {
+                while let Ok(request) = request_receiver.recv() {
+                    let result = PredictionResult {
+                        run_key: request.run.key.clone(),
+                        frame: request.frame,
+                        prediction: request
+                            .run
+                            .prediction(request.frame)
+                            .map_err(|error| format!("{error:#}")),
+                    };
+                    if result_sender.send(result).is_err() {
+                        return;
+                    }
+                    context.request_repaint();
+                }
+            })
+            .map_err(|error| eyre!("failed to spawn prediction loader: {error}"))?;
+        Ok(Self {
+            requests: request_sender,
+            results: result_receiver,
+            requested: BTreeSet::new(),
+        })
+    }
+
+    fn request(&mut self, run: LoadedPredictionRun, frame: usize) {
+        let key = (run.key.clone(), frame);
+        if self.requested.insert(key.clone())
+            && self
+                .requests
+                .send(PredictionRequest { run, frame })
+                .is_err()
+        {
+            self.requested.remove(&key);
+        }
+    }
+
+    fn try_receive(&mut self) -> Option<PredictionResult> {
+        let result = self.results.try_recv().ok()?;
+        self.requested
+            .remove(&(result.run_key.clone(), result.frame));
+        Some(result)
+    }
+}
+
 fn camera_image_rect(viewport: Rect, image: Vec2, zoom: f32, pan: Vec2) -> Rect {
     let size = image * fitted_scale(viewport.size(), image) * zoom;
     Rect::from_center_size(viewport.center() + pan, size)
@@ -1253,8 +1387,11 @@ fn draw_objects(
             Stroke::new(2.0, color),
             StrokeKind::Outside,
         );
-        let label: String = object.label.into();
-        let text = format!("{label} {:.0}%", object.bounding_box.confidence * 100.0);
+        let text = format!(
+            "{} {:.0}%",
+            object.label.as_str(),
+            object.bounding_box.confidence * 100.0
+        );
         let position = rect.min + vec2(4.0, 3.0);
         let galley = painter.layout_no_wrap(text, FontId::proportional(12.0), Color32::WHITE);
         painter.rect_filled(
@@ -1285,7 +1422,7 @@ fn draw_poses(
         .filter(|pose| pose.object.bounding_box.confidence >= pose_confidence_filter)
     {
         let keypoints: [Keypoint; 17] = pose.keypoints.into();
-        for (start, end) in POSE_SKELETON_KEYPOINT_LINE_MAPPING {
+        for (start, end) in POSE_SKELETON_EDGES {
             if keypoints[start].confidence < keypoint_confidence_filter
                 || keypoints[end].confidence < keypoint_confidence_filter
             {

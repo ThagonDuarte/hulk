@@ -551,6 +551,12 @@ mod tests {
         assert_eq!(bookmarks.next(12, 10, 20), Some(18));
         assert_eq!(bookmarks.next(18, 10, 20), Some(12));
         assert_eq!(bookmarks.previous(12, 10, 20), Some(18));
+        assert_eq!(bookmarks.next(20, 10, 20), Some(12));
+        assert_eq!(bookmarks.previous(20, 10, 20), Some(18));
+
+        let empty = BookmarkCollection::default();
+        assert_eq!(empty.next(10, 10, 10), None);
+        assert_eq!(empty.previous(10, 10, 10), None);
     }
 
     #[test]
