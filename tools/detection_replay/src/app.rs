@@ -30,7 +30,7 @@ const MAX_ZOOM: f32 = 20.0;
 const PREFETCH_FRAMES: usize = 12;
 
 pub fn run(recording: Recording, start_frame: usize, end_frame: usize) -> Result<()> {
-    let mut runs = recording.load_runs()?;
+    let (mut runs, run_load_errors) = recording.load_runs_with_errors()?;
     let bookmarks_file_exists = recording.bookmarks_exist()?;
     let legacy_bookmark_storage_key = format!(
         "detection-replay-bookmarks-{}",
@@ -62,7 +62,9 @@ pub fn run(recording: Recording, start_frame: usize, end_frame: usize) -> Result
         cached_runs = runs.len(),
         hidden_runs = runs
             .iter()
-            .filter(|run| run_metadata.get(&run.key).is_some_and(|metadata| metadata.hidden))
+            .filter(|run| run_metadata
+                .get(&run.key)
+                .is_some_and(|metadata| metadata.hidden))
             .count(),
         "loaded detection replay runs"
     );
@@ -74,6 +76,11 @@ pub fn run(recording: Recording, start_frame: usize, end_frame: usize) -> Result
     ]
     .into_iter()
     .flatten()
+    .chain(
+        run_load_errors
+            .into_iter()
+            .map(|error| format!("invalid cached model run: {error}")),
+    )
     .collect::<Vec<_>>();
     eframe::run_native(
         "Detection Replay",
@@ -141,7 +148,7 @@ struct ReplayApp {
     loader: FrameLoader,
     prediction_loader: PredictionLoader,
     loaded_predictions: BTreeMap<(String, usize), Option<Arc<Prediction>>>,
-    load_error: Option<String>,
+    frame_errors: BTreeMap<usize, String>,
     is_playing: bool,
     loop_playback: bool,
     playback_speed: f32,
@@ -160,7 +167,7 @@ struct ReplayApp {
     metadata_needs_repair: bool,
     bookmarks_dirty: bool,
     legacy_bookmarks_to_clear: Option<String>,
-    prediction_errors: BTreeMap<String, String>,
+    prediction_errors: BTreeMap<(String, usize), String>,
     rename_edits: BTreeMap<String, String>,
     management_error: Option<String>,
     pending_delete: Option<String>,
@@ -250,7 +257,7 @@ impl ReplayApp {
             loader,
             prediction_loader,
             loaded_predictions: BTreeMap::new(),
-            load_error: None,
+            frame_errors: BTreeMap::new(),
             is_playing: false,
             loop_playback: true,
             playback_speed: 1.0,
@@ -287,11 +294,14 @@ impl ReplayApp {
 
     fn poll_loader(&mut self, context: &egui::Context) {
         while let Some(result) = self.loader.try_receive() {
-            match result {
-                Ok((frame_index, image)) => {
+            let (frame_index, image) = result;
+            match image {
+                Ok(image) => {
                     self.decoded_frames.insert(frame_index, image);
                 }
-                Err(error) => self.load_error = Some(error),
+                Err(error) => {
+                    self.frame_errors.insert(frame_index, error);
+                }
             }
         }
         self.display_selected_frame(context);
@@ -314,12 +324,13 @@ impl ReplayApp {
             let key = (result.run_key.clone(), result.frame);
             match result.prediction {
                 Ok(prediction) => {
+                    self.prediction_errors.remove(&key);
                     self.loaded_predictions.insert(key, prediction);
                 }
                 Err(error) => {
                     self.loaded_predictions.insert(key, None);
                     self.prediction_errors.insert(
-                        result.run_key,
+                        (result.run_key, result.frame),
                         format!(
                             "failed to load prediction for frame {}: {error}",
                             result.frame
@@ -334,6 +345,8 @@ impl ReplayApp {
             .saturating_add(PREFETCH_FRAMES)
             .min(self.end_frame);
         self.loaded_predictions
+            .retain(|(_, frame), _| retain_from <= *frame && *frame <= retain_through);
+        self.prediction_errors
             .retain(|(_, frame), _| retain_from <= *frame && *frame <= retain_through);
     }
 
@@ -354,11 +367,16 @@ impl ReplayApp {
                 Some(context.load_texture("detection-replay-frame", image, TextureOptions::LINEAR));
         }
         self.displayed_frame = Some(self.selected_frame);
-        self.load_error = None;
+        self.frame_errors.remove(&self.selected_frame);
     }
 
     fn advance_playback(&mut self, context: &egui::Context) {
-        if !self.is_playing || self.start_frame == self.end_frame {
+        if self.start_frame == self.end_frame {
+            self.is_playing = false;
+            self.last_playback_update = Instant::now();
+            return;
+        }
+        if !self.is_playing {
             self.last_playback_update = Instant::now();
             return;
         }
@@ -771,6 +789,7 @@ impl ReplayApp {
             }
             Err(error) => {
                 self.run_metadata.remove(key);
+                self.metadata_needs_repair = true;
                 self.management_error = Some(format!(
                     "run was deleted, but its GUI metadata could not be updated: {error:#}"
                 ));
@@ -827,11 +846,21 @@ impl ReplayApp {
     }
 
     fn model_panel(&mut self, ui: &mut Ui, run_index: usize) {
-        if let Some(error) = &self.load_error {
-            ui.colored_label(Color32::LIGHT_RED, error);
+        if self.displayed_frame != Some(self.selected_frame) {
+            ui.centered_and_justified(|ui| {
+                if let Some(error) = self.frame_errors.get(&self.selected_frame) {
+                    ui.colored_label(Color32::LIGHT_RED, error);
+                } else {
+                    ui.spinner();
+                }
+            });
+            return;
         }
         let run_key = self.runs[run_index].key.clone();
-        if let Some(error) = self.prediction_errors.get(&run_key) {
+        if let Some(error) = self
+            .prediction_errors
+            .get(&(run_key.clone(), self.selected_frame))
+        {
             ui.colored_label(Color32::LIGHT_RED, error);
         }
         let Some(texture) = self.texture.clone() else {
@@ -1227,7 +1256,7 @@ impl FrameLoader {
         }
     }
 
-    fn try_receive(&mut self) -> Option<std::result::Result<(usize, ColorImage), String>> {
+    fn try_receive(&mut self) -> Option<(usize, std::result::Result<ColorImage, String>)> {
         let result = loop {
             let result = self.results.try_recv().ok()?;
             if result.generation == self.generation {
@@ -1245,12 +1274,12 @@ impl FrameLoader {
                 self.failed.insert(result.frame);
             }
         }
-        Some(result.image.map(|image| (result.frame, image)))
+        Some((result.frame, result.image))
     }
 }
 
 struct PredictionLoader {
-    requests: mpsc::Sender<PredictionRequest>,
+    requests: mpsc::SyncSender<PredictionRequest>,
     results: mpsc::Receiver<PredictionResult>,
     requested: BTreeSet<(String, usize)>,
 }
@@ -1268,8 +1297,8 @@ struct PredictionResult {
 
 impl PredictionLoader {
     fn new(context: egui::Context) -> Result<Self> {
-        let (request_sender, request_receiver) = mpsc::channel::<PredictionRequest>();
-        let (result_sender, result_receiver) = mpsc::channel::<PredictionResult>();
+        let (request_sender, request_receiver) = mpsc::sync_channel::<PredictionRequest>(2);
+        let (result_sender, result_receiver) = mpsc::sync_channel::<PredictionResult>(8);
         thread::Builder::new()
             .name("detection-replay-prediction-loader".to_string())
             .spawn(move || {
@@ -1301,7 +1330,7 @@ impl PredictionLoader {
         if self.requested.insert(key.clone())
             && self
                 .requests
-                .send(PredictionRequest { run, frame })
+                .try_send(PredictionRequest { run, frame })
                 .is_err()
         {
             self.requested.remove(&key);
