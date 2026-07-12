@@ -378,6 +378,16 @@ impl Recording {
         )
     }
 
+    pub fn load_runs_with_errors(
+        &self,
+    ) -> Result<(Vec<crate::cache::LoadedPredictionRun>, Vec<String>)> {
+        crate::cache::load_all_runs_with_errors(
+            &self.cache_directory,
+            self.fingerprint(),
+            self.frame_count(),
+        )
+    }
+
     pub fn load_run_ui_metadata(&self) -> Result<BTreeMap<String, crate::cache::RunUiMetadata>> {
         crate::cache::load_run_ui_metadata(&self.cache_directory, self.fingerprint())
     }
@@ -888,7 +898,9 @@ fn scan_linear_original_images(
             .get(frame_index)
             .wrap_err("original recording has more frames than its cache index")?;
         let image = decode_image_data(message, image_topic)?;
-        send_original_frame(sender, frame_index, expected, image)?;
+        if !send_original_frame(sender, frame_index, expected, image)? {
+            return Ok(ScanControl::Stop);
+        }
         emitted += 1;
         Ok(if emitted == take {
             ScanControl::Stop
@@ -967,7 +979,9 @@ fn scan_indexed_original_images(
                             .left
                     }
                 };
-                send_original_frame(sender, frame_index, expected, image)?;
+                if !send_original_frame(sender, frame_index, expected, image)? {
+                    return Ok(());
+                }
                 emitted += 1;
                 if emitted == take {
                     return Ok(());
@@ -1087,7 +1101,7 @@ fn scan_cached_original_images(
             })
             .wrap_err("cached original frame dimensions overflow")?;
         let maximum_length = pixel_count
-            .checked_mul(2)
+            .checked_mul(4)
             .and_then(|length| length.checked_add(IMAGE_CACHE_OVERHEAD_BYTES))
             .wrap_err("cached original frame size limit overflow")?;
         if length > maximum_length {
@@ -1104,7 +1118,9 @@ fn scan_cached_original_images(
             .wrap_err("failed to read original-frame cache")?;
         let image = SerdeCdrCodec::<Image>::deserialize(&bytes)
             .wrap_err("failed to decode cached original image")?;
-        send_original_frame(sender, frame_index, expected, image)?;
+        if !send_original_frame(sender, frame_index, expected, image)? {
+            return Ok(());
+        }
     }
     Ok(())
 }
@@ -1114,7 +1130,7 @@ fn send_original_frame(
     frame_index: usize,
     expected: &FrameIndexEntry,
     image: Image,
-) -> Result<()> {
+) -> Result<bool> {
     let timestamp_nanos = image_timestamp_nanos(&image)?;
     if timestamp_nanos != expected.timestamp_nanos
         || image.width != expected.width
@@ -1122,12 +1138,13 @@ fn send_original_frame(
     {
         bail!("original frame {frame_index} does not match its cache index");
     }
-    let _ = sender.blocking_send(Ok(OriginalFrame {
-        frame_index,
-        timestamp_nanos,
-        image,
-    }));
-    Ok(())
+    Ok(sender
+        .blocking_send(Ok(OriginalFrame {
+            frame_index,
+            timestamp_nanos,
+            image,
+        }))
+        .is_ok())
 }
 
 fn load_summary(path: &Path) -> Result<Option<mcap::Summary>> {
@@ -1184,9 +1201,8 @@ fn scan_messages(
         .metadata()
         .wrap_err_with(|| format!("failed to read metadata for {}", path.display()))?
         .len();
-    let length_limit = usize::try_from(file_length).unwrap_or(usize::MAX);
     let options = LinearReaderOptions::default()
-        .with_record_length_limit(length_limit)
+        .with_record_length_limit(MAX_MCAP_RECORD_BYTES)
         .with_validate_chunk_crcs(true);
     let mut reader = LinearReader::new_with_options(options);
     let mut schemas: HashMap<u16, Arc<Schema<'static>>> = HashMap::new();
