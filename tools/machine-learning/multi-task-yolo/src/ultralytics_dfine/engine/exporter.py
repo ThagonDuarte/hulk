@@ -24,6 +24,7 @@ class DFINEExportWrapper(nn.Module):
     ) -> None:
         super().__init__()
         self.model = copy.deepcopy(model).eval()
+        self.model.enable_onnx_compatibility()
         self.mode = mode
 
     def forward(self, images: Tensor) -> Tensor | tuple[Tensor, Tensor]:

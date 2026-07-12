@@ -9,7 +9,10 @@ from PIL import Image
 from ultralytics_dfine.config import DFINEArchitectureConfig, build_manifest
 from ultralytics_dfine.data import DFINEDataset
 from ultralytics_dfine.loss import DFINECriterion
-from ultralytics_dfine.nn import DFINEPostProcessorAdapter
+from ultralytics_dfine.nn import (
+    DFINEPostProcessorAdapter,
+    ONNXCompatibleDFINEIntegral,
+)
 from utils.model_naming import (
     HydraModelName,
     IncompatibleModelFamilyError,
@@ -62,6 +65,28 @@ class PostProcessorTests(unittest.TestCase):
         torch.testing.assert_close(
             detections[0, 1, :4], outputs["pred_boxes"][0, 1]
         )
+
+
+class ExportTests(unittest.TestCase):
+    def test_onnx_integral_matches_vector_linear(self) -> None:
+        max_num_bins = 32
+        pred_corners = torch.randn(2, 5, 4 * (max_num_bins + 1))
+        project = torch.linspace(0.1, 1.0, max_num_bins + 1)
+        probabilities = torch.softmax(
+            pred_corners.reshape(-1, max_num_bins + 1),
+            dim=1,
+        )
+        expected = torch.nn.functional.linear(
+            probabilities,
+            project,
+        ).reshape(2, 5, 4)
+
+        actual = ONNXCompatibleDFINEIntegral(max_num_bins)(
+            pred_corners,
+            project,
+        )
+
+        torch.testing.assert_close(actual, expected)
 
 
 class DatasetTests(unittest.TestCase):

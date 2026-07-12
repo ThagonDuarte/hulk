@@ -28,6 +28,25 @@ class FeaturePyramid:
     channels: tuple[int, ...]
 
 
+class ONNXCompatibleDFINEIntegral(nn.Module):
+    """D-FINE integral without a rank-one MatMul operand."""
+
+    def __init__(self, max_num_bins: int) -> None:
+        super().__init__()
+        self.max_num_bins = max_num_bins
+
+    def forward(self, pred_corners: Tensor, project: Tensor) -> Tensor:
+        batch_size, num_queries, _ = pred_corners.shape
+        probabilities = torch.softmax(
+            pred_corners.reshape(-1, self.max_num_bins + 1),
+            dim=1,
+        )
+        values = (
+            probabilities * project.to(pred_corners.device).unsqueeze(0)
+        ).sum(dim=1)
+        return values.reshape(batch_size, num_queries, -1)
+
+
 class DFINEDetectionModel(nn.Module):
     """D-FINE-S task model with official training output semantics."""
 
@@ -129,6 +148,11 @@ class DFINEDetectionModel(nn.Module):
     def replace_backbone(self, backbone: nn.Module) -> None:
         self.core.model.backbone = (  # pyright: ignore[reportAttributeAccessIssue]
             backbone
+        )
+
+    def enable_onnx_compatibility(self) -> None:
+        self.core.model.decoder.integral = (  # pyright: ignore[reportAttributeAccessIssue]
+            ONNXCompatibleDFINEIntegral(self.core.config.max_num_bins)
         )
 
     @staticmethod

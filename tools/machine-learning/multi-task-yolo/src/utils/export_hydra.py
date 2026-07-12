@@ -1,5 +1,5 @@
 import os
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from pathlib import Path
 from typing import Any, cast
 
@@ -8,6 +8,7 @@ import torch
 from torch import ByteTensor, Tensor, nn
 
 from model.hydra import Hydra
+from ultralytics_dfine.nn import DFINEDetectionModel
 from utils.model_naming import (
     HYDRA_MODEL_NAME_TYPE,
     HydraModelName,
@@ -65,6 +66,8 @@ class HydraNv12Wrapper(nn.Module):
 
 def set_export_mode(module: nn.Module) -> None:
     for child in module.modules():
+        if isinstance(child, DFINEDetectionModel):
+            child.enable_onnx_compatibility()
         if hasattr(child, "export"):
             cast(Any, child).export = True
 
@@ -105,7 +108,7 @@ def export_onnx(
     wrapper: nn.Module,
     dummy_input: Tensor,
     export_path: Path,
-    task_dict: dict[TaskType, Path],
+    task_dict: Iterable[TaskType],
     opset: int,
     *,
     with_nv12: bool,
@@ -200,7 +203,17 @@ def export_torchscript(
     type=int,
     default=640,
     show_default=True,
-    help="Square input image size used for ONNX tracing.",
+    help="Default square input size used when width or height is omitted.",
+)
+@click.option(
+    "--width",
+    type=int,
+    help="Input image width. Defaults to --imgsz.",
+)
+@click.option(
+    "--height",
+    type=int,
+    help="Input image height. Defaults to --imgsz.",
 )
 @click.option(
     "--opset",
@@ -237,6 +250,8 @@ def main(
     val_dir: Path,
     train_dir: Path,
     imgsz: int,
+    width: int | None,
+    height: int | None,
     opset: int,
     export_format: str,
     device: str,
@@ -244,6 +259,12 @@ def main(
 ) -> None:
     if imgsz <= 0:
         raise click.BadParameter("--imgsz must be > 0")  # noqa: TRY003
+    input_width = imgsz if width is None else width
+    input_height = imgsz if height is None else height
+    if input_width <= 0:
+        raise click.BadParameter("--width must be > 0")  # noqa: TRY003
+    if input_height <= 0:
+        raise click.BadParameter("--height must be > 0")  # noqa: TRY003
 
     train_folder_path = runs_dir / train_dir
     val_folder_path = runs_dir / val_dir
@@ -277,16 +298,18 @@ def main(
         export_folder.mkdir(parents=True, exist_ok=True)
 
         if with_nv12_layer:
-            if imgsz % 2 != 0:
-                raise click.BadParameter("--imgsz must be even for NV12")  # noqa: TRY003
+            if input_width % 2 != 0 or input_height % 2 != 0:
+                raise click.BadParameter(  # noqa: TRY003
+                    "--width and --height must be even for NV12"
+                )
             dummy_input = torch.zeros(
-                (imgsz // 2, imgsz // 2, 6),
+                (input_height // 2, input_width // 2, 6),
                 dtype=torch.uint8,
                 device=device,
             )
         else:
             dummy_input = torch.zeros(
-                (1, 3, imgsz, imgsz),
+                (1, 3, input_height, input_width),
                 dtype=torch.float32,
                 device=device,
             )

@@ -133,11 +133,18 @@ uv run -m validation.validator \
 
 uv run -m utils.export_hydra \
   dfine-s=f1+dfine-s~hslvision-132e \
-  runs/export/hydra \
+  runs/export/hydra-nv12 \
   --runs_dir runs \
-  --imgsz 640 \
-  --opset 17
+  --width 544 \
+  --height 448 \
+  --opset 17 \
+  --with-nv12-layer
 ```
+
+`--width` and `--height` override the square `--imgsz` default. With the NV12
+layer, a 544-by-448 image has a packed `uint8[224, 272, 6]` ONNX input.
+D-FINE export also lowers its distribution integral to elementwise multiply
+and reduction instead of a rank-one `MatMul`, which ORT WebGPU cannot execute.
 
 ## Single-task training (`src/model/train.py`)
 
