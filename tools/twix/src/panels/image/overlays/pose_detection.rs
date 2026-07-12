@@ -4,7 +4,7 @@ use linear_algebra::point;
 use ros_z::time::Time;
 use types::{
     object_detection::YOLOObjectLabel,
-    pose_detection::{Keypoint, Pose},
+    pose_detection::{Keypoint, POSE_SKELETON_EDGES, Pose},
     time_wrapper::TimeWrapper,
 };
 
@@ -12,24 +12,6 @@ use crate::repaint::ObservationContext;
 
 use super::super::image_overlay::{ImageOverlay, ImageOverlayPainter, OverlayObservation};
 
-const POSE_SKELETON_KEYPOINT_LINE_MAPPING: [(usize, usize); 16] = [
-    (0, 1),
-    (0, 2),
-    (1, 3),
-    (2, 4),
-    (5, 6),
-    (5, 11),
-    (6, 12),
-    (11, 12),
-    (5, 7),
-    (6, 8),
-    (7, 9),
-    (8, 10),
-    (11, 13),
-    (12, 14),
-    (13, 15),
-    (14, 16),
-];
 const KEYPOINT_CONFIDENCE_THRESHOLD: f32 = 0.8;
 
 pub(in crate::panels::image) struct PoseDetectionOverlay {
@@ -65,7 +47,7 @@ fn paint_poses(painter: &ImageOverlayPainter, poses: &[Pose<YOLOObjectLabel>]) {
     for pose in poses {
         let keypoints: [Keypoint; 17] = pose.keypoints.into();
 
-        for (idx1, idx2) in POSE_SKELETON_KEYPOINT_LINE_MAPPING {
+        for (idx1, idx2) in POSE_SKELETON_EDGES {
             if keypoints[idx1].confidence < KEYPOINT_CONFIDENCE_THRESHOLD
                 || keypoints[idx2].confidence < KEYPOINT_CONFIDENCE_THRESHOLD
             {

@@ -304,6 +304,20 @@ pub enum RobocupObjectLabel {
     XSpot = 6,
 }
 
+impl RobocupObjectLabel {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Ball => "Ball",
+            Self::GoalPost => "GoalPost",
+            Self::LSpot => "LSpot",
+            Self::PenaltySpot => "PenaltySpot",
+            Self::Robot => "Robot",
+            Self::TSpot => "TSpot",
+            Self::XSpot => "XSpot",
+        }
+    }
+}
+
 impl LabelIndex for RobocupObjectLabel {
     fn from_index(index: usize) -> Self {
         match index {
@@ -321,15 +335,6 @@ impl LabelIndex for RobocupObjectLabel {
 
 impl From<RobocupObjectLabel> for String {
     fn from(label: RobocupObjectLabel) -> Self {
-        match label {
-            RobocupObjectLabel::Ball => "Ball",
-            RobocupObjectLabel::GoalPost => "GoalPost",
-            RobocupObjectLabel::LSpot => "LSpot",
-            RobocupObjectLabel::PenaltySpot => "PenaltySpot",
-            RobocupObjectLabel::Robot => "Robot",
-            RobocupObjectLabel::TSpot => "TSpot",
-            RobocupObjectLabel::XSpot => "XSpot",
-        }
-        .to_string()
+        label.as_str().to_string()
     }
 }

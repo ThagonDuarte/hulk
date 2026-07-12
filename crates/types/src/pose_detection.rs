@@ -19,6 +19,24 @@ pub const OVERALL_KEYPOINT_INDEX_MASK: [usize; 15] =
 pub const VISUAL_REFEREE_KEYPOINT_INDEX_MASK: [usize; 8] = [5, 6, 7, 8, 9, 10, 15, 16];
 pub const NUMBER_OF_VALUES_PER_POSE: usize = 57;
 pub const POSE_KEYPOINT_OFFSET: usize = NUMBER_OF_VALUES_PER_OBJECT;
+pub const POSE_SKELETON_EDGES: [(usize, usize); 16] = [
+    (0, 1),
+    (0, 2),
+    (1, 3),
+    (2, 4),
+    (5, 6),
+    (5, 11),
+    (6, 12),
+    (11, 12),
+    (5, 7),
+    (6, 8),
+    (7, 9),
+    (8, 10),
+    (11, 13),
+    (12, 14),
+    (13, 15),
+    (14, 16),
+];
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, ros_z::Message)]
 pub struct Keypoint {
