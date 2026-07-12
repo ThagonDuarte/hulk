@@ -1,6 +1,6 @@
 use std::{
     collections::BTreeMap,
-    fs::{self, File},
+    fs::{self, File, OpenOptions},
     io::{BufReader, BufWriter, Write},
     ops::RangeInclusive,
     path::{Path, PathBuf},
@@ -23,9 +23,12 @@ pub const CACHE_VERSION: u32 = 1;
 pub const PREDICTION_CHUNK_SIZE: usize = 128;
 
 const MODEL_RUNS_DIRECTORY: &str = "model-runs";
+const MODEL_RUN_LOCKS_DIRECTORY: &str = ".locks";
 const RECORDINGS_DIRECTORY: &str = "recordings";
 const MANIFEST_FILE: &str = "manifest.bin";
 const RECORDED_BASELINE_FILE: &str = "recorded-baseline.bin";
+const RUN_METADATA_FILE: &str = "run-metadata.bin";
+const RUN_METADATA_LOCK_FILE: &str = ".run-metadata.lock";
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RecordingFingerprint {
@@ -197,6 +200,19 @@ pub struct LoadedPredictionRun {
     pub predictions: Vec<Option<Arc<Prediction>>>,
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunUiMetadata {
+    pub renamed_label: Option<String>,
+    pub hidden: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct RunUiMetadataFile {
+    cache_version: u32,
+    recording_fingerprint: RecordingFingerprint,
+    runs: BTreeMap<String, RunUiMetadata>,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RecordedBaseline {
     pub cache_version: u32,
@@ -212,6 +228,7 @@ struct PredictionChunk {
 }
 
 pub struct PredictionStore {
+    _lock_file: File,
     run_directory: PathBuf,
     manifest: ModelRunManifest,
     predictions: Vec<Prediction>,
@@ -229,6 +246,7 @@ impl PredictionStore {
         let root = cache_directory.as_ref().join(MODEL_RUNS_DIRECTORY);
         fs::create_dir_all(&root)
             .wrap_err_with(|| format!("failed to create {}", root.display()))?;
+        let lock_file = lock_model_run(&root, &proposed.run_key, false)?;
         let run_directory = root.join(&proposed.run_key);
         fs::create_dir_all(&run_directory)
             .wrap_err_with(|| format!("failed to create {}", run_directory.display()))?;
@@ -264,6 +282,7 @@ impl PredictionStore {
         }
 
         Ok(Self {
+            _lock_file: lock_file,
             run_directory,
             manifest,
             predictions,
@@ -419,7 +438,24 @@ pub fn load_all_runs(
     directories.sort();
 
     for directory in directories {
-        if !directory.is_dir() || !directory.join(MANIFEST_FILE).exists() {
+        if !directory.is_dir() {
+            continue;
+        }
+        let name = directory
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or_default();
+        if name.starts_with(".deleting-") {
+            if let Err(error) = fs::remove_dir_all(&directory) {
+                tracing::warn!(
+                    path = %directory.display(),
+                    ?error,
+                    "failed to clean stale deleted model run cache"
+                );
+            }
+            continue;
+        }
+        if !directory.join(MANIFEST_FILE).exists() {
             continue;
         }
         match load_model_run(&directory, recording_fingerprint, total_frame_count) {
@@ -436,12 +472,117 @@ pub fn load_all_runs(
     Ok(runs)
 }
 
+pub fn load_run_ui_metadata(
+    cache_directory: impl AsRef<Path>,
+    recording_fingerprint: &RecordingFingerprint,
+) -> Result<BTreeMap<String, RunUiMetadata>> {
+    let directory = recording_cache_directory(cache_directory.as_ref(), recording_fingerprint)?;
+    read_run_ui_metadata(&directory.join(RUN_METADATA_FILE), recording_fingerprint)
+}
+
+pub fn save_run_ui_metadata(
+    cache_directory: impl AsRef<Path>,
+    recording_fingerprint: &RecordingFingerprint,
+    runs: &BTreeMap<String, RunUiMetadata>,
+) -> Result<()> {
+    let directory = recording_cache_directory(cache_directory.as_ref(), recording_fingerprint)?;
+    fs::create_dir_all(&directory)
+        .wrap_err_with(|| format!("failed to create {}", directory.display()))?;
+    let _lock = lock_file(&directory.join(RUN_METADATA_LOCK_FILE), false)?;
+    write_run_ui_metadata(&directory, recording_fingerprint, runs)
+}
+
+pub fn rename_run(
+    cache_directory: impl AsRef<Path>,
+    recording_fingerprint: &RecordingFingerprint,
+    run_key: &str,
+    label: &str,
+) -> Result<BTreeMap<String, RunUiMetadata>> {
+    validate_model_run_key(run_key)?;
+    let label = label.trim();
+    if label.is_empty() {
+        bail!("run name must not be empty");
+    }
+    update_run_ui_metadata(cache_directory.as_ref(), recording_fingerprint, |runs| {
+        runs.entry(run_key.to_string()).or_default().renamed_label = Some(label.to_string())
+    })
+}
+
+pub fn set_run_hidden(
+    cache_directory: impl AsRef<Path>,
+    recording_fingerprint: &RecordingFingerprint,
+    run_key: &str,
+    hidden: bool,
+) -> Result<BTreeMap<String, RunUiMetadata>> {
+    validate_run_key(run_key)?;
+    update_run_ui_metadata(cache_directory.as_ref(), recording_fingerprint, |runs| {
+        runs.entry(run_key.to_string()).or_default().hidden = hidden
+    })
+}
+
+pub fn remove_run_ui_metadata(
+    cache_directory: impl AsRef<Path>,
+    recording_fingerprint: &RecordingFingerprint,
+    run_key: &str,
+) -> Result<BTreeMap<String, RunUiMetadata>> {
+    validate_run_key(run_key)?;
+    update_run_ui_metadata(cache_directory.as_ref(), recording_fingerprint, |runs| {
+        runs.remove(run_key);
+    })
+}
+
+pub fn delete_model_run(
+    cache_directory: impl AsRef<Path>,
+    recording_fingerprint: &RecordingFingerprint,
+    run_key: &str,
+) -> Result<()> {
+    validate_model_run_key(run_key)?;
+    let root = cache_directory.as_ref().join(MODEL_RUNS_DIRECTORY);
+    let _lock_file = lock_model_run(&root, run_key, true)?;
+    let run_directory = root.join(run_key);
+    let manifest: ModelRunManifest = read_bincode(&run_directory.join(MANIFEST_FILE))?;
+    if manifest.run_key != run_key || &manifest.recording_fingerprint != recording_fingerprint {
+        bail!("model run manifest does not match the requested recording and run key");
+    }
+
+    let mut suffix = 0_u32;
+    let tombstone = loop {
+        let candidate = root.join(format!(
+            ".deleting-{run_key}-{}-{suffix}",
+            std::process::id()
+        ));
+        if !candidate.exists() {
+            break candidate;
+        }
+        suffix = suffix
+            .checked_add(1)
+            .wrap_err("deletion tombstone overflow")?;
+    };
+    fs::rename(&run_directory, &tombstone).wrap_err_with(|| {
+        format!(
+            "failed to detach model run cache {}",
+            run_directory.display()
+        )
+    })?;
+    if let Err(error) = fs::remove_dir_all(&tombstone) {
+        tracing::warn!(
+            path = %tombstone.display(),
+            ?error,
+            "model run was deleted but its detached cache could not be cleaned up"
+        );
+    }
+    Ok(())
+}
+
 fn load_model_run(
     directory: &Path,
     recording_fingerprint: &RecordingFingerprint,
     total_frame_count: usize,
 ) -> Result<Option<LoadedPredictionRun>> {
     let mut manifest: ModelRunManifest = read_bincode(&directory.join(MANIFEST_FILE))?;
+    if directory.file_name().and_then(|name| name.to_str()) != Some(&manifest.run_key) {
+        bail!("model run directory name does not match its manifest key");
+    }
     if &manifest.recording_fingerprint != recording_fingerprint {
         return Ok(None);
     }
@@ -518,6 +659,76 @@ pub(crate) fn write_bincode_atomic<T: Serialize + ?Sized>(path: &Path, value: &T
     Ok(())
 }
 
+fn read_run_ui_metadata(
+    path: &Path,
+    recording_fingerprint: &RecordingFingerprint,
+) -> Result<BTreeMap<String, RunUiMetadata>> {
+    if !path.exists() {
+        return Ok(BTreeMap::new());
+    }
+    let metadata: RunUiMetadataFile = read_bincode(path)?;
+    if metadata.cache_version != CACHE_VERSION
+        || &metadata.recording_fingerprint != recording_fingerprint
+    {
+        bail!("run UI metadata does not match the recording cache");
+    }
+    for key in metadata.runs.keys() {
+        validate_run_key(key)?;
+    }
+    Ok(metadata.runs)
+}
+
+fn write_run_ui_metadata(
+    directory: &Path,
+    recording_fingerprint: &RecordingFingerprint,
+    runs: &BTreeMap<String, RunUiMetadata>,
+) -> Result<()> {
+    for key in runs.keys() {
+        validate_run_key(key)?;
+    }
+    write_bincode_atomic(
+        &directory.join(RUN_METADATA_FILE),
+        &RunUiMetadataFile {
+            cache_version: CACHE_VERSION,
+            recording_fingerprint: recording_fingerprint.clone(),
+            runs: runs.clone(),
+        },
+    )
+}
+
+fn update_run_ui_metadata(
+    cache_directory: &Path,
+    recording_fingerprint: &RecordingFingerprint,
+    update: impl FnOnce(&mut BTreeMap<String, RunUiMetadata>),
+) -> Result<BTreeMap<String, RunUiMetadata>> {
+    let directory = recording_cache_directory(cache_directory, recording_fingerprint)?;
+    fs::create_dir_all(&directory)
+        .wrap_err_with(|| format!("failed to create {}", directory.display()))?;
+    let _lock = lock_file(&directory.join(RUN_METADATA_LOCK_FILE), false)?;
+    let mut runs = read_run_ui_metadata(&directory.join(RUN_METADATA_FILE), recording_fingerprint)?;
+    update(&mut runs);
+    write_run_ui_metadata(&directory, recording_fingerprint, &runs)?;
+    Ok(runs)
+}
+
+fn lock_file(path: &Path, nonblocking: bool) -> Result<File> {
+    let file = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(path)
+        .wrap_err_with(|| format!("failed to open {}", path.display()))?;
+    if nonblocking {
+        file.try_lock()
+            .wrap_err_with(|| format!("failed to lock {}", path.display()))?;
+    } else {
+        file.lock()
+            .wrap_err_with(|| format!("failed to lock {}", path.display()))?;
+    }
+    Ok(file)
+}
+
 fn model_run_key(
     canonical_model_path: &Path,
     model_hash: &[u8; 32],
@@ -563,6 +774,46 @@ fn validate_same_run(existing: &ModelRunManifest, proposed: &ModelRunManifest) -
         bail!("existing model run manifest does not match the requested run");
     }
     Ok(())
+}
+
+fn validate_run_key(key: &str) -> Result<()> {
+    if key == "recorded" {
+        return Ok(());
+    }
+    validate_model_run_key(key)
+}
+
+fn validate_model_run_key(key: &str) -> Result<()> {
+    let Some(hash) = key.strip_prefix("model-") else {
+        bail!("invalid model run key `{key}`");
+    };
+    if hash.len() != 16 || !hash.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        bail!("invalid model run key `{key}`");
+    }
+    Ok(())
+}
+
+fn lock_model_run(root: &Path, run_key: &str, nonblocking: bool) -> Result<File> {
+    validate_model_run_key(run_key)?;
+    let lock_directory = root.join(MODEL_RUN_LOCKS_DIRECTORY);
+    fs::create_dir_all(&lock_directory)
+        .wrap_err_with(|| format!("failed to create {}", lock_directory.display()))?;
+    let path = lock_directory.join(format!("{run_key}.lock"));
+    let file = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(&path)
+        .wrap_err_with(|| format!("failed to open {}", path.display()))?;
+    if nonblocking {
+        file.try_lock()
+            .wrap_err_with(|| format!("model run `{run_key}` is currently in use"))?;
+    } else {
+        file.lock()
+            .wrap_err_with(|| format!("failed to lock model run `{run_key}`"))?;
+    }
+    Ok(file)
 }
 
 fn normalize_zero(value: f32) -> f32 {
@@ -767,5 +1018,52 @@ mod tests {
             model.manifest.as_ref().unwrap().state,
             ModelRunState::Complete
         );
+    }
+
+    #[test]
+    fn run_ui_metadata_round_trips() {
+        let cache = tempfile::tempdir().unwrap();
+        let metadata = BTreeMap::from([
+            (
+                "recorded".to_string(),
+                RunUiMetadata {
+                    renamed_label: None,
+                    hidden: true,
+                },
+            ),
+            (
+                "model-0123456789abcdef".to_string(),
+                RunUiMetadata {
+                    renamed_label: Some("Renamed".to_string()),
+                    hidden: false,
+                },
+            ),
+        ]);
+        save_run_ui_metadata(cache.path(), &fingerprint(), &metadata).unwrap();
+        assert_eq!(
+            load_run_ui_metadata(cache.path(), &fingerprint()).unwrap(),
+            metadata
+        );
+    }
+
+    #[test]
+    fn deleting_model_run_validates_and_detaches_cache() {
+        let cache = tempfile::tempdir().unwrap();
+        let proposed = manifest(1);
+        let key = proposed.run_key.clone();
+        let run_directory = cache.path().join(MODEL_RUNS_DIRECTORY).join(&key);
+        let store = PredictionStore::open(cache.path(), proposed, 0, 1).unwrap();
+        drop(store);
+
+        delete_model_run(cache.path(), &fingerprint(), &key).unwrap();
+        assert!(!run_directory.exists());
+
+        let active = PredictionStore::open(cache.path(), manifest(1), 0, 1).unwrap();
+        let error = delete_model_run(cache.path(), &fingerprint(), &key).unwrap_err();
+        assert!(error.to_string().contains("currently in use"));
+        drop(active);
+
+        assert!(delete_model_run(cache.path(), &fingerprint(), "recorded").is_err());
+        assert!(delete_model_run(cache.path(), &fingerprint(), "../escape").is_err());
     }
 }

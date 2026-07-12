@@ -224,6 +224,44 @@ impl Recording {
             self.frame_count(),
         )
     }
+
+    pub fn load_run_ui_metadata(&self) -> Result<BTreeMap<String, crate::cache::RunUiMetadata>> {
+        crate::cache::load_run_ui_metadata(&self.cache_directory, self.fingerprint())
+    }
+
+    pub fn save_run_ui_metadata(
+        &self,
+        metadata: &BTreeMap<String, crate::cache::RunUiMetadata>,
+    ) -> Result<()> {
+        crate::cache::save_run_ui_metadata(&self.cache_directory, self.fingerprint(), metadata)
+    }
+
+    pub fn delete_model_run(&self, run_key: &str) -> Result<()> {
+        crate::cache::delete_model_run(&self.cache_directory, self.fingerprint(), run_key)
+    }
+
+    pub fn rename_run(
+        &self,
+        run_key: &str,
+        label: &str,
+    ) -> Result<BTreeMap<String, crate::cache::RunUiMetadata>> {
+        crate::cache::rename_run(&self.cache_directory, self.fingerprint(), run_key, label)
+    }
+
+    pub fn set_run_hidden(
+        &self,
+        run_key: &str,
+        hidden: bool,
+    ) -> Result<BTreeMap<String, crate::cache::RunUiMetadata>> {
+        crate::cache::set_run_hidden(&self.cache_directory, self.fingerprint(), run_key, hidden)
+    }
+
+    pub fn remove_run_ui_metadata(
+        &self,
+        run_key: &str,
+    ) -> Result<BTreeMap<String, crate::cache::RunUiMetadata>> {
+        crate::cache::remove_run_ui_metadata(&self.cache_directory, self.fingerprint(), run_key)
+    }
 }
 
 pub struct OriginalImageStream {
