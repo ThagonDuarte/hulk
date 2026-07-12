@@ -25,4 +25,7 @@ types = { workspace = true }
 default = ["nvidia"]
 nvidia = ["ort/cuda", "ort/tensorrt"]
 ort-dynamic = ["ort/load-dynamic"]
-webgpu = ["ort/webgpu"]
+webgpu-provider = []
+webgpu = ["webgpu-provider", "ort/webgpu"]
+bundled-webgpu = ["webgpu"]
+dynamic-webgpu = ["webgpu-provider", "ort-dynamic"]

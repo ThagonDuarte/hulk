@@ -2,4 +2,6 @@
 set -euo pipefail
 
 # ort-sys otherwise prefers a system CPU-only ONNX Runtime over its WebGPU build.
-LIBONNXRUNTIME_NO_PKG_CONFIG=1 cargo run --package detection-replay -- "$@"
+THIS_DIRECTORY="$(dirname "$(readlink -f "$0")")"
+exec env LIBONNXRUNTIME_NO_PKG_CONFIG=1 cargo run \
+  --manifest-path="${THIS_DIRECTORY}/tools/detection_replay/Cargo.toml" -- "$@"

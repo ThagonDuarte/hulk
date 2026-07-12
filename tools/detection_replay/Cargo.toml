@@ -14,7 +14,7 @@ bincode = { workspace = true }
 blake3 = { workspace = true }
 clap = { workspace = true, features = ["derive"] }
 color-eyre = { workspace = true }
-detection = { workspace = true, features = ["webgpu"] }
+detection = { workspace = true, features = ["bundled-webgpu"] }
 eframe = { workspace = true }
 egui_dock = { workspace = true }
 image = { workspace = true }

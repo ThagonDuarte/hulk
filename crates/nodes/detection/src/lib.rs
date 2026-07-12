@@ -2,7 +2,7 @@ use std::{boxed::Box, future::Future, path::Path, pin::Pin, sync::Arc, time::Dur
 
 use color_eyre::{Result, eyre::bail, eyre::eyre};
 use ndarray::{ArrayView2, ArrayView3, ArrayViewD, Axis};
-#[cfg(feature = "webgpu")]
+#[cfg(feature = "webgpu-provider")]
 use ort::execution_providers::WebGPUExecutionProvider;
 #[cfg(feature = "nvidia")]
 use ort::execution_providers::{CUDAExecutionProvider, TensorRTExecutionProvider};
@@ -16,7 +16,7 @@ use ros_z_streams::CreateAnnouncingPublisher;
 use ros2::sensor_msgs::image::Image;
 
 use ros_z::prelude::*;
-use tokio::{task::block_in_place, time::Instant};
+use tokio::{sync::oneshot, task::block_in_place, time::Instant};
 use types::{
     bounding_box::BoundingBox,
     object_detection::{NUMBER_OF_VALUES_PER_OBJECT, Object, RobocupObjectLabel, YOLOObjectLabel},
@@ -32,6 +32,11 @@ pub enum ExecutionProviderPolicy {
     #[default]
     Automatic,
     WebGpuRequired,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DetectionModelInfo {
+    pub has_pose_output: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -78,10 +83,22 @@ pub fn run_boxed_with_provider_policy(
     ctx: Arc<Context>,
     provider_policy: ExecutionProviderPolicy,
 ) -> Pin<Box<dyn Future<Output = Result<()>> + Send>> {
-    Box::pin(run(ctx, provider_policy))
+    Box::pin(run(ctx, provider_policy, None))
 }
 
-async fn run(ctx: Arc<Context>, provider_policy: ExecutionProviderPolicy) -> Result<()> {
+pub fn run_boxed_with_model_info(
+    ctx: Arc<Context>,
+    provider_policy: ExecutionProviderPolicy,
+    model_info_sender: oneshot::Sender<DetectionModelInfo>,
+) -> Pin<Box<dyn Future<Output = Result<()>> + Send>> {
+    Box::pin(run(ctx, provider_policy, Some(model_info_sender)))
+}
+
+async fn run(
+    ctx: Arc<Context>,
+    provider_policy: ExecutionProviderPolicy,
+    model_info_sender: Option<oneshot::Sender<DetectionModelInfo>>,
+) -> Result<()> {
     let node = ctx.create_node("detection").build().await?;
 
     let node_parameters = node.bind_parameter_as::<DetectionParameters>("detection")?;
@@ -126,6 +143,11 @@ async fn run(ctx: Arc<Context>, provider_policy: ExecutionProviderPolicy) -> Res
             .with_intra_threads(2)?
             .commit_from_file(model_path)
     })?;
+    let model_info =
+        model_info_from_output_names(session.outputs.iter().map(|output| &*output.name));
+    if let Some(sender) = model_info_sender {
+        let _ = sender.send(model_info);
+    }
 
     loop {
         parameter_receiver
@@ -223,6 +245,16 @@ async fn run(ctx: Arc<Context>, provider_policy: ExecutionProviderPolicy) -> Res
     }
 }
 
+fn model_info_from_output_names<'a>(
+    names: impl IntoIterator<Item = &'a str>,
+) -> DetectionModelInfo {
+    DetectionModelInfo {
+        has_pose_output: names
+            .into_iter()
+            .any(|name| name == TaskHead::PoseDetection.output_name()),
+    }
+}
+
 fn execution_providers(
     _neural_networks_folder: &Path,
     policy: ExecutionProviderPolicy,
@@ -245,7 +277,7 @@ fn execution_providers(
         providers.push(cuda.build());
     }
 
-    #[cfg(feature = "webgpu")]
+    #[cfg(feature = "webgpu-provider")]
     {
         let webgpu = WebGPUExecutionProvider::default();
         log_provider_availability(&webgpu);
@@ -258,7 +290,7 @@ fn execution_providers(
         providers.push(webgpu);
     }
 
-    #[cfg(not(feature = "webgpu"))]
+    #[cfg(not(feature = "webgpu-provider"))]
     if matches!(policy, ExecutionProviderPolicy::WebGpuRequired) {
         bail!("WebGPU was required but detection was built without its WebGPU feature");
     }
@@ -457,6 +489,22 @@ mod tests {
         let poses = extract_candidate_pose_detections(&outputs, 0.0).unwrap();
 
         assert!(poses.is_empty());
+    }
+
+    #[test]
+    fn model_info_distinguishes_pose_capability() {
+        assert_eq!(
+            model_info_from_output_names(["object_output"]),
+            DetectionModelInfo {
+                has_pose_output: false
+            }
+        );
+        assert_eq!(
+            model_info_from_output_names(["object_output", "pose_output"]),
+            DetectionModelInfo {
+                has_pose_output: true
+            }
+        );
     }
 
     #[test]
