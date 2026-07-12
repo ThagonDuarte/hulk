@@ -6,6 +6,7 @@ use detection_replay::{DetectionThresholds, ModelRunConfig, Recording, run_model
 use tracing_subscriber::EnvFilter;
 
 mod app;
+mod timeline;
 
 #[derive(Debug, Parser)]
 #[command(about = "Prerender and compare detection models on a ROS-Z MCAP recording")]

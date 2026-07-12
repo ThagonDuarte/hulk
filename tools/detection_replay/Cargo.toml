@@ -16,6 +16,7 @@ clap = { workspace = true, features = ["derive"] }
 color-eyre = { workspace = true }
 detection = { workspace = true, features = ["webgpu"] }
 eframe = { workspace = true }
+egui_dock = { workspace = true }
 image = { workspace = true }
 libc = { workspace = true }
 mcap = { workspace = true }

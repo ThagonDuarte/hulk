@@ -41,7 +41,11 @@ The desktop build requires successful ONNX Runtime WebGPU registration. The wrap
 ./detection-replay view /path/to/recording.mcap --start-frame 5000 --end-frame 5500
 ```
 
-The viewer shows one synchronized viewport per selected model. It supports source-time playback, speed changes, looping, frame stepping, scrubbing, shared pan/zoom, confidence filtering, inference timing, and a sparse `Recorded` baseline when the MCAP contains detections.
+The viewer opens the timeline, model controls, and every model viewport as tabs in one central dock node. Tabs can be reordered, detached, closed, and reopened from the top-bar `View` menu. Model viewports remain synchronized and share pan and zoom.
+
+The timestamp-proportional timeline shows source capture gaps and prediction availability for every run. Drag to scrub, scroll to zoom around the pointer, Shift+scroll to pan, and double-click to reset to the selected CLI frame range. Press `B` to toggle a bookmark and Page Up/Page Down to visit bookmarks; bookmarks are persisted per recording.
+
+The Models tab manages cached runs. Model runs can be renamed, hidden, or permanently deleted after confirming the `Are you sure?` dialog. Renames and hidden state persist in recording-specific cache metadata. Hidden runs are removed from the timeline, viewport tabs, and `View` menu but remain in Models for unhiding. The source-derived Recorded baseline can be hidden but cannot be renamed or deleted.
 
 Useful controls:
 

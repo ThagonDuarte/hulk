@@ -3258,6 +3258,7 @@ dependencies = [
  "color-eyre",
  "detection",
  "eframe",
+ "egui_dock",
  "image",
  "libc",
  "mcap",

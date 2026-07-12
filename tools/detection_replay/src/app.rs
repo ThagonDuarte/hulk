@@ -1,27 +1,41 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     sync::{Arc, mpsc},
     thread,
     time::{Duration, Instant},
 };
 
 use color_eyre::{Result, eyre::eyre};
-use detection_replay::{LoadedPredictionRun, ModelRunState, Prediction, Recording};
+use detection_replay::{
+    LoadedPredictionRun, ModelRunState, Prediction, PredictionSource, Recording, RunUiMetadata,
+};
 use eframe::{
     App, Frame, NativeOptions, Renderer,
     egui::{
-        self, Color32, ColorImage, FontId, Key, PointerButton, Pos2, Rect, RichText, Sense, Stroke,
-        StrokeKind, TextureHandle, TextureOptions, Ui, Vec2, pos2, vec2,
+        self, Color32, ColorImage, FontId, Id, Key, Modifiers, PointerButton, Pos2, Rect, RichText,
+        Sense, Stroke, StrokeKind, TextureHandle, TextureOptions, Ui, Vec2, WidgetText, pos2, vec2,
     },
 };
+use egui_dock::{DockArea, DockState, Node, Split, TabViewer, tab_viewer::OnCloseResponse};
 use types::object_detection::{Object, RobocupObjectLabel};
+
+use crate::timeline::{BookmarkCollection, TimelineState};
 
 const MIN_ZOOM: f32 = 1.0;
 const MAX_ZOOM: f32 = 20.0;
 const PREFETCH_FRAMES: usize = 12;
 
 pub fn run(recording: Recording, start_frame: usize, end_frame: usize) -> Result<()> {
-    let runs = recording.load_runs()?;
+    let mut runs = recording.load_runs()?;
+    let run_metadata = recording.load_run_ui_metadata()?;
+    for run in &mut runs {
+        if let Some(label) = run_metadata
+            .get(&run.key)
+            .and_then(|metadata| metadata.renamed_label.as_ref())
+        {
+            run.label.clone_from(label);
+        }
+    }
     let recording = Arc::new(recording);
     let loader = FrameLoader::new(Arc::clone(&recording))?;
     eframe::run_native(
@@ -38,6 +52,7 @@ pub fn run(recording: Recording, start_frame: usize, end_frame: usize) -> Result
                 loader,
                 start_frame,
                 end_frame,
+                run_metadata,
             )))
         }),
     )
@@ -47,7 +62,6 @@ pub fn run(recording: Recording, start_frame: usize, end_frame: usize) -> Result
 struct ReplayApp {
     recording: Arc<Recording>,
     runs: Vec<LoadedPredictionRun>,
-    visible_runs: Vec<bool>,
     available_counts: Vec<usize>,
     selected_frame: usize,
     displayed_frame: Option<usize>,
@@ -65,6 +79,34 @@ struct ReplayApp {
     camera_pan: Vec2,
     start_frame: usize,
     end_frame: usize,
+    dock_state: DockState<PanelTab>,
+    open_tabs: OpenTabs,
+    timeline: TimelineState,
+    bookmark_storage_key: String,
+    run_metadata: BTreeMap<String, RunUiMetadata>,
+    rename_edits: BTreeMap<String, String>,
+    management_error: Option<String>,
+    pending_delete: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum PanelTab {
+    Timeline,
+    Models,
+    Model(String),
+}
+
+struct OpenTabs {
+    timeline: bool,
+    models: bool,
+    model: BTreeMap<String, bool>,
+}
+
+enum RunAction {
+    Open(String),
+    Rename { key: String, label: String },
+    SetHidden { key: String, hidden: bool },
+    RequestDelete(String),
 }
 
 impl ReplayApp {
@@ -75,23 +117,83 @@ impl ReplayApp {
         mut loader: FrameLoader,
         start_frame: usize,
         end_frame: usize,
+        run_metadata: BTreeMap<String, RunUiMetadata>,
     ) -> Self {
         loader.request(start_frame, end_frame);
         creation_context.egui_ctx.set_visuals(egui::Visuals::dark());
-        let visible_runs = vec![true; runs.len()];
-        let available_counts = runs
+        let available_counts: Vec<usize> = runs
             .iter()
             .map(|run| {
-                run.predictions
+                run.predictions[start_frame..=end_frame]
                     .iter()
                     .filter(|value| value.is_some())
                     .count()
             })
             .collect();
+        let visible_run_count = runs
+            .iter()
+            .filter(|run| {
+                !run_metadata
+                    .get(&run.key)
+                    .is_some_and(|metadata| metadata.hidden)
+            })
+            .count();
+        let mut tabs = runs
+            .iter()
+            .filter(|run| {
+                !run_metadata
+                    .get(&run.key)
+                    .is_some_and(|metadata| metadata.hidden)
+            })
+            .map(|run| PanelTab::Model(run.key.clone()))
+            .collect::<Vec<_>>();
+        tabs.push(PanelTab::Models);
+        let mut dock_state = DockState::new(tabs);
+        let available_height = creation_context
+            .egui_ctx
+            .input(|input| input.content_rect().height())
+            .max(1.0);
+        let timeline_height = crate::timeline::desired_height(visible_run_count) + 30.0;
+        let central_fraction = (1.0 - timeline_height / available_height).clamp(0.2, 0.85);
+        dock_state.split(
+            (0.into(), 0.into()),
+            Split::Below,
+            central_fraction,
+            Node::leaf(PanelTab::Timeline),
+        );
+        let bookmark_storage_key = format!(
+            "detection-replay-bookmarks-{}",
+            recording
+                .fingerprint()
+                .cache_key()
+                .unwrap_or_else(|_| "unknown-recording".to_string())
+        );
+        let mut timeline = TimelineState::new(&recording, start_frame, end_frame);
+        if let Some(bookmarks) = creation_context
+            .storage
+            .and_then(|storage| storage.get_string(&bookmark_storage_key))
+            .and_then(|value| serde_json::from_str::<BookmarkCollection>(&value).ok())
+        {
+            timeline.bookmarks = bookmarks;
+        }
+        let rename_edits = runs
+            .iter()
+            .map(|run| (run.key.clone(), run.label.clone()))
+            .collect();
+        let open_models = runs
+            .iter()
+            .map(|run| {
+                (
+                    run.key.clone(),
+                    !run_metadata
+                        .get(&run.key)
+                        .is_some_and(|metadata| metadata.hidden),
+                )
+            })
+            .collect();
         Self {
             recording,
             runs,
-            visible_runs,
             available_counts,
             selected_frame: start_frame,
             displayed_frame: None,
@@ -109,6 +211,18 @@ impl ReplayApp {
             camera_pan: Vec2::ZERO,
             start_frame,
             end_frame,
+            dock_state,
+            open_tabs: OpenTabs {
+                timeline: true,
+                models: true,
+                model: open_models,
+            },
+            timeline,
+            bookmark_storage_key,
+            run_metadata,
+            rename_edits,
+            management_error: None,
+            pending_delete: None,
         }
     }
 
@@ -196,20 +310,33 @@ impl ReplayApp {
                 self.loader.request(next_frame, self.end_frame);
             }
         }
-        context.request_repaint_after(Duration::from_millis(5));
+        let repaint_after = if next_frame < self.end_frame {
+            let current = self.recording.frames()[next_frame].timestamp_nanos;
+            let next = self.recording.frames()[next_frame + 1].timestamp_nanos;
+            (((next - current).max(1) as f64 / 1.0e9 - self.playback_accumulator)
+                / f64::from(self.playback_speed))
+            .max(0.001)
+        } else {
+            0.001
+        };
+        context.request_repaint_after(Duration::from_secs_f64(repaint_after));
     }
 
     fn handle_keys(&mut self, context: &egui::Context) {
         if context.wants_keyboard_input() {
             return;
         }
-        let (toggle, previous, next) = context.input(|input| {
-            (
-                input.key_pressed(Key::Space),
-                input.key_pressed(Key::ArrowLeft) || input.key_pressed(Key::Comma),
-                input.key_pressed(Key::ArrowRight) || input.key_pressed(Key::Period),
-            )
-        });
+        let (toggle, previous, next, bookmark, previous_bookmark, next_bookmark) =
+            context.input(|input| {
+                (
+                    input.key_pressed(Key::Space),
+                    input.key_pressed(Key::ArrowLeft) || input.key_pressed(Key::Comma),
+                    input.key_pressed(Key::ArrowRight) || input.key_pressed(Key::Period),
+                    input.key_pressed(Key::B) && input.modifiers == Modifiers::NONE,
+                    input.key_pressed(Key::PageUp),
+                    input.key_pressed(Key::PageDown),
+                )
+            });
         if toggle {
             self.is_playing = !self.is_playing;
             self.last_playback_update = Instant::now();
@@ -221,6 +348,28 @@ impl ReplayApp {
         if next {
             self.is_playing = false;
             self.select_frame(self.selected_frame.saturating_add(1));
+        }
+        if bookmark {
+            self.timeline.bookmarks.toggle(self.selected_frame);
+        }
+        if previous_bookmark
+            && let Some(frame) = self.timeline.bookmarks.previous(
+                self.selected_frame,
+                self.start_frame,
+                self.end_frame,
+            )
+        {
+            self.is_playing = false;
+            self.select_frame(frame);
+        }
+        if next_bookmark
+            && let Some(frame) =
+                self.timeline
+                    .bookmarks
+                    .next(self.selected_frame, self.start_frame, self.end_frame)
+        {
+            self.is_playing = false;
+            self.select_frame(frame);
         }
     }
 
@@ -261,102 +410,303 @@ impl ReplayApp {
                     self.selected_frame, self.start_frame, self.end_frame
                 ));
                 ui.label(format!("{:.3}s", self.relative_time(self.selected_frame)));
+                ui.separator();
+                ui.menu_button("View", |ui| {
+                    if !self.open_tabs.timeline && ui.button("Timeline").clicked() {
+                        self.dock_state.push_to_focused_leaf(PanelTab::Timeline);
+                        self.open_tabs.timeline = true;
+                        ui.close();
+                    }
+                    if !self.open_tabs.models && ui.button("Models").clicked() {
+                        self.dock_state.push_to_focused_leaf(PanelTab::Models);
+                        self.open_tabs.models = true;
+                        ui.close();
+                    }
+                    for run in &self.runs {
+                        let hidden = self
+                            .run_metadata
+                            .get(&run.key)
+                            .is_some_and(|metadata| metadata.hidden);
+                        let open = self.open_tabs.model.get(&run.key).copied().unwrap_or(false);
+                        if !hidden && !open && ui.button(&run.label).clicked() {
+                            self.dock_state
+                                .push_to_focused_leaf(PanelTab::Model(run.key.clone()));
+                            self.open_tabs.model.insert(run.key.clone(), true);
+                            ui.close();
+                        }
+                    }
+                    if self.open_tabs.timeline
+                        && self.open_tabs.models
+                        && self.runs.iter().all(|run| {
+                            self.run_metadata
+                                .get(&run.key)
+                                .is_some_and(|metadata| metadata.hidden)
+                                || self.open_tabs.model.get(&run.key).copied().unwrap_or(false)
+                        })
+                    {
+                        ui.label("All panels are open");
+                    }
+                });
+                ui.menu_button("?", |ui| {
+                    ui.label("Space: play/pause");
+                    ui.label("Arrows or ,/.: step frame");
+                    ui.label("B: toggle bookmark");
+                    ui.label("Page Up/Down: previous/next bookmark");
+                    ui.label("Timeline drag: scrub");
+                    ui.label("Timeline wheel: zoom");
+                    ui.label("Timeline Shift+wheel: pan");
+                    ui.label("Image drag/scroll: pan/zoom");
+                    ui.label("Double-click: reset view");
+                });
             });
-            let mut frame = self.selected_frame;
-            if ui
-                .add(
-                    egui::Slider::new(&mut frame, self.start_frame..=self.end_frame)
-                        .show_value(false),
-                )
-                .changed()
-            {
+        });
+    }
+
+    fn models_panel(&mut self, ui: &mut Ui) -> Vec<RunAction> {
+        let mut actions = Vec::new();
+        ui.heading("Models");
+        ui.add(
+            egui::Slider::new(&mut self.confidence_filter, 0.0..=1.0).text("display confidence"),
+        );
+        if let Some(error) = &self.management_error {
+            ui.colored_label(Color32::LIGHT_RED, error);
+        }
+        ui.separator();
+        for (index, run) in self.runs.iter().enumerate() {
+            let key = run.key.clone();
+            let is_recorded = run.source == PredictionSource::RecordedBaseline;
+            let mut hidden = self
+                .run_metadata
+                .get(&key)
+                .is_some_and(|metadata| metadata.hidden);
+            ui.horizontal(|ui| {
+                if is_recorded {
+                    ui.strong(&run.label);
+                    ui.add_enabled(false, egui::Button::new("Rename"))
+                        .on_disabled_hover_text("Recorded is derived from the MCAP");
+                } else {
+                    let edit = self
+                        .rename_edits
+                        .entry(key.clone())
+                        .or_insert_with(|| run.label.clone());
+                    let response = ui.text_edit_singleline(edit);
+                    let submit = ui.small_button("Rename").clicked()
+                        || (response.lost_focus()
+                            && ui.input(|input| input.key_pressed(Key::Enter)));
+                    if submit {
+                        actions.push(RunAction::Rename {
+                            key: key.clone(),
+                            label: edit.clone(),
+                        });
+                    }
+                }
+                if ui.checkbox(&mut hidden, "Hidden").changed() {
+                    actions.push(RunAction::SetHidden {
+                        key: key.clone(),
+                        hidden,
+                    });
+                }
+                let open = self.open_tabs.model.get(&key).copied().unwrap_or(false);
+                if !hidden && !open && ui.small_button("Open viewport").clicked() {
+                    actions.push(RunAction::Open(key.clone()));
+                }
+                if !is_recorded && ui.small_button("Delete").clicked() {
+                    actions.push(RunAction::RequestDelete(key.clone()));
+                } else if is_recorded {
+                    ui.add_enabled(false, egui::Button::new("Delete"))
+                        .on_disabled_hover_text("Recorded is derived from the MCAP");
+                }
+            });
+            let available = self.available_counts[index];
+            let state = run
+                .manifest
+                .as_ref()
+                .map_or("recorded", |manifest| match manifest.state {
+                    ModelRunState::Running => "running",
+                    ModelRunState::Complete => "complete",
+                    ModelRunState::Incomplete => "incomplete",
+                    ModelRunState::Failed => "failed",
+                });
+            ui.label(
+                RichText::new(format!("{state}, {available} frames"))
+                    .small()
+                    .color(Color32::GRAY),
+            );
+            ui.add_space(6.0);
+        }
+        if self.runs.is_empty() {
+            ui.label("No prediction caches found.");
+        }
+        actions
+    }
+
+    fn dock_area(&mut self, context: &egui::Context) {
+        egui::CentralPanel::default().show(context, |ui| {
+            let mut dock_state =
+                std::mem::replace(&mut self.dock_state, DockState::new(Vec::new()));
+            let mut viewer = DetectionTabViewer {
+                app: self,
+                selected_frame: None,
+                run_actions: Vec::new(),
+            };
+            DockArea::new(&mut dock_state).show_inside(ui, &mut viewer);
+            let selected_frame = viewer.selected_frame;
+            for action in viewer.run_actions {
+                self.handle_run_action(action, &mut dock_state);
+            }
+            self.dock_state = dock_state;
+            if let Some(frame) = selected_frame {
                 self.is_playing = false;
                 self.select_frame(frame);
             }
         });
     }
 
-    fn side_panel(&mut self, context: &egui::Context) {
-        egui::SidePanel::left("model-list")
-            .resizable(true)
-            .default_width(220.0)
-            .show(context, |ui| {
-                ui.heading("Models");
-                ui.add(
-                    egui::Slider::new(&mut self.confidence_filter, 0.0..=1.0)
-                        .text("display confidence"),
-                );
-                ui.separator();
-                for (index, run) in self.runs.iter().enumerate() {
-                    ui.checkbox(&mut self.visible_runs[index], &run.label);
-                    let available = self.available_counts[index];
-                    let state = run
-                        .manifest
-                        .as_ref()
-                        .map_or("recorded".to_string(), |manifest| match manifest.state {
-                            ModelRunState::Running => "running".to_string(),
-                            ModelRunState::Complete => "complete".to_string(),
-                            ModelRunState::Incomplete => "incomplete".to_string(),
-                            ModelRunState::Failed => "failed".to_string(),
-                        });
-                    ui.label(
-                        RichText::new(format!("{state}, {available} frames"))
-                            .small()
-                            .color(Color32::GRAY),
+    fn handle_run_action(&mut self, action: RunAction, dock_state: &mut DockState<PanelTab>) {
+        self.management_error = None;
+        match action {
+            RunAction::Open(key) => {
+                if !self.is_hidden(&key) {
+                    dock_state.push_to_focused_leaf(PanelTab::Model(key.clone()));
+                    self.open_tabs.model.insert(key, true);
+                }
+            }
+            RunAction::Rename { key, label } => {
+                let label = label.trim();
+                if label.is_empty() {
+                    self.management_error = Some("run name must not be empty".to_string());
+                    return;
+                }
+                let Some(run) = self.runs.iter().find(|run| run.key == key) else {
+                    return;
+                };
+                if run.source == PredictionSource::RecordedBaseline {
+                    self.management_error =
+                        Some("the Recorded baseline cannot be renamed".to_string());
+                    return;
+                }
+                self.run_metadata = match self.recording.rename_run(&key, label) {
+                    Ok(metadata) => metadata,
+                    Err(error) => {
+                        self.management_error =
+                            Some(format!("failed to persist run rename: {error:#}"));
+                        return;
+                    }
+                };
+                if let Some(run) = self.runs.iter_mut().find(|run| run.key == key) {
+                    run.label = label.to_string();
+                }
+                self.rename_edits.insert(key, label.to_string());
+            }
+            RunAction::SetHidden { key, hidden } => {
+                self.run_metadata = match self.recording.set_run_hidden(&key, hidden) {
+                    Ok(metadata) => metadata,
+                    Err(error) => {
+                        self.management_error =
+                            Some(format!("failed to persist hidden state: {error:#}"));
+                        return;
+                    }
+                };
+                if hidden {
+                    dock_state.retain_tabs(
+                        |tab| !matches!(tab, PanelTab::Model(tab_key) if tab_key == &key),
                     );
-                    ui.add_space(6.0);
+                    self.open_tabs.model.insert(key, false);
+                } else {
+                    dock_state.push_to_focused_leaf(PanelTab::Model(key.clone()));
+                    self.open_tabs.model.insert(key, true);
                 }
-                if self.runs.is_empty() {
-                    ui.label("No prediction caches found.");
-                }
-                ui.separator();
-                ui.label("Space: play/pause");
-                ui.label("Arrows: step frame");
-                ui.label("Drag/scroll: pan/zoom");
-                ui.label("Double-click: reset view");
+            }
+            RunAction::RequestDelete(key) => self.pending_delete = Some(key),
+        }
+    }
+
+    fn is_hidden(&self, key: &str) -> bool {
+        self.run_metadata
+            .get(key)
+            .is_some_and(|metadata| metadata.hidden)
+    }
+
+    fn delete_run(&mut self, key: &str) {
+        self.management_error = None;
+        if let Err(error) = self.recording.delete_model_run(key) {
+            self.management_error = Some(format!("failed to delete run: {error:#}"));
+            return;
+        }
+
+        match self.recording.remove_run_ui_metadata(key) {
+            Ok(metadata) => self.run_metadata = metadata,
+            Err(error) => {
+                self.run_metadata.remove(key);
+                self.management_error = Some(format!(
+                    "run was deleted, but its GUI metadata could not be updated: {error:#}"
+                ));
+            }
+        }
+        self.dock_state
+            .retain_tabs(|tab| !matches!(tab, PanelTab::Model(tab_key) if tab_key == key));
+        if let Some(index) = self.runs.iter().position(|run| run.key == key) {
+            self.runs.remove(index);
+            self.available_counts.remove(index);
+        }
+        self.open_tabs.model.remove(key);
+        self.rename_edits.remove(key);
+        self.pending_delete = None;
+    }
+
+    fn show_delete_confirmation(&mut self, context: &egui::Context) {
+        let Some(key) = self.pending_delete.clone() else {
+            return;
+        };
+        let Some(run) = self.runs.iter().find(|run| run.key == key) else {
+            self.pending_delete = None;
+            return;
+        };
+        let label = run.label.clone();
+        let model_path = run
+            .manifest
+            .as_ref()
+            .map(|manifest| manifest.canonical_model_path.display().to_string())
+            .unwrap_or_default();
+        egui::Window::new("Are you sure?")
+            .id(Id::new("delete-run-confirmation"))
+            .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
+            .collapsible(false)
+            .resizable(false)
+            .show(context, |ui| {
+                ui.label(format!("Delete cached predictions for `{label}`?"));
+                ui.label(RichText::new(model_path).small().color(Color32::GRAY));
+                ui.colored_label(
+                    Color32::LIGHT_RED,
+                    "This permanently removes the cached run and cannot be undone.",
+                );
+                ui.horizontal(|ui| {
+                    if ui.button("Cancel").clicked() {
+                        self.pending_delete = None;
+                    }
+                    if ui
+                        .button(RichText::new("Delete run").color(Color32::LIGHT_RED))
+                        .clicked()
+                    {
+                        self.delete_run(&key);
+                    }
+                });
             });
     }
 
-    fn central_panel(&mut self, context: &egui::Context) {
-        egui::CentralPanel::default().show(context, |ui| {
-            if let Some(error) = &self.load_error {
-                ui.colored_label(Color32::LIGHT_RED, error);
-            }
-            let Some(texture) = self.texture.clone() else {
-                ui.centered_and_justified(|ui| ui.spinner());
-                return;
-            };
-            let Some(frame_index) = self.displayed_frame else {
-                return;
-            };
-            let visible = self
-                .visible_runs
-                .iter()
-                .enumerate()
-                .filter_map(|(index, visible)| visible.then_some(index))
-                .collect::<Vec<_>>();
-            if visible.is_empty() {
-                ui.centered_and_justified(|ui| ui.label("Select at least one model."));
-                return;
-            }
-            let columns = ((ui.available_width() / 430.0).floor() as usize).clamp(1, 4);
-            egui::ScrollArea::vertical().show(ui, |ui| {
-                for row in visible.chunks(columns) {
-                    ui.columns(columns, |column_uis| {
-                        for (column, run_index) in row.iter().copied().enumerate() {
-                            let run = &self.runs[run_index];
-                            let label = run.label.clone();
-                            let prediction = run.predictions[frame_index].clone();
-                            column_uis[column].group(|ui| {
-                                ui.heading(label);
-                                self.model_view(ui, &texture, frame_index, prediction.as_deref());
-                            });
-                        }
-                    });
-                    ui.add_space(8.0);
-                }
-            });
-        });
+    fn model_panel(&mut self, ui: &mut Ui, run_index: usize) {
+        if let Some(error) = &self.load_error {
+            ui.colored_label(Color32::LIGHT_RED, error);
+        }
+        let Some(texture) = self.texture.clone() else {
+            ui.centered_and_justified(|ui| ui.spinner());
+            return;
+        };
+        let Some(frame_index) = self.displayed_frame else {
+            return;
+        };
+        let prediction = self.runs[run_index].predictions[frame_index].clone();
+        self.model_view(ui, &texture, frame_index, prediction.as_deref());
     }
 
     fn model_view(
@@ -468,8 +818,95 @@ impl App for ReplayApp {
         self.advance_playback(context);
         self.display_selected_frame(context);
         self.top_panel(context);
-        self.side_panel(context);
-        self.central_panel(context);
+        self.dock_area(context);
+        self.show_delete_confirmation(context);
+    }
+
+    fn save(&mut self, storage: &mut dyn eframe::Storage) {
+        if let Ok(bookmarks) = serde_json::to_string(&self.timeline.bookmarks) {
+            storage.set_string(&self.bookmark_storage_key, bookmarks);
+        }
+    }
+}
+
+struct DetectionTabViewer<'a> {
+    app: &'a mut ReplayApp,
+    selected_frame: Option<usize>,
+    run_actions: Vec<RunAction>,
+}
+
+impl TabViewer for DetectionTabViewer<'_> {
+    type Tab = PanelTab;
+
+    fn title(&mut self, tab: &mut Self::Tab) -> WidgetText {
+        match tab {
+            PanelTab::Timeline => "Timeline".into(),
+            PanelTab::Models => "Models".into(),
+            PanelTab::Model(key) => self
+                .app
+                .runs
+                .iter()
+                .find(|run| &run.key == key)
+                .map_or_else(|| "Missing run".into(), |run| run.label.clone().into()),
+        }
+    }
+
+    fn id(&mut self, tab: &mut Self::Tab) -> Id {
+        match tab {
+            PanelTab::Timeline => Id::new("detection-replay-timeline"),
+            PanelTab::Models => Id::new("detection-replay-models"),
+            PanelTab::Model(key) => Id::new(("detection-replay-model", key)),
+        }
+    }
+
+    fn ui(&mut self, ui: &mut Ui, tab: &mut Self::Tab) {
+        match tab {
+            PanelTab::Timeline => {
+                let hidden_runs = self
+                    .app
+                    .run_metadata
+                    .iter()
+                    .filter_map(|(key, metadata)| metadata.hidden.then_some(key.clone()))
+                    .collect::<BTreeSet<_>>();
+                let response = crate::timeline::show(
+                    ui,
+                    &self.app.recording,
+                    &self.app.runs,
+                    self.app.start_frame..=self.app.end_frame,
+                    self.app.selected_frame,
+                    &mut self.app.timeline,
+                    &hidden_runs,
+                );
+                if response.response.changed() || response.selected_frame.is_some() {
+                    self.selected_frame = response.selected_frame;
+                }
+            }
+            PanelTab::Models => self.run_actions.extend(self.app.models_panel(ui)),
+            PanelTab::Model(key) => {
+                if let Some(index) = self.app.runs.iter().position(|run| &run.key == key) {
+                    self.app.model_panel(ui, index);
+                }
+            }
+        }
+    }
+
+    fn on_close(&mut self, tab: &mut Self::Tab) -> OnCloseResponse {
+        match tab {
+            PanelTab::Timeline => self.app.open_tabs.timeline = false,
+            PanelTab::Models => self.app.open_tabs.models = false,
+            PanelTab::Model(key) => {
+                self.app.open_tabs.model.insert(key.clone(), false);
+            }
+        }
+        OnCloseResponse::Close
+    }
+
+    fn scroll_bars(&self, tab: &Self::Tab) -> [bool; 2] {
+        match tab {
+            PanelTab::Models => [true, true],
+            PanelTab::Timeline => [false, true],
+            PanelTab::Model(_) => [false, false],
+        }
     }
 }
 
