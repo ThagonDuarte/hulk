@@ -118,6 +118,7 @@ fn main() -> Result<()> {
             let recording_path = resolve_recording(recording);
             let cache_dir = cache_dir.unwrap_or_else(|| default_cache_dir(&recording_path));
             let recording = Recording::open(&recording_path, &cache_dir)?;
+            report_recording_warning(&recording);
             let (start_frame, end_frame) = frames.resolve(recording.frame_count())?;
             let recorded_predictions = recording
                 .load_runs()?
@@ -135,9 +136,6 @@ fn main() -> Result<()> {
                 recording_path.display(),
                 cache_dir.display()
             );
-            if let Some(warning) = &recording.index().tail_warning {
-                println!("warning: {warning}");
-            }
         }
         Command::Prerender {
             recording,
@@ -151,6 +149,7 @@ fn main() -> Result<()> {
             let recording_path = resolve_recording(recording);
             let cache_dir = cache_dir.unwrap_or_else(|| default_cache_dir(&recording_path));
             let recording = Recording::open(&recording_path, &cache_dir)?;
+            report_recording_warning(&recording);
             let (start_frame, end_frame) = frames.resolve(recording.frame_count())?;
             let thresholds = DetectionThresholds {
                 minimum_candidate_confidence: confidence,
@@ -212,6 +211,12 @@ fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+fn report_recording_warning(recording: &Recording) {
+    if let Some(warning) = &recording.index().tail_warning {
+        eprintln!("warning: {warning}");
+    }
 }
 
 fn resolve_recording(path: PathBuf) -> PathBuf {

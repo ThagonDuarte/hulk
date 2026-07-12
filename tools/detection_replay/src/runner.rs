@@ -62,8 +62,8 @@ impl ModelRunConfig {
 }
 
 #[derive(Clone, Debug)]
-pub struct RunProgress {
-    pub label: String,
+pub struct RunProgress<'a> {
+    pub label: &'a str,
     pub completed_frames: usize,
     pub target_frames: usize,
     pub total_frames: usize,
@@ -75,15 +75,13 @@ pub async fn run_model<F>(
     mut progress: F,
 ) -> Result<ModelRunManifest>
 where
-    F: FnMut(RunProgress),
+    F: FnMut(RunProgress<'_>),
 {
     let cache_directory = recording.cache_directory();
     let (canonical_model_path, model_hash) = hash_model(&config.model_path)?;
     let frame_end = config
         .end_frame
         .unwrap_or_else(|| recording.frame_count().saturating_sub(1));
-    validate_frame_range(config.start_frame, frame_end, recording.frame_count())?;
-    let frame_count = frame_end - config.start_frame + 1;
     let proposed = ModelRunManifest::new(
         config.label.clone(),
         canonical_model_path,
@@ -93,12 +91,13 @@ where
         recording.frame_count(),
         config.start_frame..=frame_end,
     )?;
+    let frame_count = proposed.target_frame_count()?;
     let mut store = PredictionStore::open(cache_directory, proposed)?;
 
     let target_frames =
         target_frame_count(frame_count, config.frame_limit, store.completed_count());
     progress(RunProgress {
-        label: config.label.clone(),
+        label: &config.label,
         completed_frames: store.completed_count(),
         target_frames,
         total_frames: recording.frame_count(),
@@ -129,22 +128,6 @@ where
     Ok(store.manifest().clone())
 }
 
-pub async fn run_model_traced(
-    recording: &Recording,
-    config: ModelRunConfig,
-) -> Result<ModelRunManifest> {
-    run_model(recording, config, |progress| {
-        tracing::info!(
-            label = progress.label,
-            completed = progress.completed_frames,
-            target = progress.target_frames,
-            total = progress.total_frames,
-            "detection replay progress"
-        );
-    })
-    .await
-}
-
 async fn execute_run<F>(
     recording: &Recording,
     cache_directory: &Path,
@@ -154,7 +137,7 @@ async fn execute_run<F>(
     progress: &mut F,
 ) -> Result<()>
 where
-    F: FnMut(RunProgress),
+    F: FnMut(RunProgress<'_>),
 {
     let parameter_directory = tempfile::tempdir_in(cache_directory)
         .wrap_err("failed to create temporary detection parameter layer")?;
@@ -330,7 +313,7 @@ where
                 &postprocessing_subscriber,
                 &nms_subscriber,
                 config.output_timeout,
-            ) => result?,
+            ) => result.wrap_err_with(|| format!("failed to receive outputs for frame {}", frame.frame_index))?,
             result = detector_task.join() => return Err(detector_stopped(result)),
         };
         verify_output_timestamps(&frame, &objects, &poses)?;
@@ -344,7 +327,7 @@ where
             non_maximum_suppression_duration_nanos: Some(duration_nanos(nms)),
         })?;
         progress(RunProgress {
-            label: config.label.clone(),
+            label: &config.label,
             completed_frames: store.completed_count(),
             target_frames,
             total_frames: recording.frame_count(),
@@ -429,11 +412,36 @@ async fn receive_outputs(
 )> {
     tokio::time::timeout(timeout, async {
         tokio::try_join!(
-            object_subscriber.recv(),
-            pose_subscriber.recv(),
-            inference_subscriber.recv(),
-            postprocessing_subscriber.recv(),
-            nms_subscriber.recv(),
+            async {
+                object_subscriber
+                    .recv()
+                    .await
+                    .wrap_err("failed to receive detected_objects")
+            },
+            async {
+                pose_subscriber
+                    .recv()
+                    .await
+                    .wrap_err("failed to receive detected_poses")
+            },
+            async {
+                inference_subscriber
+                    .recv()
+                    .await
+                    .wrap_err("failed to receive inference_duration")
+            },
+            async {
+                postprocessing_subscriber
+                    .recv()
+                    .await
+                    .wrap_err("failed to receive post_processing_duration")
+            },
+            async {
+                nms_subscriber
+                    .recv()
+                    .await
+                    .wrap_err("failed to receive non_maximum_suppression_duration")
+            },
         )
     })
     .await
@@ -494,16 +502,6 @@ fn write_detection_parameters(
         .wrap_err_with(|| format!("failed to write {}", path.display()))?;
     file.sync_all()
         .wrap_err_with(|| format!("failed to sync {}", path.display()))?;
-    Ok(())
-}
-
-fn validate_frame_range(start: usize, end: usize, frame_count: usize) -> Result<()> {
-    if start > end {
-        bail!("start frame {start} is greater than end frame {end}");
-    }
-    if end >= frame_count {
-        bail!("end frame {end} is out of range for {frame_count} frames");
-    }
     Ok(())
 }
 
