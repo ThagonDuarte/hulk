@@ -7,8 +7,8 @@ use std::{
 
 use color_eyre::{Result, eyre::eyre};
 use detection_replay::{
-    BookmarkCollection, LoadedPredictionRun, ModelRunState, Prediction, PredictionSource,
-    Recording, RunUiMetadata,
+    BookmarkCollection, LoadedPredictionChunk, LoadedPredictionRun, ModelRunState, Prediction,
+    PredictionSource, Recording, RunUiMetadata,
 };
 use eframe::{
     App, Frame, NativeOptions, Renderer,
@@ -147,7 +147,7 @@ struct ReplayApp {
     decoded_frames: BTreeMap<usize, ColorImage>,
     loader: FrameLoader,
     prediction_loader: PredictionLoader,
-    loaded_predictions: BTreeMap<(String, usize), Option<Arc<Prediction>>>,
+    loaded_prediction_chunks: BTreeMap<(String, usize), Vec<Option<Arc<Prediction>>>>,
     frame_errors: BTreeMap<usize, String>,
     is_playing: bool,
     loop_playback: bool,
@@ -185,6 +185,13 @@ enum RunAction {
     Rename { key: String, label: String },
     SetHidden { key: String, hidden: bool },
     RequestDelete(String),
+}
+
+enum PredictionDisplay {
+    Ready(Arc<Prediction>),
+    Loading,
+    Unavailable,
+    Error,
 }
 
 impl ReplayApp {
@@ -256,7 +263,7 @@ impl ReplayApp {
             decoded_frames: BTreeMap::new(),
             loader,
             prediction_loader,
-            loaded_predictions: BTreeMap::new(),
+            loaded_prediction_chunks: BTreeMap::new(),
             frame_errors: BTreeMap::new(),
             is_playing: false,
             loop_playback: true,
@@ -321,33 +328,46 @@ impl ReplayApp {
 
     fn poll_prediction_loader(&mut self) {
         while let Some(result) = self.prediction_loader.try_receive() {
-            let key = (result.run_key.clone(), result.frame);
-            match result.prediction {
-                Ok(prediction) => {
+            let key = (result.run_key.clone(), result.chunk_start);
+            match result.chunk {
+                Ok(chunk) => {
                     self.prediction_errors.remove(&key);
-                    self.loaded_predictions.insert(key, prediction);
+                    self.loaded_prediction_chunks.insert(key, chunk.predictions);
                 }
                 Err(error) => {
-                    self.loaded_predictions.insert(key, None);
                     self.prediction_errors.insert(
-                        (result.run_key, result.frame),
+                        (result.run_key, result.chunk_start),
                         format!(
-                            "failed to load prediction for frame {}: {error}",
-                            result.frame
+                            "failed to load prediction chunk at frame {}: {error}",
+                            result.chunk_start
                         ),
                     );
                 }
             }
         }
-        let retain_from = self.selected_frame.saturating_sub(1);
-        let retain_through = self
-            .selected_frame
-            .saturating_add(PREFETCH_FRAMES)
-            .min(self.end_frame);
-        self.loaded_predictions
-            .retain(|(_, frame), _| retain_from <= *frame && *frame <= retain_through);
+        let prefetch_frames = prediction_prefetch_frames(
+            self.selected_frame,
+            self.start_frame,
+            self.end_frame,
+            self.loop_playback,
+        );
+        let retained_chunks = self
+            .runs
+            .iter()
+            .flat_map(|run| {
+                prefetch_frames
+                    .iter()
+                    .filter_map(|frame| {
+                        run.prediction_chunk_start(*frame)
+                            .map(|start| (run.key.clone(), start))
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect::<BTreeSet<_>>();
+        self.loaded_prediction_chunks
+            .retain(|key, _| retained_chunks.contains(key));
         self.prediction_errors
-            .retain(|(_, frame), _| retain_from <= *frame && *frame <= retain_through);
+            .retain(|key, _| retained_chunks.contains(key));
     }
 
     fn display_selected_frame(&mut self, context: &egui::Context) {
@@ -856,13 +876,6 @@ impl ReplayApp {
             });
             return;
         }
-        let run_key = self.runs[run_index].key.clone();
-        if let Some(error) = self
-            .prediction_errors
-            .get(&(run_key.clone(), self.selected_frame))
-        {
-            ui.colored_label(Color32::LIGHT_RED, error);
-        }
         let Some(texture) = self.texture.clone() else {
             ui.centered_and_justified(|ui| ui.spinner());
             return;
@@ -870,22 +883,43 @@ impl ReplayApp {
         let Some(frame_index) = self.displayed_frame else {
             return;
         };
-        let prediction_key = (run_key, frame_index);
-        let prediction = self.loaded_predictions.get(&prediction_key).cloned();
-        let prediction_pending = prediction.is_none();
-        if prediction_pending {
-            for frame in frame_index..=frame_index.saturating_add(2).min(self.end_frame) {
-                self.prediction_loader
-                    .request(self.runs[run_index].clone(), frame);
+        let run = self.runs[run_index].clone();
+        for frame in prediction_prefetch_frames(
+            frame_index,
+            self.start_frame,
+            self.end_frame,
+            self.loop_playback,
+        ) {
+            let Some(chunk_start) = run.prediction_chunk_start(frame) else {
+                continue;
+            };
+            let key = (run.key.clone(), chunk_start);
+            if !self.loaded_prediction_chunks.contains_key(&key)
+                && !self.prediction_errors.contains_key(&key)
+            {
+                self.prediction_loader.request(run.clone(), frame);
             }
         }
-        self.model_view(
-            ui,
-            &texture,
-            frame_index,
-            prediction.flatten().as_deref(),
-            prediction_pending,
-        );
+        let display = if !run.is_available(frame_index) {
+            PredictionDisplay::Unavailable
+        } else {
+            let chunk_start = run
+                .prediction_chunk_start(frame_index)
+                .expect("available prediction must have a chunk");
+            let key = (run.key.clone(), chunk_start);
+            if let Some(error) = self.prediction_errors.get(&key) {
+                ui.colored_label(Color32::LIGHT_RED, error);
+                PredictionDisplay::Error
+            } else if let Some(predictions) = self.loaded_prediction_chunks.get(&key) {
+                predictions
+                    .get(frame_index - chunk_start)
+                    .and_then(Clone::clone)
+                    .map_or(PredictionDisplay::Unavailable, PredictionDisplay::Ready)
+            } else {
+                PredictionDisplay::Loading
+            }
+        };
+        self.model_view(ui, &texture, frame_index, display);
     }
 
     fn model_view(
@@ -893,8 +927,7 @@ impl ReplayApp {
         ui: &mut Ui,
         texture: &TextureHandle,
         frame_index: usize,
-        prediction: Option<&Prediction>,
-        prediction_pending: bool,
+        prediction: PredictionDisplay,
     ) {
         let frame = &self.recording.frames()[frame_index];
         let image_size = vec2(frame.width as f32, frame.height as f32);
@@ -914,7 +947,7 @@ impl ReplayApp {
             Color32::WHITE,
         );
         match prediction {
-            Some(prediction) => {
+            PredictionDisplay::Ready(prediction) => {
                 draw_objects(
                     ui,
                     viewport,
@@ -971,24 +1004,17 @@ impl ReplayApp {
                     "{object_count} detections, {pose_status}, {timing}"
                 ));
             }
-            None => {
-                painter.rect_filled(viewport, 0.0, Color32::from_black_alpha(90));
-                painter.text(
-                    viewport.center(),
-                    egui::Align2::CENTER_CENTER,
-                    if prediction_pending {
-                        "loading prediction"
-                    } else {
-                        "prediction unavailable"
-                    },
-                    FontId::proportional(16.0),
-                    Color32::LIGHT_GRAY,
-                );
-                ui.label(if prediction_pending {
-                    "Loading cached result"
-                } else {
-                    "No cached result for this frame"
+            PredictionDisplay::Loading => {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label("Loading prediction");
                 });
+            }
+            PredictionDisplay::Unavailable => {
+                ui.label("Prediction unavailable for this frame");
+            }
+            PredictionDisplay::Error => {
+                ui.colored_label(Color32::LIGHT_RED, "Cached prediction could not be loaded");
             }
         }
     }
@@ -1287,12 +1313,13 @@ struct PredictionLoader {
 struct PredictionRequest {
     run: LoadedPredictionRun,
     frame: usize,
+    chunk_start: usize,
 }
 
 struct PredictionResult {
     run_key: String,
-    frame: usize,
-    prediction: std::result::Result<Option<Arc<Prediction>>, String>,
+    chunk_start: usize,
+    chunk: std::result::Result<LoadedPredictionChunk, String>,
 }
 
 impl PredictionLoader {
@@ -1305,10 +1332,10 @@ impl PredictionLoader {
                 while let Ok(request) = request_receiver.recv() {
                     let result = PredictionResult {
                         run_key: request.run.key.clone(),
-                        frame: request.frame,
-                        prediction: request
+                        chunk_start: request.chunk_start,
+                        chunk: request
                             .run
-                            .prediction(request.frame)
+                            .prediction_chunk(request.frame)
                             .map_err(|error| format!("{error:#}")),
                     };
                     if result_sender.send(result).is_err() {
@@ -1326,11 +1353,18 @@ impl PredictionLoader {
     }
 
     fn request(&mut self, run: LoadedPredictionRun, frame: usize) {
-        let key = (run.key.clone(), frame);
+        let Some(chunk_start) = run.prediction_chunk_start(frame) else {
+            return;
+        };
+        let key = (run.key.clone(), chunk_start);
         if self.requested.insert(key.clone())
             && self
                 .requests
-                .try_send(PredictionRequest { run, frame })
+                .try_send(PredictionRequest {
+                    run,
+                    frame,
+                    chunk_start,
+                })
                 .is_err()
         {
             self.requested.remove(&key);
@@ -1340,7 +1374,7 @@ impl PredictionLoader {
     fn try_receive(&mut self) -> Option<PredictionResult> {
         let result = self.results.try_recv().ok()?;
         self.requested
-            .remove(&(result.run_key.clone(), result.frame));
+            .remove(&(result.run_key.clone(), result.chunk_start));
         Some(result)
     }
 }
@@ -1354,6 +1388,27 @@ fn fitted_scale(viewport: Vec2, image: Vec2) -> f32 {
     (viewport.x / image.x.max(1.0))
         .min(viewport.y / image.y.max(1.0))
         .max(0.01)
+}
+
+fn prediction_prefetch_frames(
+    frame: usize,
+    start_frame: usize,
+    end_frame: usize,
+    loop_playback: bool,
+) -> [usize; 2] {
+    let lookahead = if loop_playback {
+        let frame_count = end_frame - start_frame + 1;
+        let step = PREFETCH_FRAMES % frame_count;
+        let frames_through_end = end_frame - frame;
+        if step <= frames_through_end {
+            frame + step
+        } else {
+            start_frame + step - frames_through_end - 1
+        }
+    } else {
+        frame.saturating_add(PREFETCH_FRAMES).min(end_frame)
+    };
+    [frame, lookahead]
 }
 
 fn consume_playback_time(
@@ -1536,5 +1591,19 @@ mod tests {
         assert_eq!(frame, 2);
         assert!(!playing);
         assert_eq!(accumulator, 0.0);
+    }
+
+    #[test]
+    fn prediction_prefetch_crosses_chunk_boundaries() {
+        assert_eq!(prediction_prefetch_frames(120, 0, 1_000, false), [120, 132]);
+    }
+
+    #[test]
+    fn prediction_prefetch_wraps_with_loop_playback() {
+        assert_eq!(
+            prediction_prefetch_frames(995, 100, 1_000, true),
+            [995, 106]
+        );
+        assert_eq!(prediction_prefetch_frames(100, 100, 100, true), [100, 100]);
     }
 }

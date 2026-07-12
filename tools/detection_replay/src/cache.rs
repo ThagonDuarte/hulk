@@ -312,6 +312,12 @@ struct CachedPredictionChunk {
     predictions: Vec<Option<Arc<Prediction>>>,
 }
 
+#[derive(Clone, Debug)]
+pub struct LoadedPredictionChunk {
+    pub start_frame: usize,
+    pub predictions: Vec<Option<Arc<Prediction>>>,
+}
+
 impl LoadedPredictionRun {
     pub fn is_available(&self, frame: usize) -> bool {
         self.availability.contains(frame)
@@ -325,11 +331,55 @@ impl LoadedPredictionRun {
         self.availability.count_in(range)
     }
 
+    pub fn prediction_chunk_start(&self, frame: usize) -> Option<usize> {
+        match &self.storage {
+            PredictionStorage::RecordedBaseline {
+                total_frame_count, ..
+            } => (frame < *total_frame_count)
+                .then_some(frame / PREDICTION_CHUNK_SIZE * PREDICTION_CHUNK_SIZE),
+            PredictionStorage::Model { frame_start, .. } if self.is_available(frame) => frame
+                .checked_sub(*frame_start)
+                .and_then(|relative| {
+                    (relative / PREDICTION_CHUNK_SIZE).checked_mul(PREDICTION_CHUNK_SIZE)
+                })
+                .and_then(|relative_start| frame_start.checked_add(relative_start)),
+            PredictionStorage::Model { .. } => None,
+        }
+    }
+
+    pub fn prediction_chunk(&self, frame: usize) -> Result<LoadedPredictionChunk> {
+        self.prediction_chunk_start(frame)
+            .wrap_err_with(|| format!("prediction chunk for frame {frame} is unavailable"))?;
+        self.with_prediction_chunk(frame, |chunk| {
+            Ok(LoadedPredictionChunk {
+                start_frame: chunk.start_frame,
+                predictions: chunk.predictions.clone(),
+            })
+        })
+    }
+
     /// A present empty prediction means inference ran and found nothing. `None` means absent.
     pub fn prediction(&self, frame: usize) -> Result<Option<Arc<Prediction>>> {
         if !self.is_available(frame) {
             return Ok(None);
         }
+        self.with_prediction_chunk(frame, |chunk| {
+            let offset = frame
+                .checked_sub(chunk.start_frame)
+                .wrap_err("prediction precedes cached chunk")?;
+            chunk
+                .predictions
+                .get(offset)
+                .cloned()
+                .wrap_err_with(|| format!("frame {frame} is outside its cached prediction chunk"))
+        })
+    }
+
+    fn with_prediction_chunk<T>(
+        &self,
+        frame: usize,
+        callback: impl FnOnce(&CachedPredictionChunk) -> Result<T>,
+    ) -> Result<T> {
         let (chunk_index, path) = match &self.storage {
             PredictionStorage::RecordedBaseline { directory, .. } => {
                 let index = frame / PREDICTION_CHUNK_SIZE;
@@ -378,15 +428,7 @@ impl LoadedPredictionRun {
         let chunk = cached
             .as_ref()
             .wrap_err("prediction chunk cache was unexpectedly empty")?;
-        let offset = frame
-            .checked_sub(chunk.start_frame)
-            .wrap_err("prediction precedes cached chunk")?;
-        chunk.predictions.get(offset).cloned().wrap_err_with(|| {
-            format!(
-                "frame {frame} is outside prediction chunk {}",
-                path.display()
-            )
-        })
+        callback(chunk)
     }
 }
 
@@ -2106,6 +2148,17 @@ mod tests {
         assert!(model.prediction(0).unwrap().unwrap().objects.is_empty());
         assert!(model.prediction(128).unwrap().is_some());
         assert!(model.prediction(129).unwrap().is_none());
+        let first_chunk = model.prediction_chunk(0).unwrap();
+        assert_eq!(first_chunk.start_frame, 0);
+        assert_eq!(first_chunk.predictions.len(), PREDICTION_CHUNK_SIZE);
+        let second_chunk = model.prediction_chunk(128).unwrap();
+        assert_eq!(second_chunk.start_frame, PREDICTION_CHUNK_SIZE);
+        assert_eq!(second_chunk.predictions.len(), 1);
+        assert_eq!(
+            model.prediction_chunk_start(128),
+            Some(PREDICTION_CHUNK_SIZE)
+        );
+        assert_eq!(model.prediction_chunk_start(129), None);
     }
 
     #[test]
