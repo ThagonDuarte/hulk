@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeMap,
     sync::{Arc, mpsc},
     thread,
     time::{Duration, Instant},
@@ -17,6 +18,7 @@ use types::object_detection::{Object, RobocupObjectLabel};
 
 const MIN_ZOOM: f32 = 1.0;
 const MAX_ZOOM: f32 = 20.0;
+const PREFETCH_FRAMES: usize = 12;
 
 pub fn run(recording: Recording, start_frame: usize, end_frame: usize) -> Result<()> {
     let runs = recording.load_runs()?;
@@ -50,6 +52,7 @@ struct ReplayApp {
     selected_frame: usize,
     displayed_frame: Option<usize>,
     texture: Option<TextureHandle>,
+    decoded_frames: BTreeMap<usize, ColorImage>,
     loader: FrameLoader,
     load_error: Option<String>,
     is_playing: bool,
@@ -73,7 +76,7 @@ impl ReplayApp {
         start_frame: usize,
         end_frame: usize,
     ) -> Self {
-        loader.request(start_frame);
+        loader.request(start_frame, end_frame);
         creation_context.egui_ctx.set_visuals(egui::Visuals::dark());
         let visible_runs = vec![true; runs.len()];
         let available_counts = runs
@@ -93,6 +96,7 @@ impl ReplayApp {
             selected_frame: start_frame,
             displayed_frame: None,
             texture: None,
+            decoded_frames: BTreeMap::new(),
             loader,
             load_error: None,
             is_playing: false,
@@ -112,30 +116,49 @@ impl ReplayApp {
         self.selected_frame = frame.clamp(self.start_frame, self.end_frame);
         self.playback_accumulator = 0.0;
         self.last_playback_update = Instant::now();
-        self.loader.request(self.selected_frame);
+        if !self.decoded_frames.contains_key(&self.selected_frame) {
+            self.loader.request(self.selected_frame, self.end_frame);
+        }
     }
 
     fn poll_loader(&mut self, context: &egui::Context) {
         while let Some(result) = self.loader.try_receive() {
             match result {
-                Ok((frame_index, image)) if frame_index == self.selected_frame => {
-                    let size = [image.width() as usize, image.height() as usize];
-                    let color = ColorImage::from_rgb(size, image.as_raw());
-                    self.texture = Some(context.load_texture(
-                        "detection-replay-frame",
-                        color,
-                        TextureOptions::LINEAR,
-                    ));
-                    self.displayed_frame = Some(frame_index);
-                    self.load_error = None;
+                Ok((frame_index, image)) => {
+                    self.decoded_frames.insert(frame_index, image);
                 }
-                Ok(_) => {}
                 Err(error) => self.load_error = Some(error),
             }
         }
-        if self.displayed_frame != Some(self.selected_frame) {
-            self.loader.request(self.selected_frame);
+        self.display_selected_frame(context);
+        let retain_from = self.selected_frame.saturating_sub(1);
+        self.decoded_frames
+            .retain(|frame, _| *frame >= retain_from && *frame <= self.end_frame);
+        if self.displayed_frame != Some(self.selected_frame)
+            && !self.decoded_frames.contains_key(&self.selected_frame)
+        {
+            self.loader.request(self.selected_frame, self.end_frame);
         }
+    }
+
+    fn display_selected_frame(&mut self, context: &egui::Context) {
+        if self.displayed_frame == Some(self.selected_frame) {
+            return;
+        }
+        let Some(image) = self.decoded_frames.remove(&self.selected_frame) else {
+            return;
+        };
+        let size = image.size;
+        if let Some(texture) = &mut self.texture
+            && texture.size() == size
+        {
+            texture.set(image, TextureOptions::LINEAR);
+        } else {
+            self.texture =
+                Some(context.load_texture("detection-replay-frame", image, TextureOptions::LINEAR));
+        }
+        self.displayed_frame = Some(self.selected_frame);
+        self.load_error = None;
     }
 
     fn advance_playback(&mut self, context: &egui::Context) {
@@ -169,7 +192,9 @@ impl ReplayApp {
         }
         if next_frame != self.selected_frame {
             self.selected_frame = next_frame;
-            self.loader.request(next_frame);
+            if !self.decoded_frames.contains_key(&next_frame) {
+                self.loader.request(next_frame, self.end_frame);
+            }
         }
         context.request_repaint_after(Duration::from_millis(5));
     }
@@ -438,9 +463,10 @@ impl ReplayApp {
 
 impl App for ReplayApp {
     fn update(&mut self, context: &egui::Context, _frame: &mut Frame) {
+        self.poll_loader(context);
         self.handle_keys(context);
         self.advance_playback(context);
-        self.poll_loader(context);
+        self.display_selected_frame(context);
         self.top_panel(context);
         self.side_panel(context);
         self.central_panel(context);
@@ -448,25 +474,73 @@ impl App for ReplayApp {
 }
 
 struct FrameLoader {
-    requests: mpsc::SyncSender<usize>,
-    results: mpsc::Receiver<(usize, std::result::Result<image::RgbImage, String>)>,
+    requests: mpsc::Sender<FrameRequest>,
+    results: mpsc::Receiver<FrameResult>,
     requested: Option<usize>,
+    generation: u64,
+}
+
+#[derive(Clone, Copy)]
+struct FrameRequest {
+    frame: usize,
+    end_frame: usize,
+    generation: u64,
+}
+
+struct FrameResult {
+    frame: usize,
+    generation: u64,
+    image: std::result::Result<ColorImage, String>,
 }
 
 impl FrameLoader {
     fn new(recording: Arc<Recording>) -> Result<Self> {
-        let (request_sender, request_receiver) = mpsc::sync_channel(1);
-        let (result_sender, result_receiver) = mpsc::channel();
+        let (request_sender, request_receiver) = mpsc::channel::<FrameRequest>();
+        let (result_sender, result_receiver) =
+            mpsc::sync_channel::<FrameResult>(PREFETCH_FRAMES * 2);
         thread::Builder::new()
             .name("detection-replay-frame-loader".to_string())
             .spawn(move || {
-                while let Ok(frame) = request_receiver.recv() {
-                    let result = recording
-                        .load_proxy_frame(frame)
-                        .map_err(|error| format!("failed to load frame {frame}: {error:#}"));
-                    if result_sender.send((frame, result)).is_err() {
-                        break;
+                let Ok(mut request) = request_receiver.recv() else {
+                    return;
+                };
+                'requests: loop {
+                    if let Some(latest) = request_receiver.try_iter().last() {
+                        request = latest;
                     }
+                    let prefetch_end = request
+                        .frame
+                        .saturating_add(PREFETCH_FRAMES - 1)
+                        .min(request.end_frame);
+                    for frame in request.frame..=prefetch_end {
+                        if let Some(latest) = request_receiver.try_iter().last() {
+                            request = latest;
+                            continue 'requests;
+                        }
+                        let image = recording
+                            .load_proxy_frame(frame)
+                            .map(|image| {
+                                ColorImage::from_rgb(
+                                    [image.width() as usize, image.height() as usize],
+                                    image.as_raw(),
+                                )
+                            })
+                            .map_err(|error| format!("failed to load frame {frame}: {error:#}"));
+                        if result_sender
+                            .send(FrameResult {
+                                frame,
+                                generation: request.generation,
+                                image,
+                            })
+                            .is_err()
+                        {
+                            return;
+                        }
+                    }
+                    let Ok(next) = request_receiver.recv() else {
+                        return;
+                    };
+                    request = next;
                 }
             })
             .map_err(|error| eyre!("failed to spawn frame loader: {error}"))?;
@@ -474,24 +548,39 @@ impl FrameLoader {
             requests: request_sender,
             results: result_receiver,
             requested: None,
+            generation: 0,
         })
     }
 
-    fn request(&mut self, frame: usize) {
+    fn request(&mut self, frame: usize, end_frame: usize) {
         if self.requested == Some(frame) {
             return;
         }
-        if self.requests.try_send(frame).is_ok() {
+        self.generation = self.generation.wrapping_add(1);
+        if self
+            .requests
+            .send(FrameRequest {
+                frame,
+                end_frame,
+                generation: self.generation,
+            })
+            .is_ok()
+        {
             self.requested = Some(frame);
         }
     }
 
-    fn try_receive(&mut self) -> Option<std::result::Result<(usize, image::RgbImage), String>> {
-        let (frame, result) = self.results.try_recv().ok()?;
-        if self.requested == Some(frame) {
+    fn try_receive(&mut self) -> Option<std::result::Result<(usize, ColorImage), String>> {
+        let result = loop {
+            let result = self.results.try_recv().ok()?;
+            if result.generation == self.generation {
+                break result;
+            }
+        };
+        if self.requested == Some(result.frame) {
             self.requested = None;
         }
-        Some(result.map(|image| (frame, image)))
+        Some(result.image.map(|image| (result.frame, image)))
     }
 }
 
