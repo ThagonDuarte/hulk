@@ -17,13 +17,34 @@ use eframe::{
     },
 };
 use egui_dock::{DockArea, DockState, Node, Split, TabViewer, tab_viewer::OnCloseResponse};
-use types::object_detection::{Object, RobocupObjectLabel};
+use types::{
+    object_detection::{Object, RobocupObjectLabel, YOLOObjectLabel},
+    pose_detection::{Keypoint, Pose},
+};
 
 use crate::timeline::{BookmarkCollection, TimelineState};
 
 const MIN_ZOOM: f32 = 1.0;
 const MAX_ZOOM: f32 = 20.0;
 const PREFETCH_FRAMES: usize = 12;
+const POSE_SKELETON_KEYPOINT_LINE_MAPPING: [(usize, usize); 16] = [
+    (0, 1),
+    (0, 2),
+    (1, 3),
+    (2, 4),
+    (5, 6),
+    (5, 11),
+    (6, 12),
+    (11, 12),
+    (5, 7),
+    (6, 8),
+    (7, 9),
+    (8, 10),
+    (11, 13),
+    (12, 14),
+    (13, 15),
+    (14, 16),
+];
 
 pub fn run(recording: Recording, start_frame: usize, end_frame: usize) -> Result<()> {
     let mut runs = recording.load_runs()?;
@@ -75,6 +96,8 @@ struct ReplayApp {
     playback_accumulator: f64,
     last_playback_update: Instant,
     confidence_filter: f32,
+    show_poses: bool,
+    keypoint_confidence_filter: f32,
     camera_zoom: f32,
     camera_pan: Vec2,
     start_frame: usize,
@@ -206,7 +229,9 @@ impl ReplayApp {
             playback_speed: 1.0,
             playback_accumulator: 0.0,
             last_playback_update: Instant::now(),
-            confidence_filter: 0.05,
+            confidence_filter: 0.5,
+            show_poses: false,
+            keypoint_confidence_filter: 0.5,
             camera_zoom: 1.0,
             camera_pan: Vec2::ZERO,
             start_frame,
@@ -467,6 +492,12 @@ impl ReplayApp {
         ui.heading("Models");
         ui.add(
             egui::Slider::new(&mut self.confidence_filter, 0.0..=1.0).text("display confidence"),
+        );
+        ui.checkbox(&mut self.show_poses, "Show poses");
+        ui.add_enabled(
+            self.show_poses,
+            egui::Slider::new(&mut self.keypoint_confidence_filter, 0.0..=1.0)
+                .text("keypoint confidence"),
         );
         if let Some(error) = &self.management_error {
             ui.colored_label(Color32::LIGHT_RED, error);
@@ -743,17 +774,42 @@ impl ReplayApp {
                     &prediction.objects,
                     self.confidence_filter,
                 );
+                if self.show_poses
+                    && let Some(poses) = &prediction.poses
+                {
+                    draw_poses(
+                        ui,
+                        viewport,
+                        image_rect,
+                        image_size,
+                        poses,
+                        self.confidence_filter,
+                        self.keypoint_confidence_filter,
+                    );
+                }
                 let inference = prediction
                     .inference_duration_nanos
                     .map(|value| format!("{:.1} ms", value as f64 / 1.0e6))
                     .unwrap_or_else(|| "recorded".to_string());
+                let object_count = prediction
+                    .objects
+                    .iter()
+                    .filter(|object| object.bounding_box.confidence >= self.confidence_filter)
+                    .count();
+                let pose_status = prediction.poses.as_ref().map_or_else(
+                    || "poses unavailable".to_string(),
+                    |poses| {
+                        let count = poses
+                            .iter()
+                            .filter(|pose| {
+                                pose.object.bounding_box.confidence >= self.confidence_filter
+                            })
+                            .count();
+                        format!("{count} poses")
+                    },
+                );
                 ui.label(format!(
-                    "{} detections, {inference}",
-                    prediction
-                        .objects
-                        .iter()
-                        .filter(|object| object.bounding_box.confidence >= self.confidence_filter)
-                        .count()
+                    "{object_count} detections, {pose_status}, {inference}"
                 ));
             }
             None => {
@@ -1078,6 +1134,73 @@ fn draw_objects(
         );
         painter.galley(position, galley, Color32::WHITE);
     }
+}
+
+fn draw_poses(
+    ui: &Ui,
+    clip: Rect,
+    image_rect: Rect,
+    image_size: Vec2,
+    poses: &[Pose<YOLOObjectLabel>],
+    pose_confidence_filter: f32,
+    keypoint_confidence_filter: f32,
+) {
+    let scale = vec2(
+        image_rect.width() / image_size.x.max(1.0),
+        image_rect.height() / image_size.y.max(1.0),
+    );
+    let painter = ui.painter_at(clip);
+    for pose in poses
+        .iter()
+        .filter(|pose| pose.object.bounding_box.confidence >= pose_confidence_filter)
+    {
+        let keypoints: [Keypoint; 17] = pose.keypoints.into();
+        for (start, end) in POSE_SKELETON_KEYPOINT_LINE_MAPPING {
+            if keypoints[start].confidence < keypoint_confidence_filter
+                || keypoints[end].confidence < keypoint_confidence_filter
+            {
+                continue;
+            }
+            painter.line_segment(
+                [
+                    pose_point(image_rect, scale, keypoints[start]),
+                    pose_point(image_rect, scale, keypoints[end]),
+                ],
+                Stroke::new(2.0, Color32::LIGHT_BLUE.gamma_multiply(0.8)),
+            );
+        }
+        for keypoint in keypoints {
+            if keypoint.confidence >= keypoint_confidence_filter {
+                painter.circle_filled(
+                    pose_point(image_rect, scale, keypoint),
+                    3.0,
+                    Color32::from_rgb(55, 145, 255),
+                );
+            }
+        }
+
+        let bounding_box = pose.object.bounding_box;
+        let min = image_rect.min
+            + vec2(
+                bounding_box.area.min.x() * scale.x,
+                bounding_box.area.min.y() * scale.y,
+            );
+        let max = image_rect.min
+            + vec2(
+                bounding_box.area.max.x() * scale.x,
+                bounding_box.area.max.y() * scale.y,
+            );
+        painter.rect_stroke(
+            Rect::from_min_max(min, max).intersect(clip),
+            egui::CornerRadius::same(3),
+            Stroke::new(2.0, Color32::DARK_BLUE),
+            StrokeKind::Outside,
+        );
+    }
+}
+
+fn pose_point(image_rect: Rect, scale: Vec2, keypoint: Keypoint) -> Pos2 {
+    image_rect.min + vec2(keypoint.point.x() * scale.x, keypoint.point.y() * scale.y)
 }
 
 fn label_color(label: RobocupObjectLabel) -> Color32 {

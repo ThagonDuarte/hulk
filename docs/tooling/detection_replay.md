@@ -47,6 +47,8 @@ The timestamp-proportional timeline shows source capture gaps and prediction ava
 
 The Models tab manages cached runs. Model runs can be renamed, hidden, or permanently deleted after confirming the `Are you sure?` dialog. Renames and hidden state persist in recording-specific cache metadata. Hidden runs are removed from the timeline, viewport tabs, and `View` menu but remain in Models for unhiding. The source-derived Recorded baseline can be hidden but cannot be renamed or deleted.
 
+Enable `Show poses` in Models to overlay cached pose results where a model provides them. Pose bounding boxes use the display-confidence threshold; skeleton lines and keypoints use the separate keypoint-confidence threshold. The viewport distinguishes unavailable pose output from a valid empty pose result in its status line.
+
 Useful controls:
 
 - `Space`: play or pause
