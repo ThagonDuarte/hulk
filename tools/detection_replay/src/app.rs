@@ -417,9 +417,14 @@ impl ReplayApp {
         self.playback_accumulator = accumulator;
         self.is_playing = is_playing;
         if next_frame != self.selected_frame {
-            self.selected_frame = next_frame;
-            if !self.decoded_frames.contains_key(&next_frame) {
+            if self.decoded_frames.contains_key(&next_frame) {
+                self.selected_frame = next_frame;
+            } else {
                 self.loader.request(next_frame, self.end_frame);
+                // Keep the current synchronized image visible until the next proxy frame arrives.
+                self.playback_accumulator = self.playback_frame_duration(self.selected_frame);
+                context.request_repaint_after(Duration::from_millis(10));
+                return;
             }
         }
         if self.is_playing {
@@ -1005,10 +1010,7 @@ impl ReplayApp {
                 ));
             }
             PredictionDisplay::Loading => {
-                ui.horizontal(|ui| {
-                    ui.spinner();
-                    ui.label("Loading prediction");
-                });
+                ui.label("Loading prediction");
             }
             PredictionDisplay::Unavailable => {
                 ui.label("Prediction unavailable for this frame");
