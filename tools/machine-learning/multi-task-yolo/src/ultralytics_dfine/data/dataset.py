@@ -1,9 +1,10 @@
 # ruff: noqa: S311, TRY003
 
 import random
+import warnings
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Literal, TypedDict
+from typing import Any, Literal, NotRequired, TypedDict
 
 import torch
 import torch.nn.functional as functional
@@ -23,6 +24,12 @@ class DatasetTarget(TypedDict):
     orig_size: Tensor
     image_id: Tensor
     path: Path
+    keypoints: NotRequired[Tensor]
+    visibility: NotRequired[Tensor]
+    schema_id: NotRequired[str]
+    valid_detection_classes: NotRequired[Tensor]
+    point_labels: NotRequired[Tensor]
+    points: NotRequired[Tensor]
 
 
 @dataclass(frozen=True)
@@ -128,6 +135,8 @@ class DFINEDataset(Dataset[tuple[Tensor, DatasetTarget]]):
         *,
         image_size: int = 640,
         transition_epoch: int = 120,
+        num_detection_classes: int | None = None,
+        ignore_unlisted_classes: bool = False,
     ) -> None:
         self.definition = (
             data
@@ -137,6 +146,16 @@ class DFINEDataset(Dataset[tuple[Tensor, DatasetTarget]]):
         self.split = split
         self.image_size = image_size
         self.transition_epoch = transition_epoch
+        self.num_detection_classes = (
+            len(self.definition.names)
+            if num_detection_classes is None
+            else num_detection_classes
+        )
+        if self.num_detection_classes < len(self.definition.names):
+            raise ValueError(
+                "Detection class count cannot be smaller than dataset classes"
+            )
+        self.ignore_unlisted_classes = ignore_unlisted_classes
         self.epoch = 0
         sources = getattr(self.definition, split)
         if not sources:
@@ -174,17 +193,14 @@ class DFINEDataset(Dataset[tuple[Tensor, DatasetTarget]]):
     def __len__(self) -> int:
         return len(self.images)
 
-    def _load_labels(
+    def _parse_label_file(
         self,
-        image_path: Path,
-        width: int,
-        height: int,
-    ) -> tuple[Tensor, Tensor]:
-        label_path = _label_path(image_path)
+        label_path: Path,
+    ) -> tuple[list[tuple[int, list[float]]], int]:
         if not label_path.exists():
-            return torch.empty((0,), dtype=torch.long), torch.empty((0, 4))
-        labels: list[int] = []
-        boxes: list[list[float]] = []
+            return [], 0
+        rows = []
+        ignored = 0
         with label_path.open(encoding="utf-8") as file:
             for line_number, line in enumerate(file, start=1):
                 values = line.split()
@@ -196,7 +212,7 @@ class DFINEDataset(Dataset[tuple[Tensor, DatasetTarget]]):
                     )
                 class_id = int(values[0])
                 box = [float(value) for value in values[1:]]
-                if not 0 <= class_id < len(self.names):
+                if not 0 <= class_id < self.num_detection_classes:
                     raise ValueError(
                         f"{label_path}:{line_number}: class {class_id} is out "
                         "of range"
@@ -205,16 +221,60 @@ class DFINEDataset(Dataset[tuple[Tensor, DatasetTarget]]):
                     raise ValueError(
                         f"{label_path}:{line_number}: box must be normalized"
                     )
-                center_x, center_y, box_width, box_height = box
-                boxes.append(
-                    [
-                        (center_x - box_width / 2) * width,
-                        (center_y - box_height / 2) * height,
-                        (center_x + box_width / 2) * width,
-                        (center_y + box_height / 2) * height,
-                    ]
-                )
-                labels.append(class_id)
+                if class_id >= len(self.names):
+                    if self.ignore_unlisted_classes:
+                        ignored += 1
+                        continue
+                    raise ValueError(
+                        f"{label_path}:{line_number}: class {class_id} is not "
+                        "declared by the dataset"
+                    )
+                rows.append((class_id, box))
+        return rows, ignored
+
+    def audit_annotations(self) -> dict[str, int]:
+        """Validate all labels before training and report excluded rows."""
+        files = 0
+        missing_files = 0
+        rows = 0
+        ignored_rows = 0
+        for image_path in self.images:
+            label_path = _label_path(image_path)
+            if not label_path.exists():
+                missing_files += 1
+                continue
+            files += 1
+            parsed, ignored = self._parse_label_file(label_path)
+            rows += len(parsed)
+            ignored_rows += ignored
+        return {
+            "images": len(self.images),
+            "label_files": files,
+            "missing_label_files": missing_files,
+            "rows": rows,
+            "ignored_rows": ignored_rows,
+        }
+
+    def _load_labels(
+        self,
+        image_path: Path,
+        width: int,
+        height: int,
+    ) -> tuple[Tensor, Tensor]:
+        rows, _ = self._parse_label_file(_label_path(image_path))
+        labels: list[int] = []
+        boxes: list[list[float]] = []
+        for class_id, box in rows:
+            center_x, center_y, box_width, box_height = box
+            boxes.append(
+                [
+                    (center_x - box_width / 2) * width,
+                    (center_y - box_height / 2) * height,
+                    (center_x + box_width / 2) * width,
+                    (center_y + box_height / 2) * height,
+                ]
+            )
+            labels.append(class_id)
         return torch.tensor(labels, dtype=torch.long), torch.tensor(
             boxes,
             dtype=torch.float32,
@@ -222,8 +282,11 @@ class DFINEDataset(Dataset[tuple[Tensor, DatasetTarget]]):
 
     def __getitem__(self, index: int) -> tuple[Tensor, DatasetTarget]:
         image_path = self.images[index]
-        with Image.open(image_path) as loaded_image:
-            image = loaded_image.convert("RGB")
+        with warnings.catch_warnings():
+            # Trusted local dataset images are resized immediately.
+            warnings.simplefilter("ignore", Image.DecompressionBombWarning)
+            with Image.open(image_path) as loaded_image:
+                image = loaded_image.convert("RGB")
         width, height = image.size
         labels, boxes = self._load_labels(image_path, width, height)
         transform_target: dict[str, Any] = {
@@ -251,6 +314,15 @@ class DFINEDataset(Dataset[tuple[Tensor, DatasetTarget]]):
             "orig_size": torch.tensor([height, width], dtype=torch.long),
             "image_id": torch.tensor(index, dtype=torch.long),
             "path": image_path,
+            "valid_detection_classes": torch.cat(
+                (
+                    torch.ones(len(self.names), dtype=torch.bool),
+                    torch.zeros(
+                        self.num_detection_classes - len(self.names),
+                        dtype=torch.bool,
+                    ),
+                )
+            ),
         }
         return image.as_subclass(Tensor), target
 

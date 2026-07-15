@@ -136,3 +136,78 @@ def build_manifest(
             "output_contract": "normalized_cxcywh_score_class",
         },
     )
+
+
+@dataclass(frozen=True)
+class DFINEMultiTaskManifest:
+    """Self-contained deployment contract for multi-task D-FINE."""
+
+    architecture: str
+    variant: str
+    class_names: tuple[str, ...]
+    architecture_config: dict[str, Any]
+    schemas: dict[str, dict[str, Any]]
+    outputs: dict[str, dict[str, Any]]
+    preprocessing: dict[str, Any]
+    source_dfine_revision: str = DFINE_SOURCE_REVISION
+    source_transformers_version: str = TRANSFORMERS_VERSION
+    source_checkpoint: str = DFINE_S_CHECKPOINT
+    source_checkpoint_revision: str = DFINE_S_CHECKPOINT_REVISION
+    schema_version: int = 2
+    config_hash: str = field(init=False, default="")
+
+    def __post_init__(self) -> None:
+        values = asdict(self)
+        values.pop("config_hash", None)
+        encoded = json.dumps(values, sort_keys=True).encode()
+        object.__setattr__(
+            self,
+            "config_hash",
+            hashlib.sha256(encoded).hexdigest(),
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+def build_multitask_manifest(
+    architecture: DFINEArchitectureConfig,
+    names: list[str] | tuple[str, ...],
+) -> DFINEMultiTaskManifest:
+    """Build the fixed four-output model and schema contract."""
+    from ultralytics_dfine.schemas import SCHEMA_REGISTRY, schema_to_dict
+
+    schemas = {
+        str(head_id): schema_to_dict(schema)
+        for head_id, schema in SCHEMA_REGISTRY.items()
+    }
+    return DFINEMultiTaskManifest(
+        architecture="dfine-multitask",
+        variant=architecture.variant,
+        class_names=tuple(names),
+        architecture_config=asdict(architecture),
+        schemas=schemas,
+        outputs={
+            "object_output": {
+                "shape": ["batch", architecture.num_top_queries, 6],
+                "layout": "pixel_xyxy_score_global_class",
+            },
+            "person_pose_output": {
+                "shape": ["batch", architecture.num_top_queries, 57],
+                "layout": "pixel_xyxy_score_local_class_coco17_xyv",
+            },
+            "robot_pose_output": {
+                "shape": ["batch", architecture.num_top_queries, 14, 3],
+                "layout": "object_aligned_dhrp14_pixel_xyv",
+            },
+            "field_feature_output": {
+                "shape": ["batch", 300, 4],
+                "layout": "pixel_xy_score_field_class",
+            },
+        },
+        preprocessing={
+            "resize": "scale_fill",
+            "pixel_range": [0.0, 1.0],
+            "input_size": [architecture.image_size, architecture.image_size],
+        },
+    )

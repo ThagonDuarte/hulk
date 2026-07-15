@@ -19,7 +19,8 @@ class DFINEPostProcessorAdapter(nn.Module):
         self.num_classes = num_classes
         self.topk = topk
 
-    def forward(self, outputs: dict[str, Tensor]) -> Tensor:
+    def select(self, outputs: dict[str, Tensor]) -> tuple[Tensor, Tensor]:
+        """Return detections and the source query index for every row."""
         logits = outputs["pred_logits"]
         boxes = outputs["pred_boxes"]
         probabilities = logits.sigmoid().flatten(1)
@@ -35,7 +36,7 @@ class DFINEPostProcessorAdapter(nn.Module):
             1,
             query_indices[..., None].expand(-1, -1, 4),
         )
-        return torch.cat(
+        detections = torch.cat(
             (
                 selected_boxes,
                 scores[..., None],
@@ -43,6 +44,11 @@ class DFINEPostProcessorAdapter(nn.Module):
             ),
             dim=-1,
         )
+        return detections, query_indices
+
+    def forward(self, outputs: dict[str, Tensor]) -> Tensor:
+        detections, _ = self.select(outputs)
+        return detections
 
     def to_pixel_xyxy(
         self,

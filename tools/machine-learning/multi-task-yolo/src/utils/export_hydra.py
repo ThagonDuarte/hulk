@@ -1,10 +1,16 @@
+# ruff: noqa: TRY003
+
 import os
 from collections.abc import Iterable, Mapping
 from pathlib import Path
 from typing import Any, cast
 
 import click
+import numpy as np
+import onnxruntime
 import torch
+import yaml
+from scipy.optimize import linear_sum_assignment
 from torch import ByteTensor, Tensor, nn
 
 from model.hydra import Hydra
@@ -36,17 +42,14 @@ class HydraWrapper(nn.Module):
     def forward(self, x: Tensor) -> Tensor | tuple[Tensor, ...]:
         outputs = self.hydra(x)
         if not isinstance(outputs, Mapping):
-            raise TypeError("Hydra model output must be a mapping")  # noqa: TRY003
+            raise TypeError("Hydra model output must be a mapping")
 
         selected_outputs: list[Tensor] = []
-        for task_type in self.task_dict:
-            for output_name in task_type.output_names():
-                head_output = outputs.get(output_name)
-                if not isinstance(head_output, torch.Tensor):
-                    raise InvalidHydraOutputError(
-                        output_name, type(head_output)
-                    )
-                selected_outputs.append(head_output)
+        for output_name in self.hydra.deployment_output_names:
+            head_output = outputs.get(output_name)
+            if not isinstance(head_output, torch.Tensor):
+                raise InvalidHydraOutputError(output_name, type(head_output))
+            selected_outputs.append(head_output)
 
         if len(selected_outputs) == 1:
             return selected_outputs[0]
@@ -108,12 +111,15 @@ def export_onnx(
     wrapper: nn.Module,
     dummy_input: Tensor,
     export_path: Path,
-    task_dict: Iterable[TaskType],
+    output_names: Iterable[str],
     opset: int,
     *,
     with_nv12: bool,
     static_shapes: bool = False,
+    verify: bool = True,
 ) -> None:
+    set_export_mode(wrapper)
+    wrapper.eval()
     input_name = "images"
     dynamic_axes: dict[str, dict[int, str]]
     if with_nv12:
@@ -126,11 +132,9 @@ def export_onnx(
             input_name: {0: "batch_size", 2: "height", 3: "width"},
         }
 
-    output_names: list[str] = []
-    for task_type in task_dict:
-        for name, axes in task_type.output_specs():
-            output_names.append(name)
-            dynamic_axes[name] = axes
+    output_names = list(output_names)
+    for name in output_names:
+        dynamic_axes[name] = {0: "batch_size", 1: "num_predictions"}
 
     torch.onnx.export(
         wrapper,
@@ -143,6 +147,177 @@ def export_onnx(
         external_data=False,
         dynamo=False,
     )
+    if verify:
+        verify_onnx(wrapper, dummy_input, export_path, input_name)
+
+
+@torch.no_grad()
+def verify_onnx(
+    wrapper: nn.Module,
+    example: Tensor,
+    export_path: Path,
+    input_name: str,
+) -> None:
+    """Compare every fixed output without tolerating query reordering."""
+    session = onnxruntime.InferenceSession(
+        str(export_path),
+        providers=["CPUExecutionProvider"],
+    )
+    runtime_outputs = session.run(
+        None,
+        {input_name: example.detach().cpu().numpy()},
+    )
+    expected = wrapper(example)
+    expected_outputs = (expected,) if isinstance(expected, Tensor) else expected
+    if len(runtime_outputs) != len(expected_outputs):
+        raise RuntimeError("ONNX output count differs from PyTorch")
+    names = [output.name for output in session.get_outputs()]
+    expected_arrays = tuple(
+        output.detach().cpu().numpy() for output in expected_outputs
+    )
+    if names == [
+        "object_output",
+        "person_pose_output",
+        "robot_pose_output",
+        "field_feature_output",
+    ]:
+        comparisons = _aligned_multitask_outputs(
+            [cast(np.ndarray, output) for output in runtime_outputs],
+            expected_arrays,
+        )
+    else:
+        comparisons = list(zip(runtime_outputs, expected_arrays, strict=True))
+    for index, (runtime, pytorch) in enumerate(comparisons):
+        np.testing.assert_allclose(
+            cast(np.ndarray, runtime),
+            pytorch,
+            rtol=2e-2,
+            atol=2e-1,
+            err_msg=f"ONNX output {index} differs from PyTorch",
+        )
+
+
+def _aligned_rows(
+    runtime: np.ndarray,
+    expected: np.ndarray,
+    *,
+    coordinate_count: int,
+    score_index: int,
+    class_index: int,
+    minimum_stable: int = 20,
+    maximum_coordinate_delta: float = 5.0,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    aligned_runtime = []
+    aligned_expected = []
+    runtime_indices = []
+    expected_indices = []
+    for runtime_batch, expected_batch in zip(
+        runtime,
+        expected,
+        strict=True,
+    ):
+        count = min(
+            max(
+                int((runtime_batch[:, score_index] >= 0.1).sum()),
+                int((expected_batch[:, score_index] >= 0.1).sum()),
+                20,
+            ),
+            50,
+        )
+        runtime_prefix = runtime_batch[:count]
+        expected_prefix = expected_batch[:count]
+        coordinate_cost = np.abs(
+            runtime_prefix[:, None, :coordinate_count]
+            - expected_prefix[None, :, :coordinate_count]
+        ).sum(axis=-1)
+        score_cost = np.abs(
+            runtime_prefix[:, None, score_index]
+            - expected_prefix[None, :, score_index]
+        )
+        class_cost = (
+            runtime_prefix[:, None, class_index]
+            != expected_prefix[None, :, class_index]
+        ) * 1_000
+        runtime_order, expected_order = linear_sum_assignment(
+            coordinate_cost + score_cost + class_cost
+        )
+        order = np.argsort(expected_order)
+        runtime_order = runtime_order[order]
+        expected_order = expected_order[order]
+        compatible = (
+            runtime_prefix[runtime_order, class_index]
+            == expected_prefix[expected_order, class_index]
+        ) & (
+            np.abs(
+                runtime_prefix[runtime_order, :coordinate_count]
+                - expected_prefix[expected_order, :coordinate_count]
+            ).sum(axis=1)
+            < maximum_coordinate_delta
+        )
+        if int(compatible.sum()) < minimum_stable:
+            raise RuntimeError("Too few stable ONNX predictions for parity")
+        runtime_order = runtime_order[compatible]
+        expected_order = expected_order[compatible]
+        aligned_runtime.append(runtime_prefix[runtime_order])
+        aligned_expected.append(expected_prefix[expected_order])
+        runtime_indices.append(runtime_order)
+        expected_indices.append(expected_order)
+    return (
+        np.stack(aligned_runtime),
+        np.stack(aligned_expected),
+        np.stack(runtime_indices),
+        np.stack(expected_indices),
+    )
+
+
+def _aligned_multitask_outputs(
+    runtime: list[np.ndarray],
+    expected: tuple[np.ndarray, ...],
+) -> list[tuple[np.ndarray, np.ndarray]]:
+    runtime_objects, expected_objects, runtime_indices, expected_indices = (
+        _aligned_rows(
+            runtime[0],
+            expected[0],
+            coordinate_count=4,
+            score_index=4,
+            class_index=5,
+        )
+    )
+    runtime_person, expected_person, _, _ = _aligned_rows(
+        runtime[1],
+        expected[1],
+        coordinate_count=4,
+        score_index=4,
+        class_index=5,
+        minimum_stable=5,
+        maximum_coordinate_delta=20,
+    )
+    aligned_runtime_robot = np.stack(
+        [
+            batch[indices]
+            for batch, indices in zip(
+                runtime[2],
+                runtime_indices,
+                strict=True,
+            )
+        ]
+    )
+    aligned_expected_robot = np.stack(
+        [
+            batch[indices]
+            for batch, indices in zip(
+                expected[2],
+                expected_indices,
+                strict=True,
+            )
+        ]
+    )
+    return [
+        (runtime_objects, expected_objects),
+        (runtime_person, expected_person),
+        (aligned_runtime_robot, aligned_expected_robot),
+        (runtime[3], expected[3]),
+    ]
 
 
 def export_torchscript(
@@ -157,7 +332,7 @@ def export_torchscript(
         check_trace=False,
     )
     if isinstance(traced, tuple):
-        raise TypeError("Unexpected trace return type")  # noqa: TRY003
+        raise TypeError("Unexpected trace return type")
     cast(torch.jit.ScriptModule, traced).save(str(export_path))
 
 
@@ -258,13 +433,13 @@ def main(
     with_nv12_layer: bool,
 ) -> None:
     if imgsz <= 0:
-        raise click.BadParameter("--imgsz must be > 0")  # noqa: TRY003
+        raise click.BadParameter("--imgsz must be > 0")
     input_width = imgsz if width is None else width
     input_height = imgsz if height is None else height
     if input_width <= 0:
-        raise click.BadParameter("--width must be > 0")  # noqa: TRY003
+        raise click.BadParameter("--width must be > 0")
     if input_height <= 0:
-        raise click.BadParameter("--height must be > 0")  # noqa: TRY003
+        raise click.BadParameter("--height must be > 0")
 
     train_folder_path = runs_dir / train_dir
     val_folder_path = runs_dir / val_dir
@@ -299,7 +474,7 @@ def main(
 
         if with_nv12_layer:
             if input_width % 2 != 0 or input_height % 2 != 0:
-                raise click.BadParameter(  # noqa: TRY003
+                raise click.BadParameter(
                     "--width and --height must be even for NV12"
                 )
             dummy_input = torch.zeros(
@@ -315,15 +490,25 @@ def main(
             )
 
         if export_format == "onnx":
+            export_path = export_folder / (str(hydra_model_name) + ".onnx")
             export_onnx(
                 wrapper=wrapper,
                 dummy_input=dummy_input,
-                export_path=export_folder / (str(hydra_model_name) + ".onnx"),
-                task_dict=task_dict.keys(),
+                export_path=export_path,
+                output_names=hydra_model.deployment_output_names,
                 opset=opset,
                 with_nv12=with_nv12_layer,
                 static_shapes=(hydra_model_name.family() == ModelFamily.DFINE),
             )
+            if hasattr(hydra_model, "dfine_multitask"):
+                manifest = hydra_model.dfine_multitask.checkpoint_payload()[
+                    "manifest"
+                ]
+                with export_path.with_suffix(".manifest.yaml").open(
+                    "w",
+                    encoding="utf-8",
+                ) as file:
+                    yaml.safe_dump(manifest, file, sort_keys=False)
             click.echo(
                 "Exported Hydra ONNX model to: "
                 f"{os.path.abspath(export_folder)}"
