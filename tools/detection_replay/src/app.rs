@@ -1565,6 +1565,7 @@ fn label_color(label: RobocupObjectLabel) -> Color32 {
         RobocupObjectLabel::Robot => Color32::from_rgb(255, 89, 123),
         RobocupObjectLabel::TSpot => Color32::from_rgb(179, 136, 255),
         RobocupObjectLabel::XSpot => Color32::from_rgb(93, 230, 129),
+        RobocupObjectLabel::Person => Color32::from_rgb(74, 144, 226),
     }
 }
 

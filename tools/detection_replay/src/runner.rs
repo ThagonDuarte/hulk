@@ -17,7 +17,10 @@ use ros2::sensor_msgs::image::Image;
 use tokio::task::JoinHandle;
 use types::{
     object_detection::{Object, RobocupObjectLabel, YOLOObjectLabel},
-    parameters::{DetectionParameters, ObjectDetectionParameters, PoseDetectionParameters},
+    parameters::{
+        DetectionParameters, FieldFeatureDetectionParameters, ObjectDetectionParameters,
+        PoseDetectionParameters,
+    },
     pose_detection::Pose,
     time_wrapper::TimeWrapper,
 };
@@ -495,6 +498,14 @@ fn write_detection_parameters(
         pose_detection_parameters: PoseDetectionParameters {
             maximum_intersection_over_union: thresholds.maximum_intersection_over_union,
             minimum_candidate_confidence: thresholds.minimum_candidate_confidence,
+        },
+        robot_pose_detection_parameters: PoseDetectionParameters {
+            maximum_intersection_over_union: thresholds.maximum_intersection_over_union,
+            minimum_candidate_confidence: thresholds.minimum_candidate_confidence,
+        },
+        field_feature_detection_parameters: FieldFeatureDetectionParameters {
+            minimum_candidate_confidence: thresholds.minimum_candidate_confidence,
+            maximum_suppression_distance_in_pixels: 8.0,
         },
     };
     let path = directory.join("detection.json5");
