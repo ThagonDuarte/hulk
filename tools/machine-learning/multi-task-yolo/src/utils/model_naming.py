@@ -73,13 +73,21 @@ class ModelName:
                 return TaskType.OBJECT
             case str if re.fullmatch(r"dfine-s(?:~[A-Za-z0-9_-]+)?", str):
                 return TaskType.OBJECT
+            case str if re.fullmatch(
+                r"dfine-multitask(?:~[A-Za-z0-9_-]+)?",
+                str,
+            ):
+                return TaskType.OBJECT
             case _:
                 raise ModelNameError(self.name)
 
     def family(self) -> ModelFamily:
         if self.name.startswith("yolo26m"):
             return ModelFamily.YOLO
-        if re.fullmatch(r"dfine-s(?:~[A-Za-z0-9_-]+)?", self.name):
+        if re.fullmatch(
+            r"dfine-(?:s|multitask)(?:~[A-Za-z0-9_-]+)?",
+            self.name,
+        ):
             return ModelFamily.DFINE
         raise ModelNameError(self.name)
 
@@ -131,7 +139,10 @@ class HydraModelName:
             raise UnsupportedHydraCompositionError(
                 "D-FINE currently supports exactly one D-FINE detection head"
             )
-        if self.backbone.variant() != self.heads[0].variant():
+        if (
+            not self.heads[0].name.startswith("dfine-multitask")
+            and self.backbone.variant() != self.heads[0].variant()
+        ):
             raise UnsupportedHydraCompositionError(
                 "D-FINE backbone and head variants must match"
             )

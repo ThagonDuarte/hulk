@@ -8,7 +8,7 @@ import torch.nn as nn
 from ultralytics.models.yolo.model import YOLO
 from ultralytics.nn.tasks import DetectionModel
 
-from ultralytics_dfine.nn import DFINEDetectionModel
+from ultralytics_dfine.nn import DFINEDetectionModel, DFINEMultiTaskModel
 from utils.model_naming import ModelFamily, TaskType
 
 logger = logging.getLogger(__name__)
@@ -87,6 +87,7 @@ class Hydra(nn.Module):
         super().__init__()
 
         self.family = family
+        self.deployment_output_names: list[str] = []
         if family == ModelFamily.DFINE:
             self._initialize_dfine(
                 backbone_path,
@@ -159,6 +160,9 @@ class Hydra(nn.Module):
                 )
             else:
                 self.head_kpt_shapes[task_type] = None
+        self.deployment_output_names = [
+            name for task_type in task_dict for name in task_type.output_names()
+        ]
 
     def _initialize_dfine(
         self,
@@ -175,6 +179,39 @@ class Hydra(nn.Module):
                 "D-FINE Hydra supports one object-detection head"
             )
         head_path = task_dict[TaskType.OBJECT]
+        checkpoint = torch.load(
+            head_path,
+            map_location="cpu",
+            weights_only=True,
+        )
+        if (
+            isinstance(checkpoint, dict)
+            and checkpoint.get("format_version") == 2
+            and checkpoint.get("architecture") == "dfine-multitask"
+        ):
+            model = DFINEMultiTaskModel.from_checkpoint(head_path)
+            if backbone_path != "dfine-s":
+                raise ValueError(  # noqa: TRY003
+                    "Multi-task D-FINE checkpoints own their shared backbone"
+                )
+            self.dfine_multitask = model
+            self.backbone_length = 1
+            self.backbone_name = "dfine-s"
+            self.head_class_names = {"object": model.detector.names}
+            self.head_model_names = {"object": head_path.stem}
+            self.head_strides = {"object": model.detector.stride}
+            self.head_end2end = {"object": True}
+            self.head_kpt_shapes = {
+                "person_pose": (17, 3),
+                "robot_pose": (14, 3),
+            }
+            self.deployment_output_names = [
+                "object_output",
+                "person_pose_output",
+                "robot_pose_output",
+                "field_feature_output",
+            ]
+            return
         detector = DFINEDetectionModel.from_checkpoint(head_path)
         source_path = Path(backbone_path)
         if source_path.is_file():
@@ -196,9 +233,12 @@ class Hydra(nn.Module):
         self.head_strides = {str(TaskType.OBJECT): detector.stride}
         self.head_end2end = {str(TaskType.OBJECT): True}
         self.head_kpt_shapes = {str(TaskType.OBJECT): None}
+        self.deployment_output_names = ["object_output"]
 
-    def forward(self, x: torch.Tensor) -> dict[str, Any]:
+    def forward(self, x: torch.Tensor) -> dict[str, Any]:  # noqa: C901
         if self.family == ModelFamily.DFINE:
+            if hasattr(self, "dfine_multitask"):
+                return self.dfine_multitask.forward_deploy(x)
             raw = self.dfine_detector.forward_raw(x)
             normalized = self.dfine_detector.postprocessor(raw)
             sizes = torch.tensor(

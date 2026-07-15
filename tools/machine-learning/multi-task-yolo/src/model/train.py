@@ -4,11 +4,11 @@ from pathlib import Path
 from typing import Any
 
 import click
-import wandb
 import yaml
 from ultralytics.models.yolo.model import YOLO
 from wonderwords import RandomWord
 
+import wandb
 from ultralytics_dfine import DFINE
 from utils.model_naming import (
     HYDRA_MODEL_NAME_TYPE,

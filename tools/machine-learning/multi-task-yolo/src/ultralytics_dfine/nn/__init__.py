@@ -1,3 +1,8 @@
+from ultralytics_dfine.nn.multitask import (
+    DFINEMultiTaskModel,
+    FieldFeatureHead,
+    QueryPoseHead,
+)
 from ultralytics_dfine.nn.postprocess import DFINEPostProcessorAdapter
 from ultralytics_dfine.nn.tasks import (
     DFINEDetectionModel,
@@ -6,6 +11,9 @@ from ultralytics_dfine.nn.tasks import (
 
 __all__ = [
     "DFINEDetectionModel",
+    "DFINEMultiTaskModel",
     "DFINEPostProcessorAdapter",
+    "FieldFeatureHead",
     "ONNXCompatibleDFINEIntegral",
+    "QueryPoseHead",
 ]

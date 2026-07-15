@@ -1,6 +1,7 @@
 # ruff: noqa: C901, TRY003
 
 import copy
+from dataclasses import dataclass
 
 import torch
 import torch.distributed as distributed
@@ -21,6 +22,14 @@ from ultralytics_dfine.loss.matcher import (
 )
 
 ModelOutput = dict[str, object]
+
+
+@dataclass(frozen=True)
+class CriterionResult:
+    """Weighted D-FINE losses and final one-to-one assignments."""
+
+    losses: dict[str, Tensor]
+    final_matches: list[Match]
 
 
 def _world_size() -> int:
@@ -179,6 +188,22 @@ class DFINECriterion(nn.Module):
             weight=weight,
             reduction="none",
         )
+        valid_classes = torch.stack(
+            [
+                target.get(
+                    "valid_detection_classes",
+                    torch.ones(
+                        self.num_classes,
+                        dtype=torch.bool,
+                        device=logits.device,
+                    ),
+                ).to(device=logits.device, dtype=torch.bool)
+                for target in targets
+            ]
+        )
+        if valid_classes.shape != (logits.shape[0], self.num_classes):
+            raise ValueError("valid_detection_classes must match D-FINE logits")
+        loss = loss * valid_classes[:, None, :]
         loss = loss.mean(1).sum() * logits.shape[1] / num_boxes
         return {"loss_vfl": loss}
 
@@ -390,11 +415,11 @@ class DFINECriterion(nn.Module):
             distributed.all_reduce(value)
         return float((value / _world_size()).clamp(min=1).item())
 
-    def forward(
+    def _forward_result(
         self,
         outputs: ModelOutput,
         targets: list[Target],
-    ) -> dict[str, Tensor]:
+    ) -> CriterionResult:
         tensor_output = self._tensor(outputs, "pred_logits")
         main = {
             key: value for key, value in outputs.items() if "aux" not in key
@@ -566,10 +591,28 @@ class DFINECriterion(nn.Module):
                 )
                 losses.update(self._suffix(output_losses, "_dn_pre"))
 
-        return {
-            key: torch.nan_to_num(value, nan=0.0)
-            for key, value in losses.items()
-        }
+        return CriterionResult(
+            losses={
+                key: torch.nan_to_num(value, nan=0.0)
+                for key, value in losses.items()
+            },
+            final_matches=indices,
+        )
+
+    def forward(
+        self,
+        outputs: ModelOutput,
+        targets: list[Target],
+    ) -> dict[str, Tensor]:
+        return self._forward_result(outputs, targets).losses
+
+    def forward_with_matches(
+        self,
+        outputs: ModelOutput,
+        targets: list[Target],
+    ) -> CriterionResult:
+        """Compute losses while exposing final decoder assignments."""
+        return self._forward_result(outputs, targets)
 
     @staticmethod
     def _denoising_indices(

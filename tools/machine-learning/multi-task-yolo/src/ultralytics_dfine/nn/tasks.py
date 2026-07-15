@@ -3,7 +3,7 @@
 from collections import OrderedDict
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import torch
 import torch.nn as nn
@@ -150,6 +150,89 @@ class DFINEDetectionModel(nn.Module):
             backbone
         )
 
+    @staticmethod
+    def _expanded_classifier(
+        classifier: nn.Linear,
+        *,
+        initial_bias: float,
+    ) -> nn.Linear:
+        expanded = nn.Linear(
+            classifier.in_features,
+            classifier.out_features + 1,
+            bias=classifier.bias is not None,
+            device=classifier.weight.device,
+            dtype=classifier.weight.dtype,
+        )
+        with torch.no_grad():
+            expanded.weight[:-1].copy_(classifier.weight)
+            expanded.weight[-1].zero_()
+            if classifier.bias is not None and expanded.bias is not None:
+                expanded.bias[:-1].copy_(classifier.bias)
+                expanded.bias[-1].fill_(initial_bias)
+        return expanded
+
+    @staticmethod
+    def _expanded_denoising_embedding(embedding: nn.Embedding) -> nn.Embedding:
+        if embedding.padding_idx != embedding.num_embeddings - 1:
+            raise ValueError(
+                "D-FINE denoising padding must follow all class embeddings"
+            )
+        expanded = nn.Embedding(
+            embedding.num_embeddings + 1,
+            embedding.embedding_dim,
+            padding_idx=embedding.num_embeddings,
+            device=embedding.weight.device,
+            dtype=embedding.weight.dtype,
+        )
+        with torch.no_grad():
+            expanded.weight[:-2].copy_(embedding.weight[:-1])
+            expanded.weight[-2].zero_()
+            expanded.weight[-1].copy_(embedding.weight[-1])
+        return expanded
+
+    def append_detection_class(
+        self,
+        name: str,
+        *,
+        initial_bias: float = -4.59511985013459,
+    ) -> None:
+        """Append a class while preserving every existing detector row."""
+        if not name or name in self.names:
+            raise ValueError("D-FINE class name must be new and non-empty")
+        class_embed = nn.ModuleList(
+            [
+                self._expanded_classifier(
+                    cast(nn.Linear, classifier),
+                    initial_bias=initial_bias,
+                )
+                for classifier in self.core.class_embed
+            ]
+        )
+        self.core.class_embed = class_embed
+        self.core.model.decoder.class_embed = (  # pyright: ignore[reportAttributeAccessIssue]
+            class_embed
+        )
+        self.core.model.enc_score_head = self._expanded_classifier(
+            self.core.model.enc_score_head,
+            initial_bias=initial_bias,
+        )
+        self.core.model.denoising_class_embed = (
+            self._expanded_denoising_embedding(
+                self.core.model.denoising_class_embed
+            )
+        )
+        self.names.append(name)
+        self.nc = len(self.names)
+        self.core.config.num_labels = self.nc
+        self.core.config.id2label = dict(enumerate(self.names))
+        self.core.config.label2id = {
+            class_name: index for index, class_name in enumerate(self.names)
+        }
+        self.postprocessor = DFINEPostProcessorAdapter(
+            self.nc,
+            self.architecture.num_top_queries,
+        )
+
     def enable_onnx_compatibility(self) -> None:
         self.core.model.decoder.integral = (  # pyright: ignore[reportAttributeAccessIssue]
             ONNXCompatibleDFINEIntegral(self.core.config.max_num_bins)
@@ -176,6 +259,32 @@ class DFINEDetectionModel(nn.Module):
         if len(values) != 2:
             raise ValueError("D-FINE denoising split must have two parts")
         return values[0], values[1]
+
+    @classmethod
+    def _final_query_features(cls, raw: Any) -> Tensor:
+        features = raw.last_hidden_state
+        if not isinstance(features, Tensor):
+            raise TypeError("D-FINE model did not return final query features")
+        metadata = raw.denoising_meta_values
+        if isinstance(metadata, dict):
+            split = metadata.get("dn_num_split")
+            if not isinstance(split, (list, tuple)):
+                raise TypeError("D-FINE denoising split is invalid")
+            _, features = cls._split_queries(
+                features,
+                split,
+                dimension=1,
+            )
+        return features
+
+    @staticmethod
+    def _encoder_feature_maps(raw: Any) -> tuple[Tensor, ...]:
+        features = raw.encoder_last_hidden_state
+        if not isinstance(features, (list, tuple)) or not all(
+            isinstance(feature, Tensor) for feature in features
+        ):
+            raise TypeError("D-FINE model did not return encoder feature maps")
+        return tuple(features)
 
     def _training_outputs(self, raw: Any) -> ModelOutput:
         all_logits = raw.intermediate_logits
@@ -233,6 +342,11 @@ class DFINEDetectionModel(nn.Module):
         final_boxes = decoder_boxes[:, -1]
         final_corners = all_corners[:, -1]
         final_references = all_references[:, -1]
+        query_features = self._final_query_features(raw)
+        if query_features.shape[:2] != final_boxes.shape[:2]:
+            raise ValueError(
+                "D-FINE query features and final boxes are not aligned"
+            )
         output: ModelOutput = {
             "pred_logits": final_logits,
             "pred_boxes": final_boxes,
@@ -240,6 +354,8 @@ class DFINEDetectionModel(nn.Module):
             "ref_points": final_references,
             "up": self.core.model.decoder.up,
             "reg_scale": self.core.model.decoder.reg_scale,
+            "query_features": query_features,
+            "encoder_features": self._encoder_feature_maps(raw),
             "aux_outputs": [
                 {
                     "pred_logits": logits,
@@ -310,10 +426,27 @@ class DFINEDetectionModel(nn.Module):
         )
         if self.training and targets is not None:
             return self._training_outputs(raw)
-        return {
+        output: ModelOutput = {
             "pred_logits": raw.intermediate_logits[:, -1],
             "pred_boxes": raw.intermediate_reference_points[:, -1],
+            "query_features": self._final_query_features(raw),
+            "encoder_features": self._encoder_feature_maps(raw),
         }
+        if (
+            self._tensor_shape(output, "query_features")[:2]
+            != self._tensor_shape(output, "pred_boxes")[:2]
+        ):
+            raise ValueError(
+                "D-FINE query features and final boxes are not aligned"
+            )
+        return output
+
+    @staticmethod
+    def _tensor_shape(output: ModelOutput, key: str) -> torch.Size:
+        value = output.get(key)
+        if not isinstance(value, Tensor):
+            raise TypeError(f"D-FINE output is missing tensor '{key}'")
+        return value.shape
 
     def forward(
         self,
