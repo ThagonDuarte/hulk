@@ -37,6 +37,21 @@ pub const POSE_SKELETON_EDGES: [(usize, usize); 16] = [
     (13, 15),
     (14, 16),
 ];
+pub const ROBOT_POSE_SKELETON_EDGES: [(usize, usize); 13] = [
+    (1, 0),
+    (1, 2),
+    (2, 3),
+    (3, 4),
+    (1, 5),
+    (5, 6),
+    (6, 7),
+    (1, 8),
+    (8, 9),
+    (9, 10),
+    (1, 11),
+    (11, 12),
+    (12, 13),
+];
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, ros_z::Message)]
 pub struct Keypoint {
@@ -119,6 +134,27 @@ pub struct RobotKeypoints {
     pub left_hip: Keypoint,
     pub left_knee: Keypoint,
     pub left_ankle: Keypoint,
+}
+
+impl RobotKeypoints {
+    pub fn as_array(self) -> [Keypoint; 14] {
+        [
+            self.nose,
+            self.neck,
+            self.right_shoulder,
+            self.right_elbow,
+            self.right_wrist,
+            self.left_shoulder,
+            self.left_elbow,
+            self.left_wrist,
+            self.right_hip,
+            self.right_knee,
+            self.right_ankle,
+            self.left_hip,
+            self.left_knee,
+            self.left_ankle,
+        ]
+    }
 }
 
 impl From<&[f32; 42]> for RobotKeypoints {
@@ -334,6 +370,7 @@ mod tests {
         assert_eq!(keypoints.nose.point.x(), 0.0);
         assert_eq!(keypoints.neck.point.x(), 1.0);
         assert_eq!(keypoints.left_ankle.point.x(), 13.0);
+        assert_eq!(keypoints.as_array()[13].point.x(), 13.0);
     }
 }
 

@@ -44,6 +44,8 @@ pub enum ExecutionProviderPolicy {
 /// Capabilities reported after the ONNX session has been created.
 pub struct DetectionModelInfo {
     pub has_pose_output: bool,
+    pub has_robot_pose_output: bool,
+    pub has_field_feature_output: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -320,11 +322,18 @@ async fn run(
 fn model_info_from_output_names<'a>(
     names: impl IntoIterator<Item = &'a str>,
 ) -> DetectionModelInfo {
-    DetectionModelInfo {
-        has_pose_output: names.into_iter().any(|name| {
-            name == TaskHead::LegacyPose.output_name() || name == TaskHead::PersonPose.output_name()
-        }),
+    let mut model_info = DetectionModelInfo {
+        has_pose_output: false,
+        has_robot_pose_output: false,
+        has_field_feature_output: false,
+    };
+    for name in names {
+        model_info.has_pose_output |= name == TaskHead::LegacyPose.output_name()
+            || name == TaskHead::PersonPose.output_name();
+        model_info.has_robot_pose_output |= name == TaskHead::RobotPose.output_name();
+        model_info.has_field_feature_output |= name == TaskHead::FieldFeature.output_name();
     }
+    model_info
 }
 
 fn execution_providers(
@@ -709,19 +718,41 @@ mod tests {
         assert_eq!(
             model_info_from_output_names(["object_output"]),
             DetectionModelInfo {
-                has_pose_output: false
+                has_pose_output: false,
+                has_robot_pose_output: false,
+                has_field_feature_output: false,
             }
         );
         assert_eq!(
             model_info_from_output_names(["object_output", "pose_output"]),
             DetectionModelInfo {
-                has_pose_output: true
+                has_pose_output: true,
+                has_robot_pose_output: false,
+                has_field_feature_output: false,
             }
         );
         assert_eq!(
             model_info_from_output_names(["object_output", "person_pose_output"]),
             DetectionModelInfo {
-                has_pose_output: true
+                has_pose_output: true,
+                has_robot_pose_output: false,
+                has_field_feature_output: false,
+            }
+        );
+        assert_eq!(
+            model_info_from_output_names(["object_output", "field_feature_output"]),
+            DetectionModelInfo {
+                has_pose_output: false,
+                has_robot_pose_output: false,
+                has_field_feature_output: true,
+            }
+        );
+        assert_eq!(
+            model_info_from_output_names(["object_output", "robot_pose_output"]),
+            DetectionModelInfo {
+                has_pose_output: false,
+                has_robot_pose_output: true,
+                has_field_feature_output: false,
             }
         );
     }

@@ -21,7 +21,7 @@ use types::{
         DetectionParameters, FieldFeatureDetectionParameters, ObjectDetectionParameters,
         PoseDetectionParameters,
     },
-    pose_detection::Pose,
+    pose_detection::{FieldFeatureDetection, Pose, RobotPoseDetection},
     time_wrapper::TimeWrapper,
 };
 
@@ -264,6 +264,16 @@ where
         .build()
         .await
         .wrap_err("failed to subscribe to detected_poses")?;
+    let robot_pose_subscriber = node
+        .subscriber::<TimeWrapper<Vec<RobotPoseDetection>>>("detected_robot_poses")
+        .build()
+        .await
+        .wrap_err("failed to subscribe to detected_robot_poses")?;
+    let field_feature_subscriber = node
+        .subscriber::<TimeWrapper<Vec<FieldFeatureDetection>>>("detected_field_features")
+        .build()
+        .await
+        .wrap_err("failed to subscribe to detected_field_features")?;
     let inference_subscriber = node
         .subscriber::<Duration>("inference_duration")
         .build()
@@ -279,6 +289,15 @@ where
         .build()
         .await
         .wrap_err("failed to subscribe to non_maximum_suppression_duration")?;
+    let output_subscribers = DetectorOutputSubscribers {
+        objects: object_subscriber,
+        poses: pose_subscriber,
+        robot_poses: robot_pose_subscriber,
+        field_features: field_feature_subscriber,
+        inference: inference_subscriber,
+        postprocessing: postprocessing_subscriber,
+        non_maximum_suppression: nms_subscriber,
+    };
 
     let matched = tokio::select! {
         matched = image_publisher.wait_for_subscribers(1, config.startup_timeout) => matched,
@@ -310,27 +329,28 @@ where
             result = detector_task.join() => return Err(detector_stopped(result)),
         }
 
-        let (objects, poses, inference, postprocessing, nms) = tokio::select! {
-            result = receive_outputs(
-                &object_subscriber,
-                &pose_subscriber,
-                &inference_subscriber,
-                &postprocessing_subscriber,
-                &nms_subscriber,
-                config.output_timeout,
-            ) => result.wrap_err_with(|| format!("failed to receive outputs for frame {}", frame.frame_index))?,
+        let (objects, poses, robot_poses, field_features, inference, postprocessing, nms) = tokio::select! {
+            result = receive_outputs(&output_subscribers, config.output_timeout) => result.wrap_err_with(|| format!("failed to receive outputs for frame {}", frame.frame_index))?,
             result = detector_task.join() => return Err(detector_stopped(result)),
         };
-        verify_output_timestamps(&frame, &objects, &poses)?;
-        store.append(Prediction {
-            frame_index: frame.frame_index,
-            timestamp_nanos: frame.timestamp_nanos,
-            objects: objects.inner,
-            poses: model_info.has_pose_output.then_some(poses.inner),
-            inference_duration_nanos: Some(duration_nanos(inference)),
-            postprocessing_duration_nanos: Some(duration_nanos(postprocessing)),
-            non_maximum_suppression_duration_nanos: Some(duration_nanos(nms)),
-        })?;
+        verify_output_timestamps(&frame, &objects, &poses, &robot_poses, &field_features)?;
+        store.append_with_optional_outputs(
+            Prediction {
+                frame_index: frame.frame_index,
+                timestamp_nanos: frame.timestamp_nanos,
+                objects: objects.inner,
+                poses: model_info.has_pose_output.then_some(poses.inner),
+                inference_duration_nanos: Some(duration_nanos(inference)),
+                postprocessing_duration_nanos: Some(duration_nanos(postprocessing)),
+                non_maximum_suppression_duration_nanos: Some(duration_nanos(nms)),
+            },
+            model_info
+                .has_field_feature_output
+                .then_some(field_features.inner),
+            model_info
+                .has_robot_pose_output
+                .then_some(robot_poses.inner),
+        )?;
         progress(RunProgress {
             label: &config.label,
             completed_frames: store.completed_count(),
@@ -344,6 +364,16 @@ where
 struct AbortOnDropTask {
     handle: JoinHandle<Result<()>>,
     joined: bool,
+}
+
+struct DetectorOutputSubscribers {
+    objects: Subscriber<TimeWrapper<Vec<Object<RobocupObjectLabel>>>>,
+    poses: Subscriber<TimeWrapper<Vec<Pose<YOLOObjectLabel>>>>,
+    robot_poses: Subscriber<TimeWrapper<Vec<RobotPoseDetection>>>,
+    field_features: Subscriber<TimeWrapper<Vec<FieldFeatureDetection>>>,
+    inference: Subscriber<Duration>,
+    postprocessing: Subscriber<Duration>,
+    non_maximum_suppression: Subscriber<Duration>,
 }
 
 impl AbortOnDropTask {
@@ -402,15 +432,13 @@ fn classify_cleanup_join(
 }
 
 async fn receive_outputs(
-    object_subscriber: &Subscriber<TimeWrapper<Vec<Object<RobocupObjectLabel>>>>,
-    pose_subscriber: &Subscriber<TimeWrapper<Vec<Pose<YOLOObjectLabel>>>>,
-    inference_subscriber: &Subscriber<Duration>,
-    postprocessing_subscriber: &Subscriber<Duration>,
-    nms_subscriber: &Subscriber<Duration>,
+    subscribers: &DetectorOutputSubscribers,
     timeout: Duration,
 ) -> Result<(
     TimeWrapper<Vec<Object<RobocupObjectLabel>>>,
     TimeWrapper<Vec<Pose<YOLOObjectLabel>>>,
+    TimeWrapper<Vec<RobotPoseDetection>>,
+    TimeWrapper<Vec<FieldFeatureDetection>>,
     Duration,
     Duration,
     Duration,
@@ -418,31 +446,50 @@ async fn receive_outputs(
     tokio::time::timeout(timeout, async {
         tokio::try_join!(
             async {
-                object_subscriber
+                subscribers
+                    .objects
                     .recv()
                     .await
                     .wrap_err("failed to receive detected_objects")
             },
             async {
-                pose_subscriber
+                subscribers
+                    .poses
                     .recv()
                     .await
                     .wrap_err("failed to receive detected_poses")
             },
             async {
-                inference_subscriber
+                subscribers
+                    .robot_poses
+                    .recv()
+                    .await
+                    .wrap_err("failed to receive detected_robot_poses")
+            },
+            async {
+                subscribers
+                    .field_features
+                    .recv()
+                    .await
+                    .wrap_err("failed to receive detected_field_features")
+            },
+            async {
+                subscribers
+                    .inference
                     .recv()
                     .await
                     .wrap_err("failed to receive inference_duration")
             },
             async {
-                postprocessing_subscriber
+                subscribers
+                    .postprocessing
                     .recv()
                     .await
                     .wrap_err("failed to receive post_processing_duration")
             },
             async {
-                nms_subscriber
+                subscribers
+                    .non_maximum_suppression
                     .recv()
                     .await
                     .wrap_err("failed to receive non_maximum_suppression_duration")
@@ -458,16 +505,26 @@ fn verify_output_timestamps(
     frame: &OriginalFrame,
     objects: &TimeWrapper<Vec<Object<RobocupObjectLabel>>>,
     poses: &TimeWrapper<Vec<Pose<YOLOObjectLabel>>>,
+    robot_poses: &TimeWrapper<Vec<RobotPoseDetection>>,
+    field_features: &TimeWrapper<Vec<FieldFeatureDetection>>,
 ) -> Result<()> {
     let object_time = objects.time.as_nanos();
     let pose_time = poses.time.as_nanos();
-    if object_time != frame.timestamp_nanos || pose_time != frame.timestamp_nanos {
+    let robot_pose_time = robot_poses.time.as_nanos();
+    let field_feature_time = field_features.time.as_nanos();
+    if object_time != frame.timestamp_nanos
+        || pose_time != frame.timestamp_nanos
+        || robot_pose_time != frame.timestamp_nanos
+        || field_feature_time != frame.timestamp_nanos
+    {
         bail!(
-            "frame {} output timestamps do not match image timestamp {} (objects {}, poses {})",
+            "frame {} output timestamps do not match image timestamp {} (objects {}, poses {}, robot poses {}, field features {})",
             frame.frame_index,
             frame.timestamp_nanos,
             object_time,
-            pose_time
+            pose_time,
+            robot_pose_time,
+            field_feature_time,
         );
     }
     Ok(())
