@@ -55,41 +55,123 @@ impl Keypoints {
 
 impl From<&[f32; 51]> for Keypoints {
     fn from(keypoints_slice: &[f32; 51]) -> Self {
-        let mut keypoints_iter = keypoints_slice
+        let keypoints = keypoints_slice
             .chunks_exact(3)
             .map(|keypoint_chunk| Keypoint {
                 point: point![keypoint_chunk[0], keypoint_chunk[1]],
                 confidence: keypoint_chunk[2],
-            });
+            })
+            .collect::<Vec<_>>();
 
         Self {
-            left_eye: keypoints_iter.next().unwrap(),
-            right_eye: keypoints_iter.next().unwrap(),
-            nose: keypoints_iter.next().unwrap(),
-            left_ear: keypoints_iter.next().unwrap(),
-            right_ear: keypoints_iter.next().unwrap(),
-            left_shoulder: keypoints_iter.next().unwrap(),
-            right_shoulder: keypoints_iter.next().unwrap(),
-            left_elbow: keypoints_iter.next().unwrap(),
-            right_elbow: keypoints_iter.next().unwrap(),
-            left_hand: keypoints_iter.next().unwrap(),
-            right_hand: keypoints_iter.next().unwrap(),
-            left_hip: keypoints_iter.next().unwrap(),
-            right_hip: keypoints_iter.next().unwrap(),
-            left_knee: keypoints_iter.next().unwrap(),
-            right_knee: keypoints_iter.next().unwrap(),
-            left_foot: keypoints_iter.next().unwrap(),
-            right_foot: keypoints_iter.next().unwrap(),
+            nose: keypoints[0],
+            left_eye: keypoints[1],
+            right_eye: keypoints[2],
+            left_ear: keypoints[3],
+            right_ear: keypoints[4],
+            left_shoulder: keypoints[5],
+            right_shoulder: keypoints[6],
+            left_elbow: keypoints[7],
+            right_elbow: keypoints[8],
+            left_hand: keypoints[9],
+            right_hand: keypoints[10],
+            left_hip: keypoints[11],
+            right_hip: keypoints[12],
+            left_knee: keypoints[13],
+            right_knee: keypoints[14],
+            left_foot: keypoints[15],
+            right_foot: keypoints[16],
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, ros_z::Message)]
+pub struct RobotKeypoints {
+    pub nose: Keypoint,
+    pub neck: Keypoint,
+    pub right_shoulder: Keypoint,
+    pub right_elbow: Keypoint,
+    pub right_wrist: Keypoint,
+    pub left_shoulder: Keypoint,
+    pub left_elbow: Keypoint,
+    pub left_wrist: Keypoint,
+    pub right_hip: Keypoint,
+    pub right_knee: Keypoint,
+    pub right_ankle: Keypoint,
+    pub left_hip: Keypoint,
+    pub left_knee: Keypoint,
+    pub left_ankle: Keypoint,
+}
+
+impl From<&[f32; 42]> for RobotKeypoints {
+    fn from(values: &[f32; 42]) -> Self {
+        let keypoints = values
+            .chunks_exact(3)
+            .map(|chunk| Keypoint {
+                point: point![chunk[0], chunk[1]],
+                confidence: chunk[2],
+            })
+            .collect::<Vec<_>>();
+        Self {
+            nose: keypoints[0],
+            neck: keypoints[1],
+            right_shoulder: keypoints[2],
+            right_elbow: keypoints[3],
+            right_wrist: keypoints[4],
+            left_shoulder: keypoints[5],
+            left_elbow: keypoints[6],
+            left_wrist: keypoints[7],
+            right_hip: keypoints[8],
+            right_knee: keypoints[9],
+            right_ankle: keypoints[10],
+            left_hip: keypoints[11],
+            left_knee: keypoints[12],
+            left_ankle: keypoints[13],
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, ros_z::Message)]
+pub struct RobotPoseDetection {
+    pub object: Object<crate::object_detection::RobocupObjectLabel>,
+    pub keypoints: RobotKeypoints,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, ros_z::Message)]
+pub enum FieldFeatureLabel {
+    GoalPost = 0,
+    LSpot = 1,
+    TSpot = 2,
+    PenaltySpot = 3,
+    XSpot = 4,
+}
+
+impl FieldFeatureLabel {
+    pub fn from_index(index: usize) -> Self {
+        match index {
+            0 => Self::GoalPost,
+            1 => Self::LSpot,
+            2 => Self::TSpot,
+            3 => Self::PenaltySpot,
+            4 => Self::XSpot,
+            _ => panic!("invalid field-feature class index: {index}"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, ros_z::Message)]
+pub struct FieldFeatureDetection {
+    pub point: Point2<Pixel>,
+    pub confidence: f32,
+    pub label: FieldFeatureLabel,
 }
 
 impl Index<usize> for Keypoints {
     fn index(&self, index: usize) -> &Keypoint {
         match index {
-            0 => &self.left_eye,
-            1 => &self.right_eye,
-            2 => &self.nose,
+            0 => &self.nose,
+            1 => &self.left_eye,
+            2 => &self.right_eye,
             3 => &self.left_ear,
             4 => &self.right_ear,
             5 => &self.left_shoulder,
@@ -113,9 +195,9 @@ impl Index<usize> for Keypoints {
 impl From<Keypoints> for [Keypoint; 17] {
     fn from(keypoints: Keypoints) -> Self {
         [
+            keypoints.nose,
             keypoints.left_eye,
             keypoints.right_eye,
-            keypoints.nose,
             keypoints.left_ear,
             keypoints.right_ear,
             keypoints.left_shoulder,
@@ -198,6 +280,43 @@ pub struct FreeKickSignalDetectionResult {
 pub struct TimeTaggedKickingTeamDetections {
     pub time: SystemTime,
     pub detected_kicking_team: Option<Team>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn person_keypoints_use_standard_coco_order() {
+        let mut values = [0.0; 51];
+        for (index, keypoint) in values.chunks_exact_mut(3).enumerate() {
+            keypoint[0] = index as f32;
+            keypoint[1] = index as f32 + 0.5;
+            keypoint[2] = 1.0;
+        }
+
+        let keypoints = Keypoints::from(&values);
+
+        assert_eq!(keypoints.nose.point.x(), 0.0);
+        assert_eq!(keypoints.left_eye.point.x(), 1.0);
+        assert_eq!(keypoints.right_foot.point.x(), 16.0);
+        assert_eq!(keypoints.as_array()[0].point.x(), 0.0);
+    }
+
+    #[test]
+    fn robot_keypoints_use_dhrp_order() {
+        let mut values = [0.0; 42];
+        for (index, keypoint) in values.chunks_exact_mut(3).enumerate() {
+            keypoint[0] = index as f32;
+            keypoint[2] = 1.0;
+        }
+
+        let keypoints = RobotKeypoints::from(&values);
+
+        assert_eq!(keypoints.nose.point.x(), 0.0);
+        assert_eq!(keypoints.neck.point.x(), 1.0);
+        assert_eq!(keypoints.left_ankle.point.x(), 13.0);
+    }
 }
 
 #[derive(Debug, Default, Clone, Copy, Serialize, Deserialize, PartialEq)]

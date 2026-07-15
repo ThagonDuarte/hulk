@@ -349,6 +349,8 @@ pub struct DetectionParameters {
     pub model_name: String,
     pub object_detection_parameters: ObjectDetectionParameters,
     pub pose_detection_parameters: PoseDetectionParameters,
+    pub robot_pose_detection_parameters: PoseDetectionParameters,
+    pub field_feature_detection_parameters: FieldFeatureDetectionParameters,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize, ros_z::Message)]
@@ -361,6 +363,12 @@ pub struct ObjectDetectionParameters {
 pub struct PoseDetectionParameters {
     pub maximum_intersection_over_union: f32,
     pub minimum_candidate_confidence: f32,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize, ros_z::Message)]
+pub struct FieldFeatureDetectionParameters {
+    pub minimum_candidate_confidence: f32,
+    pub maximum_suppression_distance_in_pixels: f32,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, ros_z::Message)]
