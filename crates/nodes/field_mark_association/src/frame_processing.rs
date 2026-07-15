@@ -8,7 +8,7 @@ use ros_z::{cache::Cache, parameter::NodeParameters, pubsub::Publisher, time::Ti
 use ros_z_streams::FutureItem;
 use types::{
     field_dimensions::FieldDimensions,
-    object_detection::{Object, RobocupObjectLabel},
+    pose_detection::FieldFeatureDetection,
     primary_state::PrimaryState,
     time_wrapper::TimeWrapper,
     visual_localization::{AssociationPoseHint, GlobalLocalizationDebug, VisualLocalizationFrame},
@@ -21,8 +21,8 @@ use crate::{
 
 const MAX_CAMERA_MATRIX_TIME_DISTANCE: Duration = Duration::from_millis(100);
 
-type DetectedObjects = TimeWrapper<Vec<Object<RobocupObjectLabel>>>;
-type DetectedObjectsItem<'a> = FutureItem<'a, (Option<DetectedObjects>,)>;
+type DetectedFieldFeatures = TimeWrapper<Vec<FieldFeatureDetection>>;
+type DetectedFieldFeaturesItem<'a> = FutureItem<'a, (Option<DetectedFieldFeatures>,)>;
 
 pub(crate) struct DetectionProcessingContext<'a> {
     pub(crate) parameters: &'a NodeParameters<FieldMarkAssociationParameters>,
@@ -37,7 +37,7 @@ pub(crate) struct DetectionProcessingContext<'a> {
 
 struct PreparedDetectionFrame {
     image_time: Time,
-    objects: Vec<Object<RobocupObjectLabel>>,
+    visual_features: crate::DetectedVisualFeatures,
     camera_matrix: CameraMatrix,
     robot_to_camera: Isometry3<Robot, Camera>,
     field_dimensions: FieldDimensions,
@@ -52,11 +52,11 @@ struct ProcessedDetectionFrame {
     localization: GlobalVisualLocalization,
 }
 
-pub(crate) async fn process_detected_objects(
-    item: DetectedObjectsItem<'_>,
+pub(crate) async fn process_detected_field_features(
+    item: DetectedFieldFeaturesItem<'_>,
     ctx: DetectionProcessingContext<'_>,
 ) -> Result<()> {
-    for (image_time, (objects,)) in item.persistent {
+    for (image_time, (features,)) in item.persistent {
         let Some(processed_frame) =
             tokio::task::block_in_place(|| -> Result<Option<ProcessedDetectionFrame>> {
                 if association_is_damping(ctx.primary_state_cache) {
@@ -64,7 +64,7 @@ pub(crate) async fn process_detected_objects(
                     return Ok(None);
                 }
 
-                let Some(frame) = prepare_detection_frame(image_time, objects, &ctx) else {
+                let Some(frame) = prepare_detection_frame(image_time, features, &ctx) else {
                     return Ok(None);
                 };
                 let image_time = frame.image_time;
@@ -101,7 +101,7 @@ pub(crate) async fn process_detected_objects(
 
 fn prepare_detection_frame(
     image_time: Time,
-    objects: Option<DetectedObjects>,
+    features: Option<DetectedFieldFeatures>,
     ctx: &DetectionProcessingContext<'_>,
 ) -> Option<PreparedDetectionFrame> {
     let camera_matrix = ctx.camera_matrix_cache.get_nearest(image_time)?;
@@ -116,7 +116,9 @@ fn prepare_detection_frame(
 
     Some(PreparedDetectionFrame {
         image_time,
-        objects: objects.map(|item| item.inner).unwrap_or_default(),
+        visual_features: crate::group_detected_field_features(
+            &features.map(|item| item.inner).unwrap_or_default(),
+        ),
         robot_to_camera: robot_to_camera(&camera_matrix),
         camera_matrix,
         field_dimensions: *field_dimensions.as_ref(),
@@ -145,8 +147,7 @@ fn associate_detection_frame(
     mut state: FieldMarkAssociationState,
     frame: PreparedDetectionFrame,
 ) -> Result<(FieldMarkAssociationState, GlobalVisualLocalization)> {
-    let visual_features = crate::find_detected_visual_features(&frame.objects);
-    if visual_features.supported_feature_count() == 0 {
+    if frame.visual_features.supported_feature_count() == 0 {
         return Ok((
             state,
             GlobalVisualLocalization {
@@ -158,7 +159,7 @@ fn associate_detection_frame(
     }
 
     let localization = state.associate_visual_features_with_debug(
-        &visual_features,
+        &frame.visual_features,
         &frame.camera_matrix,
         &frame.field_dimensions,
         frame.pose_hint,

@@ -17,7 +17,7 @@ pub use api::{
 };
 pub use features::{
     DetectedVisualFeature, DetectedVisualFeatures, find_detected_goalposts,
-    find_detected_visual_features,
+    find_detected_visual_features, group_detected_field_features,
 };
 pub use global_association::{
     GlobalAssociationConfig as GlobalLocalizerParameters, GlobalLocalizationDebugAssociation,

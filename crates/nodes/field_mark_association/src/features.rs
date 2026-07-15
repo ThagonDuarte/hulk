@@ -1,6 +1,7 @@
 use coordinate_systems::Pixel;
 use linear_algebra::{Point2, point};
 use types::object_detection::{Object, RobocupObjectLabel};
+use types::pose_detection::{FieldFeatureDetection, FieldFeatureLabel};
 
 /// Extracts goalpost image points from object detections.
 pub fn find_detected_goalposts(detections: &[Object<RobocupObjectLabel>]) -> Vec<Point2<Pixel>> {
@@ -80,6 +81,26 @@ pub fn find_detected_visual_features(
             }
             features
         })
+}
+
+/// Groups direct point-head detections by localization landmark class.
+pub fn group_detected_field_features(
+    detections: &[FieldFeatureDetection],
+) -> DetectedVisualFeatures {
+    detections.iter().fold(
+        DetectedVisualFeatures::default(),
+        |mut features, detection| {
+            let feature = DetectedVisualFeature::new(detection.point, detection.confidence);
+            match detection.label {
+                FieldFeatureLabel::GoalPost => features.goalposts.push(feature),
+                FieldFeatureLabel::LSpot => features.l_spots.push(feature),
+                FieldFeatureLabel::TSpot => features.t_spots.push(feature),
+                FieldFeatureLabel::PenaltySpot => features.penalty_spots.push(feature),
+                FieldFeatureLabel::XSpot => features.x_spots.push(feature),
+            }
+            features
+        },
+    )
 }
 
 fn pixel_bottom_center(object: &Object<RobocupObjectLabel>) -> Point2<Pixel> {
@@ -168,6 +189,20 @@ mod tests {
             features.l_spots.first().map(|feature| feature.confidence),
             Some(1.0)
         );
+    }
+
+    #[test]
+    fn direct_field_features_preserve_annotated_points() {
+        let detections = vec![FieldFeatureDetection {
+            point: point![42.0, 23.0],
+            confidence: 0.9,
+            label: FieldFeatureLabel::TSpot,
+        }];
+
+        let features = group_detected_field_features(&detections);
+
+        assert_eq!(feature_pixels(&features.t_spots), vec![point![42.0, 23.0]]);
+        assert_eq!(features.t_spots[0].confidence, 0.9);
     }
 
     fn feature_pixels(features: &[DetectedVisualFeature]) -> Vec<Point2<Pixel>> {
