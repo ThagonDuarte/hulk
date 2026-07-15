@@ -10,7 +10,7 @@ use ros_z::{
 use ros_z_streams::CreateFutureMapBuilder;
 use types::{
     field_dimensions::FieldDimensions,
-    object_detection::{Object, RobocupObjectLabel},
+    pose_detection::FieldFeatureDetection,
     primary_state::PrimaryState,
     time_wrapper::TimeWrapper,
     visual_localization::{
@@ -21,7 +21,7 @@ use types::{
 
 use crate::{
     FieldMarkAssociationState,
-    frame_processing::{DetectionProcessingContext, process_detected_objects},
+    frame_processing::{DetectionProcessingContext, process_detected_field_features},
     parameters::FieldMarkAssociationParameters,
 };
 
@@ -81,10 +81,10 @@ pub async fn run(ctx: Arc<Context>) -> Result<()> {
         .build()
         .await?;
 
-    let mut detected_objects = node
+    let mut detected_field_features = node
         .create_future_map_builder()
-        .create_future_subscriber::<TimeWrapper<Vec<Object<RobocupObjectLabel>>>>(
-            "detected_objects",
+        .create_future_subscriber::<TimeWrapper<Vec<FieldFeatureDetection>>>(
+            "detected_field_features",
             DETECTED_OBJECTS_SAFETY_LAG,
         )
         .await?
@@ -107,9 +107,9 @@ pub async fn run(ctx: Arc<Context>) -> Result<()> {
                     association_state.reset_for_damping();
                 }
             }
-            item = detected_objects.recv() => {
+            item = detected_field_features.recv() => {
                 let item = item?;
-                process_detected_objects(
+                process_detected_field_features(
                     item,
                     DetectionProcessingContext {
                         parameters: &parameters,
