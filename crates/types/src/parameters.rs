@@ -349,7 +349,7 @@ pub struct DetectionParameters {
     pub model_name: String,
     pub object_detection_parameters: ObjectDetectionParameters,
     pub pose_detection_parameters: PoseDetectionParameters,
-    pub robot_pose_detection_parameters: PoseDetectionParameters,
+    pub robot_pose_detection_parameters: RobotPoseDetectionParameters,
     pub field_feature_detection_parameters: FieldFeatureDetectionParameters,
 }
 
@@ -363,6 +363,16 @@ pub struct ObjectDetectionParameters {
 pub struct PoseDetectionParameters {
     pub maximum_intersection_over_union: f32,
     pub minimum_candidate_confidence: f32,
+    #[serde(default)]
+    pub visibility_score_alpha: f32,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize, ros_z::Message)]
+pub struct RobotPoseDetectionParameters {
+    pub maximum_intersection_over_union: f32,
+    pub minimum_candidate_confidence: f32,
+    #[serde(default)]
+    pub visibility_score_alpha: f32,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize, ros_z::Message)]

@@ -230,12 +230,16 @@ async fn run(
                 parameters
                     .pose_detection_parameters
                     .minimum_candidate_confidence,
+                parameters.pose_detection_parameters.visibility_score_alpha,
             )?;
             let detected_robot_poses = extract_robot_pose_detections(
                 &outputs,
                 parameters
                     .robot_pose_detection_parameters
                     .minimum_candidate_confidence,
+                parameters
+                    .robot_pose_detection_parameters
+                    .visibility_score_alpha,
             )?;
             let detected_field_features = extract_field_feature_detections(
                 &outputs,
@@ -535,59 +539,118 @@ fn extract_candidate_object_detections(
 fn extract_candidate_pose_detections(
     outputs: &ModelOutputs,
     confidence_threshold: f32,
+    visibility_score_alpha: f32,
 ) -> Result<Vec<Pose<YOLOObjectLabel>>> {
+    if !visibility_score_alpha.is_finite() || visibility_score_alpha < 0.0 {
+        bail!("person pose visibility score alpha must be finite and non-negative");
+    }
     let Some(poses) = &outputs.poses else {
         return Ok(Vec::new());
     };
 
-    Ok(poses
+    poses
         .axis_iter(Axis(0))
         .filter_map(|row| {
-            let confidence = row[4usize];
+            let base_confidence = row[4usize];
+            if !base_confidence.is_finite() {
+                return None;
+            }
+            let confidence = if visibility_score_alpha == 0.0 {
+                base_confidence
+            } else {
+                let values = row.as_slice().expect("slice is not contiguous");
+                let keypoints = values[NUMBER_OF_VALUES_PER_OBJECT..].chunks_exact(3);
+                let keypoint_count = keypoints.len();
+                if keypoint_count == 0 {
+                    return None;
+                }
+                let mut visibility_sum = 0.0;
+                for keypoint in keypoints {
+                    let visibility = keypoint[2];
+                    if !visibility.is_finite() || !(0.0..=1.0).contains(&visibility) {
+                        return None;
+                    }
+                    visibility_sum += visibility;
+                }
+                base_confidence
+                    * (visibility_sum / keypoint_count as f32).powf(visibility_score_alpha)
+            };
             if !confidence.is_finite() || confidence < confidence_threshold {
                 return None;
             }
 
-            let pose_values: [f32; NUMBER_OF_VALUES_PER_POSE] = row
+            let mut pose_values: [f32; NUMBER_OF_VALUES_PER_POSE] = row
                 .as_slice()
                 .expect("slice is not contiguous")
                 .try_into()
                 .unwrap_or_else(|_| panic!("slice is not of length {}", NUMBER_OF_VALUES_PER_POSE));
+            pose_values[4] = confidence;
 
-            Some(Pose::from(&pose_values))
+            Some(Ok(Pose::from(&pose_values)))
         })
-        .collect())
+        .collect()
 }
 
 fn extract_robot_pose_detections(
     outputs: &ModelOutputs,
     confidence_threshold: f32,
+    visibility_score_alpha: f32,
 ) -> Result<Vec<RobotPoseDetection>> {
+    if !visibility_score_alpha.is_finite() || visibility_score_alpha < 0.0 {
+        bail!("robot pose visibility score alpha must be finite and non-negative");
+    }
     let Some(robot_poses) = &outputs.robot_poses else {
         return Ok(Vec::new());
     };
+
+    fn calibrated_confidence(
+        object_confidence: f32,
+        keypoint_rows: &ArrayView2<f32>,
+        visibility_score_alpha: f32,
+    ) -> Option<f32> {
+        if !object_confidence.is_finite() {
+            return None;
+        }
+        if visibility_score_alpha == 0.0 {
+            return Some(object_confidence);
+        }
+        let mut visibility_sum = 0.0;
+        for keypoint in keypoint_rows.axis_iter(Axis(0)) {
+            let visibility = keypoint[2];
+            if !visibility.is_finite() || !(0.0..=1.0).contains(&visibility) {
+                return None;
+            }
+            visibility_sum += visibility;
+        }
+        let keypoint_count = keypoint_rows.len_of(Axis(0));
+        if keypoint_count == 0 {
+            return None;
+        }
+        let mean_visibility = visibility_sum / keypoint_count as f32;
+        let confidence = object_confidence * mean_visibility.powf(visibility_score_alpha);
+        confidence.is_finite().then_some(confidence)
+    }
 
     outputs
         .objects
         .axis_iter(Axis(0))
         .zip(robot_poses.axis_iter(Axis(0)))
         .filter_map(|(object_row, keypoint_rows)| {
-            let confidence = object_row[4];
             let class_index = object_row[5] as usize;
-            if !confidence.is_finite()
-                || confidence < confidence_threshold
-                || class_index != RobocupObjectLabel::Robot as usize
-            {
+            if class_index != RobocupObjectLabel::Robot as usize {
                 return None;
             }
-            Some((object_row, keypoint_rows))
+            let confidence =
+                calibrated_confidence(object_row[4], &keypoint_rows, visibility_score_alpha)?;
+            (confidence >= confidence_threshold).then_some((object_row, keypoint_rows, confidence))
         })
-        .map(|(object_row, keypoint_rows)| {
-            let object_values: [f32; NUMBER_OF_VALUES_PER_OBJECT] = object_row
+        .map(|(object_row, keypoint_rows, confidence)| {
+            let mut object_values: [f32; NUMBER_OF_VALUES_PER_OBJECT] = object_row
                 .as_slice()
                 .expect("slice is not contiguous")
                 .try_into()
                 .expect("object row has invalid length");
+            object_values[4] = confidence;
             let keypoint_values: [f32; 42] = keypoint_rows
                 .as_slice()
                 .expect("slice is not contiguous")
@@ -702,11 +765,11 @@ mod tests {
             model_outputs_from_arrays(Some(objects.view().into_dyn()), None, None, None, None)
                 .unwrap();
 
-        let poses = extract_candidate_pose_detections(&outputs, 0.0).unwrap();
+        let poses = extract_candidate_pose_detections(&outputs, 0.0, 0.0).unwrap();
 
         assert!(poses.is_empty());
         assert!(
-            extract_robot_pose_detections(&outputs, 0.0)
+            extract_robot_pose_detections(&outputs, 0.0, 0.0)
                 .unwrap()
                 .is_empty()
         );
@@ -890,6 +953,133 @@ mod tests {
         assert_eq!(detections.len(), 1);
         assert_eq!(detections[0].confidence, 0.9);
         assert_eq!(detections[0].label, FieldFeatureLabel::TSpot);
+    }
+
+    #[test]
+    fn robot_pose_alpha_zero_preserves_legacy_confidence() {
+        let mut objects = Array2::zeros((NUMBER_OF_DETECTIONS, NUMBER_OF_VALUES_PER_OBJECT));
+        objects[[0, 4]] = 0.8;
+        objects[[0, 5]] = RobocupObjectLabel::Robot as usize as f32;
+        let robot_poses = Array3::zeros((NUMBER_OF_DETECTIONS, 14, 3));
+        let outputs = ModelOutputs {
+            objects: objects.view(),
+            poses: None,
+            robot_poses: Some(robot_poses.view()),
+            field_features: None,
+        };
+
+        let legacy = extract_robot_pose_detections(&outputs, 0.5, 0.0).unwrap();
+        let calibrated = extract_robot_pose_detections(&outputs, 0.5, 1.0).unwrap();
+
+        assert_eq!(legacy.len(), 1);
+        assert_eq!(legacy[0].object.bounding_box.confidence, 0.8);
+        assert!(calibrated.is_empty());
+    }
+
+    #[test]
+    fn person_pose_visibility_alpha_calibrates_only_pose_confidence() {
+        let objects = Array2::zeros((NUMBER_OF_DETECTIONS, NUMBER_OF_VALUES_PER_OBJECT));
+        let mut poses = Array2::zeros((NUMBER_OF_DETECTIONS, NUMBER_OF_VALUES_PER_POSE));
+        poses[[0, 4]] = 0.8;
+        for keypoint in 0..17 {
+            poses[[0, NUMBER_OF_VALUES_PER_OBJECT + keypoint * 3 + 2]] = 0.5;
+        }
+        let outputs = ModelOutputs {
+            objects: objects.view(),
+            poses: Some(poses.view()),
+            robot_poses: None,
+            field_features: None,
+        };
+
+        let legacy = extract_candidate_pose_detections(&outputs, 0.0, 0.0).unwrap();
+        let calibrated = extract_candidate_pose_detections(&outputs, 0.0, 1.75).unwrap();
+
+        assert_eq!(legacy[0].object.bounding_box.confidence, 0.8);
+        assert_eq!(
+            calibrated[0].object.bounding_box.confidence,
+            0.8 * 0.5_f32.powf(1.75)
+        );
+        assert_eq!(
+            legacy[0].object.bounding_box.area,
+            calibrated[0].object.bounding_box.area
+        );
+        assert_eq!(
+            legacy[0].keypoints.nose.confidence,
+            calibrated[0].keypoints.nose.confidence
+        );
+    }
+
+    #[test]
+    fn person_pose_visibility_alpha_must_be_valid() {
+        let objects = Array2::zeros((NUMBER_OF_DETECTIONS, NUMBER_OF_VALUES_PER_OBJECT));
+        let poses = Array2::zeros((NUMBER_OF_DETECTIONS, NUMBER_OF_VALUES_PER_POSE));
+        let outputs = ModelOutputs {
+            objects: objects.view(),
+            poses: Some(poses.view()),
+            robot_poses: None,
+            field_features: None,
+        };
+
+        for alpha in [-1.0, f32::NAN, f32::INFINITY] {
+            let error = extract_candidate_pose_detections(&outputs, 0.0, alpha).unwrap_err();
+            assert!(error.to_string().contains("visibility score alpha"));
+        }
+    }
+
+    #[test]
+    fn robot_pose_calibration_changes_only_pose_threshold_and_nms() {
+        let mut objects = Array2::zeros((NUMBER_OF_DETECTIONS, NUMBER_OF_VALUES_PER_OBJECT));
+        for index in 0..2 {
+            objects[[index, 0]] = 0.0;
+            objects[[index, 1]] = 0.0;
+            objects[[index, 2]] = 10.0;
+            objects[[index, 3]] = 10.0;
+            objects[[index, 5]] = RobocupObjectLabel::Robot as usize as f32;
+        }
+        objects[[0, 4]] = 0.9;
+        objects[[1, 4]] = 0.8;
+        let mut robot_poses = Array3::zeros((NUMBER_OF_DETECTIONS, 14, 3));
+        for keypoint in 0..14 {
+            robot_poses[[0, keypoint, 2]] = 0.1;
+            robot_poses[[1, keypoint, 2]] = 1.0;
+        }
+        let outputs = ModelOutputs {
+            objects: objects.view(),
+            poses: None,
+            robot_poses: Some(robot_poses.view()),
+            field_features: None,
+        };
+
+        let detected_objects = non_maximum_suppression(
+            extract_candidate_object_detections(&outputs, 0.5).unwrap(),
+            0.5,
+        );
+        let detected_robot_poses = non_maximum_suppression(
+            extract_robot_pose_detections(&outputs, 0.0, 1.0).unwrap(),
+            0.5,
+        );
+
+        assert_eq!(detected_objects.len(), 1);
+        assert_eq!(detected_robot_poses.len(), 1);
+        assert_eq!(detected_objects[0].bounding_box.confidence, 0.9);
+        assert_eq!(detected_robot_poses[0].object.bounding_box.confidence, 0.8);
+    }
+
+    #[test]
+    fn robot_pose_visibility_alpha_must_be_valid() {
+        let objects = Array2::zeros((NUMBER_OF_DETECTIONS, NUMBER_OF_VALUES_PER_OBJECT));
+        let robot_poses = Array3::zeros((NUMBER_OF_DETECTIONS, 14, 3));
+        let outputs = ModelOutputs {
+            objects: objects.view(),
+            poses: None,
+            robot_poses: Some(robot_poses.view()),
+            field_features: None,
+        };
+
+        for alpha in [-1.0, f32::NAN, f32::INFINITY] {
+            let error = extract_robot_pose_detections(&outputs, 0.0, alpha).unwrap_err();
+            assert!(error.to_string().contains("visibility score alpha"));
+        }
     }
 
     #[test]

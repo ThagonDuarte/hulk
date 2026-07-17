@@ -19,14 +19,18 @@ use types::{
     object_detection::{Object, RobocupObjectLabel, YOLOObjectLabel},
     parameters::{
         DetectionParameters, FieldFeatureDetectionParameters, ObjectDetectionParameters,
-        PoseDetectionParameters,
+        PoseDetectionParameters, RobotPoseDetectionParameters,
     },
     pose_detection::{FieldFeatureDetection, Pose, RobotPoseDetection},
     time_wrapper::TimeWrapper,
 };
 
 use crate::{
-    cache::{DetectionThresholds, ModelRunManifest, Prediction, PredictionStore, hash_model},
+    cache::{
+        DetectionThresholds, ModelRunManifest, PerHeadDetectionThresholds, Prediction,
+        PredictionStore, hash_model, validate_person_visibility_score_alpha,
+        validate_robot_visibility_score_alpha,
+    },
     recording::{OriginalFrame, Recording},
 };
 
@@ -39,6 +43,10 @@ pub struct ModelRunConfig {
     pub label: String,
     pub model_path: PathBuf,
     pub thresholds: DetectionThresholds,
+    /// `None` preserves the legacy uniform `thresholds` behavior.
+    pub per_head_thresholds: Option<PerHeadDetectionThresholds>,
+    pub person_visibility_score_alpha: f32,
+    pub robot_visibility_score_alpha: f32,
     pub frame_limit: Option<usize>,
     pub start_frame: usize,
     pub end_frame: Option<usize>,
@@ -54,6 +62,9 @@ impl ModelRunConfig {
             label: label.into(),
             model_path: model_path.into(),
             thresholds: DetectionThresholds::default(),
+            per_head_thresholds: None,
+            person_visibility_score_alpha: 0.0,
+            robot_visibility_score_alpha: 0.0,
             frame_limit: None,
             start_frame: 0,
             end_frame: None,
@@ -81,16 +92,26 @@ where
     F: FnMut(RunProgress<'_>),
 {
     let cache_directory = recording.cache_directory();
+    let person_visibility_score_alpha =
+        validate_person_visibility_score_alpha(config.person_visibility_score_alpha)?;
+    let robot_visibility_score_alpha =
+        validate_robot_visibility_score_alpha(config.robot_visibility_score_alpha)?;
+    let per_head_thresholds = match config.per_head_thresholds {
+        Some(thresholds) => thresholds.validate()?,
+        None => PerHeadDetectionThresholds::uniform(config.thresholds)?,
+    };
     let (canonical_model_path, model_hash) = hash_model(&config.model_path)?;
     let frame_end = config
         .end_frame
         .unwrap_or_else(|| recording.frame_count().saturating_sub(1));
-    let proposed = ModelRunManifest::new(
+    let proposed = ModelRunManifest::new_with_per_head_thresholds_and_visibility_alphas(
         config.label.clone(),
         canonical_model_path,
         model_hash,
         recording.fingerprint().clone(),
-        config.thresholds,
+        per_head_thresholds,
+        person_visibility_score_alpha,
+        robot_visibility_score_alpha,
         recording.frame_count(),
         config.start_frame..=frame_end,
     )?;
@@ -146,11 +167,7 @@ where
 {
     let parameter_directory = tempfile::tempdir_in(cache_directory)
         .wrap_err("failed to create temporary detection parameter layer")?;
-    write_detection_parameters(
-        parameter_directory.path(),
-        store.manifest(),
-        config.thresholds,
-    )?;
+    write_detection_parameters(parameter_directory.path(), store.manifest())?;
 
     let namespace_id = NEXT_NAMESPACE.fetch_add(1, Ordering::Relaxed);
     let namespace = format!("/detection_replay/{}_{namespace_id}", std::process::id());
@@ -530,11 +547,12 @@ fn verify_output_timestamps(
     Ok(())
 }
 
-fn write_detection_parameters(
-    directory: &Path,
-    manifest: &ModelRunManifest,
-    thresholds: DetectionThresholds,
-) -> Result<()> {
+fn write_detection_parameters(directory: &Path, manifest: &ModelRunManifest) -> Result<()> {
+    let person_visibility_score_alpha =
+        validate_person_visibility_score_alpha(manifest.person_visibility_score_alpha)?;
+    let robot_visibility_score_alpha =
+        validate_robot_visibility_score_alpha(manifest.robot_visibility_score_alpha)?;
+    let thresholds = manifest.per_head_thresholds.validate()?;
     let parent = manifest
         .canonical_model_path
         .parent()
@@ -550,18 +568,20 @@ fn write_detection_parameters(
         model_name: model_name.to_string(),
         object_detection_parameters: ObjectDetectionParameters {
             maximum_intersection_over_union: thresholds.maximum_intersection_over_union,
-            minimum_candidate_confidence: thresholds.minimum_candidate_confidence,
+            minimum_candidate_confidence: thresholds.object_minimum_candidate_confidence,
         },
         pose_detection_parameters: PoseDetectionParameters {
             maximum_intersection_over_union: thresholds.maximum_intersection_over_union,
-            minimum_candidate_confidence: thresholds.minimum_candidate_confidence,
+            minimum_candidate_confidence: thresholds.person_pose_minimum_candidate_confidence,
+            visibility_score_alpha: person_visibility_score_alpha,
         },
-        robot_pose_detection_parameters: PoseDetectionParameters {
+        robot_pose_detection_parameters: RobotPoseDetectionParameters {
             maximum_intersection_over_union: thresholds.maximum_intersection_over_union,
-            minimum_candidate_confidence: thresholds.minimum_candidate_confidence,
+            minimum_candidate_confidence: thresholds.robot_pose_minimum_candidate_confidence,
+            visibility_score_alpha: robot_visibility_score_alpha,
         },
         field_feature_detection_parameters: FieldFeatureDetectionParameters {
-            minimum_candidate_confidence: thresholds.minimum_candidate_confidence,
+            minimum_candidate_confidence: thresholds.field_feature_minimum_candidate_confidence,
             maximum_suppression_distance_in_pixels: 8.0,
         },
     };
@@ -600,7 +620,157 @@ mod tests {
         let config = ModelRunConfig::new("model", "model.onnx");
         assert_eq!(config.thresholds.minimum_candidate_confidence, 0.05);
         assert_eq!(config.thresholds.maximum_intersection_over_union, 0.4);
+        assert_eq!(config.per_head_thresholds, None);
+        assert_eq!(config.person_visibility_score_alpha, 0.0);
+        assert_eq!(config.robot_visibility_score_alpha, 0.0);
         assert_eq!(config.cleanup_warning_after, Duration::from_secs(5));
+    }
+
+    #[test]
+    fn generated_parameters_include_independent_visibility_alphas() {
+        let directory = tempfile::tempdir().unwrap();
+        let thresholds = DetectionThresholds::default();
+        let manifest = ModelRunManifest::new_with_visibility_alphas(
+            "model",
+            PathBuf::from("/tmp/model.onnx"),
+            [7; 32],
+            crate::cache::RecordingFingerprint {
+                canonical_path: PathBuf::from("/tmp/recording.mcap"),
+                size: 1,
+                modified_unix_nanos: 1,
+                format_version: 1,
+            },
+            thresholds,
+            1.75,
+            1.25,
+            1,
+            0..=0,
+        )
+        .unwrap();
+        write_detection_parameters(directory.path(), &manifest).unwrap();
+
+        let parameters: DetectionParameters =
+            serde_json::from_reader(File::open(directory.path().join("detection.json5")).unwrap())
+                .unwrap();
+        assert_eq!(
+            parameters.pose_detection_parameters.visibility_score_alpha,
+            1.75
+        );
+        assert_eq!(
+            parameters
+                .robot_pose_detection_parameters
+                .visibility_score_alpha,
+            1.25
+        );
+    }
+
+    #[test]
+    fn generated_parameters_preserve_per_head_confidence() {
+        let directory = tempfile::tempdir().unwrap();
+        let thresholds = PerHeadDetectionThresholds {
+            object_minimum_candidate_confidence: 0.25,
+            person_pose_minimum_candidate_confidence: 0.5,
+            robot_pose_minimum_candidate_confidence: 0.5,
+            field_feature_minimum_candidate_confidence: 0.35,
+            maximum_intersection_over_union: 0.5,
+        };
+        let manifest = ModelRunManifest::new_with_per_head_thresholds(
+            "model",
+            PathBuf::from("/tmp/model.onnx"),
+            [7; 32],
+            crate::cache::RecordingFingerprint {
+                canonical_path: PathBuf::from("/tmp/recording.mcap"),
+                size: 1,
+                modified_unix_nanos: 1,
+                format_version: 1,
+            },
+            thresholds,
+            0.0,
+            1,
+            0..=0,
+        )
+        .unwrap();
+        write_detection_parameters(directory.path(), &manifest).unwrap();
+
+        let parameters: DetectionParameters =
+            serde_json::from_reader(File::open(directory.path().join("detection.json5")).unwrap())
+                .unwrap();
+        assert_eq!(
+            parameters
+                .object_detection_parameters
+                .minimum_candidate_confidence,
+            0.25
+        );
+        assert_eq!(
+            parameters
+                .pose_detection_parameters
+                .minimum_candidate_confidence,
+            0.5
+        );
+        assert_eq!(
+            parameters
+                .robot_pose_detection_parameters
+                .minimum_candidate_confidence,
+            0.5
+        );
+        assert_eq!(
+            parameters
+                .field_feature_detection_parameters
+                .minimum_candidate_confidence,
+            0.35
+        );
+    }
+
+    #[test]
+    fn generated_parameters_reject_invalid_robot_visibility_alpha() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut manifest = ModelRunManifest::new(
+            "model",
+            PathBuf::from("/tmp/model.onnx"),
+            [7; 32],
+            crate::cache::RecordingFingerprint {
+                canonical_path: PathBuf::from("/tmp/recording.mcap"),
+                size: 1,
+                modified_unix_nanos: 1,
+                format_version: 1,
+            },
+            DetectionThresholds::default(),
+            1,
+            0..=0,
+        )
+        .unwrap();
+
+        for invalid in [-1.0, f32::NAN, f32::INFINITY] {
+            manifest.robot_visibility_score_alpha = invalid;
+            let error = write_detection_parameters(directory.path(), &manifest).unwrap_err();
+            assert!(error.to_string().contains("finite and non-negative"));
+        }
+    }
+
+    #[test]
+    fn generated_parameters_reject_invalid_person_visibility_alpha() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut manifest = ModelRunManifest::new(
+            "model",
+            PathBuf::from("/tmp/model.onnx"),
+            [7; 32],
+            crate::cache::RecordingFingerprint {
+                canonical_path: PathBuf::from("/tmp/recording.mcap"),
+                size: 1,
+                modified_unix_nanos: 1,
+                format_version: 1,
+            },
+            DetectionThresholds::default(),
+            1,
+            0..=0,
+        )
+        .unwrap();
+
+        for invalid in [-1.0, f32::NAN, f32::INFINITY] {
+            manifest.person_visibility_score_alpha = invalid;
+            let error = write_detection_parameters(directory.path(), &manifest).unwrap_err();
+            assert!(error.to_string().contains("finite and non-negative"));
+        }
     }
 
     #[test]

@@ -9,10 +9,12 @@
   pose_detection_parameters: {
     maximum_intersection_over_union: 0.5,
     minimum_candidate_confidence: 0.5,
+    visibility_score_alpha: 1.75,
   },
   robot_pose_detection_parameters: {
     maximum_intersection_over_union: 0.5,
     minimum_candidate_confidence: 0.5,
+    visibility_score_alpha: 2.0,
   },
   field_feature_detection_parameters: {
     minimum_candidate_confidence: 0.35,

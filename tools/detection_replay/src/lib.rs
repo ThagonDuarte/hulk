@@ -4,8 +4,8 @@ mod runner;
 
 pub use cache::{
     Bookmark, BookmarkCollection, DetectionThresholds, LoadedPredictionChunk, LoadedPredictionRun,
-    ModelRunManifest, ModelRunState, Prediction, PredictionAvailability, PredictionSource,
-    RecordingFingerprint, RunUiMetadata,
+    ModelRunManifest, ModelRunState, PerHeadDetectionThresholds, Prediction,
+    PredictionAvailability, PredictionSource, RecordingFingerprint, RunUiMetadata,
 };
 pub use recording::{
     FrameIndexEntry, ImageTopic, OriginalFrame, OriginalImageSource, OriginalImageStream,
