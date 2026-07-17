@@ -1,10 +1,14 @@
 """YOLO-format keypoint datasets with global detector-class mapping."""
 
-# ruff: noqa: S311, TRY003
+# ruff: noqa: C901, S311, TRY003
 
+import hashlib
+import json
 import random
+from collections.abc import Sequence
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal
+from typing import Literal, cast
 
 import torch
 import torchvision.transforms.v2.functional as transform_functional
@@ -21,6 +25,255 @@ from ultralytics_dfine.data.dataset import (
 )
 from ultralytics_dfine.schemas import HeadId
 
+ROBOT_NEGATIVE_MANIFEST_VERSION = 2
+ROBOT_NEGATIVE_MANIFEST_POLICY = "explicit-verified-robot-free-keypoint-v2"
+ROBOT_NEGATIVE_POPULATION_DIGEST_ALGORITHM = (
+    r"sha256(keypoint-robot-negative-population-v1\0 + split + \0 + "
+    r"ordered(relative_path + \0 + image_sha256 + \n))"
+)
+ROBOT_NEGATIVE_ROLES = frozenset(
+    {"primary_evaluation", "stress_evaluation"}
+)
+
+
+@dataclass(frozen=True)
+class RobotNegativeEvidence:
+    """Byte-locked approval for one complete keypoint dataset split."""
+
+    role: str
+    records: int
+    population_sha256: str
+    reviewed_records: int
+    eligible_records: int
+    excluded_records: int
+    eligible_image_sha256: tuple[tuple[str, str], ...]
+    excluded_image_sha256: tuple[tuple[str, str], ...]
+    eligible_relative_paths: frozenset[str]
+    excluded_relative_paths: frozenset[str]
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as file:
+        while block := file.read(1024 * 1024):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _require_mapping(value: object, context: str) -> dict[str, object]:
+    if not isinstance(value, dict):
+        raise TypeError(f"{context} must be an object")
+    return cast("dict[str, object]", value)
+
+
+def _require_sha256(value: object, context: str) -> str:
+    if (
+        not isinstance(value, str)
+        or len(value) != 64
+        or any(character not in "0123456789abcdef" for character in value)
+    ):
+        raise ValueError(f"{context} must be a lowercase SHA-256")
+    return value
+
+
+def _normalized_relative_path(value: object, context: str) -> str:
+    if not isinstance(value, str) or not value:
+        raise ValueError(f"{context} must be a non-empty relative path")
+    path = Path(value)
+    if path.is_absolute() or ".." in path.parts:
+        raise ValueError(f"{context} must be a normalized relative path")
+    normalized = path.as_posix()
+    if normalized != value:
+        raise ValueError(f"{context} must use normalized POSIX separators")
+    return normalized
+
+
+def _load_reviewed_entries(
+    manifest_path: Path,
+    raw_reference: object,
+    *,
+    split: str,
+    decision: Literal["eligible", "excluded"],
+) -> dict[str, str]:
+    context = f"splits.{split}.{decision}"
+    reference = _require_mapping(raw_reference, context)
+    relative_reference = _normalized_relative_path(
+        reference.get("path"),
+        f"{context}.path",
+    )
+    reference_path = (manifest_path.parent / relative_reference).resolve()
+    try:
+        reference_path.relative_to(manifest_path.parent.resolve())
+    except ValueError as error:
+        raise ValueError(
+            f"{context}.path must stay inside the manifest directory"
+        ) from error
+    expected_sha = _require_sha256(
+        reference.get("sha256"),
+        f"{context}.sha256",
+    )
+    if not reference_path.is_file():
+        raise FileNotFoundError(reference_path)
+    if _sha256_file(reference_path) != expected_sha:
+        raise ValueError(f"{context} list SHA-256 mismatch")
+    records = reference.get("records")
+    if not isinstance(records, int) or records < 0:
+        raise ValueError(f"{context}.records must be non-negative")
+
+    entries: dict[str, str] = {}
+    with reference_path.open(encoding="utf-8") as file:
+        for line_number, line in enumerate(file, start=1):
+            if not line.strip():
+                raise ValueError(
+                    f"{reference_path}:{line_number}: blank lines are invalid"
+                )
+            raw_entry = _require_mapping(
+                json.loads(line),
+                f"{reference_path}:{line_number}",
+            )
+            relative_path = _normalized_relative_path(
+                raw_entry.get("relative_path"),
+                f"{reference_path}:{line_number}.relative_path",
+            )
+            image_sha = _require_sha256(
+                raw_entry.get("image_sha256"),
+                f"{reference_path}:{line_number}.image_sha256",
+            )
+            evidence_field = "review" if decision == "eligible" else "reason"
+            evidence = raw_entry.get(evidence_field)
+            if not isinstance(evidence, str) or not evidence.strip():
+                raise ValueError(
+                    f"{reference_path}:{line_number}.{evidence_field} "
+                    "must be non-empty"
+                )
+            if relative_path in entries:
+                raise ValueError(
+                    f"{reference_path}: duplicate path {relative_path!r}"
+                )
+            entries[relative_path] = image_sha
+    if len(entries) != records:
+        raise ValueError(f"{context} record count mismatch")
+    return entries
+
+
+def _load_robot_negative_manifest(
+    path: str | Path,
+    *,
+    dataset_yaml: Path,
+    split: str,
+) -> tuple[RobotNegativeEvidence, str]:
+    manifest_path = Path(path).expanduser().resolve()
+    with manifest_path.open(encoding="utf-8") as file:
+        values = _require_mapping(json.load(file), str(manifest_path))
+    if values.get("version") != ROBOT_NEGATIVE_MANIFEST_VERSION:
+        raise ValueError("Unsupported robot-negative manifest version")
+    if values.get("policy") != ROBOT_NEGATIVE_MANIFEST_POLICY:
+        raise ValueError("Unsupported robot-negative manifest policy")
+    if values.get("population_digest_algorithm") != (
+        ROBOT_NEGATIVE_POPULATION_DIGEST_ALGORITHM
+    ):
+        raise ValueError("Unsupported robot-negative population digest")
+    expected_yaml_sha = _require_sha256(
+        values.get("dataset_yaml_sha256"),
+        "dataset_yaml_sha256",
+    )
+    if _sha256_file(dataset_yaml) != expected_yaml_sha:
+        raise ValueError("Robot-negative dataset YAML SHA-256 mismatch")
+    splits = _require_mapping(values.get("splits"), "splits")
+    raw_evidence = _require_mapping(
+        splits.get(split),
+        f"splits.{split}",
+    )
+    role = raw_evidence.get("role")
+    if role not in ROBOT_NEGATIVE_ROLES:
+        raise ValueError(f"splits.{split}.role is unsupported")
+    records = raw_evidence.get("records")
+    if not isinstance(records, int) or records <= 0:
+        raise ValueError(f"splits.{split}.records must be positive")
+
+    eligible = _load_reviewed_entries(
+        manifest_path,
+        raw_evidence.get("eligible"),
+        split=split,
+        decision="eligible",
+    )
+    raw_excluded = raw_evidence.get("excluded")
+    excluded = (
+        {}
+        if raw_excluded is None
+        else _load_reviewed_entries(
+            manifest_path,
+            raw_excluded,
+            split=split,
+            decision="excluded",
+        )
+    )
+    overlap = sorted(set(eligible) & set(excluded))
+    if overlap:
+        raise ValueError(
+            "Robot-negative eligible/excluded lists overlap: "
+            + ", ".join(overlap)
+        )
+
+    expected_counts = {
+        "reviewed_records": len(eligible) + len(excluded),
+        "eligible_records": len(eligible),
+        "excluded_records": len(excluded),
+    }
+    observed_counts = {key: raw_evidence.get(key) for key in expected_counts}
+    if observed_counts != expected_counts:
+        raise ValueError(
+            "Robot-negative reviewed decision counts are inconsistent"
+        )
+    if expected_counts["reviewed_records"] > records:
+        raise ValueError("Robot-negative reviewed records exceed population")
+
+    evidence = RobotNegativeEvidence(
+        role=cast("str", role),
+        records=records,
+        population_sha256=_require_sha256(
+            raw_evidence.get("population_sha256"),
+            f"splits.{split}.population_sha256",
+        ),
+        reviewed_records=expected_counts["reviewed_records"],
+        eligible_records=expected_counts["eligible_records"],
+        excluded_records=expected_counts["excluded_records"],
+        eligible_image_sha256=tuple(sorted(eligible.items())),
+        excluded_image_sha256=tuple(sorted(excluded.items())),
+        eligible_relative_paths=frozenset(eligible),
+        excluded_relative_paths=frozenset(excluded),
+    )
+    return evidence, _sha256_file(manifest_path)
+
+
+def _relative_image_path(image_path: Path, root: Path) -> str:
+    try:
+        return image_path.resolve().relative_to(root.resolve()).as_posix()
+    except ValueError as error:
+        raise ValueError(
+            f"Robot-negative image is outside the dataset root: {image_path}"
+        ) from error
+
+
+def _robot_negative_population_sha256(
+    images: Sequence[Path],
+    *,
+    root: Path,
+    split: str,
+) -> tuple[str, tuple[str, ...], dict[str, str]]:
+    digest = hashlib.sha256()
+    digest.update(b"keypoint-robot-negative-population-v1\0")
+    digest.update(f"{split}\0".encode())
+    relative_paths = []
+    image_sha256 = {}
+    for image_path in images:
+        relative_path = _relative_image_path(image_path, root)
+        relative_paths.append(relative_path)
+        image_sha = _sha256_file(image_path)
+        image_sha256[relative_path] = image_sha
+        digest.update(f"{relative_path}\0{image_sha}\n".encode())
+    return digest.hexdigest(), tuple(relative_paths), image_sha256
+
 
 class YOLOKeypointDataset(Dataset[tuple[Tensor, DatasetTarget]]):
     """Load homogeneous YOLO pose rows and map classes into D-FINE."""
@@ -36,10 +289,13 @@ class YOLOKeypointDataset(Dataset[tuple[Tensor, DatasetTarget]]):
         global_class_ids: tuple[int, ...],
         keypoint_dimensions: Literal[2, 3] = 3,
         num_detection_classes: int = 8,
-        image_size: int = 640,
+        image_size: int | tuple[int, int] = 640,
         horizontal_flip_probability: float = 0.5,
+        augmentation_profile: Literal["basic"] = "basic",
         point_set: bool = False,
         point_label_ids: tuple[int, ...] | None = None,
+        robot_negative_manifest: str | Path | None = None,
+        robot_negative_roles: Sequence[str] = ("primary_evaluation",),
     ) -> None:
         self.definition = (
             data
@@ -61,8 +317,20 @@ class YOLOKeypointDataset(Dataset[tuple[Tensor, DatasetTarget]]):
         self.flip_idx = flip_idx
         self.global_class_ids = global_class_ids
         self.num_detection_classes = num_detection_classes
+        self.output_size = (
+            (image_size, image_size)
+            if isinstance(image_size, int)
+            else image_size
+        )
+        if len(self.output_size) != 2 or min(self.output_size) <= 0:
+            raise ValueError("image_size must contain positive height/width")
         self.image_size = image_size
+        if not 0 <= horizontal_flip_probability <= 1:
+            raise ValueError("horizontal_flip_probability must be in [0, 1]")
         self.horizontal_flip_probability = horizontal_flip_probability
+        if augmentation_profile != "basic":
+            raise ValueError("Unsupported keypoint augmentation profile")
+        self.augmentation_profile = augmentation_profile
         self.point_set = point_set
         self.point_label_ids = point_label_ids
         if point_label_ids is not None and len(point_label_ids) != len(
@@ -78,6 +346,97 @@ class YOLOKeypointDataset(Dataset[tuple[Tensor, DatasetTarget]]):
         ]
         if not self.images:
             raise ValueError(f"Dataset '{split}' split contains no images")
+        selected_roles = frozenset(robot_negative_roles)
+        if not selected_roles.issubset(ROBOT_NEGATIVE_ROLES):
+            raise ValueError(
+                "robot_negative_roles contains an unsupported role"
+            )
+        if (
+            robot_negative_manifest is not None
+            and schema_id != HeadId.PERSON_POSE
+        ):
+            raise ValueError(
+                "Robot-negative evidence may only be used with Person pose"
+            )
+        self.robot_negative_manifest_sha256: str | None = None
+        self.robot_negative_reviewed_records = 0
+        self.robot_negative_verified_records = 0
+        self.robot_negative_eligible_records = 0
+        self.robot_negative_excluded_records = 0
+        self.robot_negative_unreviewed_records = len(self.images)
+        self._robot_negative_reviewed = tuple(False for _ in self.images)
+        self._robot_negative_verified = tuple(False for _ in self.images)
+        self._robot_negative_eligible = tuple(False for _ in self.images)
+        self._robot_negative_excluded = tuple(False for _ in self.images)
+        if robot_negative_manifest is not None:
+            evidence, manifest_sha = _load_robot_negative_manifest(
+                robot_negative_manifest,
+                dataset_yaml=self.definition.yaml_path,
+                split=split,
+            )
+            if len(self.images) != evidence.records:
+                raise ValueError("Robot-negative record count mismatch")
+            population_sha, relative_paths, population_image_sha = (
+                _robot_negative_population_sha256(
+                    self.images,
+                    root=self.definition.root,
+                    split=split,
+                )
+            )
+            if population_sha != evidence.population_sha256:
+                raise ValueError("Robot-negative population SHA-256 mismatch")
+            reviewed_paths = (
+                evidence.eligible_relative_paths
+                | evidence.excluded_relative_paths
+            )
+            unknown_reviewed = sorted(reviewed_paths - set(relative_paths))
+            if unknown_reviewed:
+                raise ValueError(
+                    "Robot-negative reviewed paths are absent from the "
+                    "dataset: " + ", ".join(unknown_reviewed)
+                )
+            expected_reviewed_sha = dict(evidence.eligible_image_sha256)
+            expected_reviewed_sha.update(evidence.excluded_image_sha256)
+            mismatched_reviewed_sha = sorted(
+                path
+                for path, expected in expected_reviewed_sha.items()
+                if population_image_sha[path] != expected
+            )
+            if mismatched_reviewed_sha:
+                raise ValueError(
+                    "Robot-negative reviewed image SHA-256 mismatch: "
+                    + ", ".join(mismatched_reviewed_sha)
+                )
+            reviewed = tuple(path in reviewed_paths for path in relative_paths)
+            verified = tuple(
+                path in evidence.eligible_relative_paths
+                for path in relative_paths
+            )
+            eligible = tuple(
+                value and evidence.role in selected_roles for value in verified
+            )
+            excluded = tuple(
+                path in evidence.excluded_relative_paths
+                for path in relative_paths
+            )
+            if sum(reviewed) != evidence.reviewed_records:
+                raise ValueError("Robot-negative reviewed records do not match")
+            if sum(verified) != evidence.eligible_records:
+                raise ValueError("Robot-negative eligible records do not match")
+            if sum(excluded) != evidence.excluded_records:
+                raise ValueError("Robot-negative excluded records do not match")
+            self.robot_negative_manifest_sha256 = manifest_sha
+            self.robot_negative_reviewed_records = sum(reviewed)
+            self.robot_negative_verified_records = sum(verified)
+            self.robot_negative_eligible_records = sum(eligible)
+            self.robot_negative_excluded_records = sum(excluded)
+            self.robot_negative_unreviewed_records = len(self.images) - sum(
+                reviewed
+            )
+            self._robot_negative_reviewed = reviewed
+            self._robot_negative_verified = verified
+            self._robot_negative_eligible = eligible
+            self._robot_negative_excluded = excluded
 
     def __len__(self) -> int:
         return len(self.images)
@@ -101,9 +460,24 @@ class YOLOKeypointDataset(Dataset[tuple[Tensor, DatasetTarget]]):
             "missing_label_files": missing_files,
             "rows": rows,
             "ignored_rows": 0,
+            "robot_negative_reviewed_records": (
+                self.robot_negative_reviewed_records
+            ),
+            "robot_negative_verified_records": (
+                self.robot_negative_verified_records
+            ),
+            "robot_negative_eligible_records": (
+                self.robot_negative_eligible_records
+            ),
+            "robot_negative_excluded_records": (
+                self.robot_negative_excluded_records
+            ),
+            "robot_negative_unreviewed_records": (
+                self.robot_negative_unreviewed_records
+            ),
         }
 
-    def _load_labels(  # noqa: C901
+    def _load_labels(
         self,
         image_path: Path,
     ) -> tuple[Tensor, Tensor, Tensor]:
@@ -199,7 +573,7 @@ class YOLOKeypointDataset(Dataset[tuple[Tensor, DatasetTarget]]):
                 keypoints = keypoints[:, self.flip_idx]
         image = transform_functional.resize(
             image_tensor,
-            [self.image_size, self.image_size],
+            list(self.output_size),
             antialias=True,
         )
         image = transform_functional.to_dtype(
@@ -224,6 +598,10 @@ class YOLOKeypointDataset(Dataset[tuple[Tensor, DatasetTarget]]):
             "orig_size": torch.tensor([height, width], dtype=torch.long),
             "image_id": torch.tensor(index, dtype=torch.long),
             "path": image_path,
+            "robot_negative_reviewed": self._robot_negative_reviewed[index],
+            "robot_negative_verified": self._robot_negative_verified[index],
+            "robot_negative_eligible": self._robot_negative_eligible[index],
+            "robot_negative_excluded": self._robot_negative_excluded[index],
         }
         if self.point_set:
             point_mapping = torch.tensor(

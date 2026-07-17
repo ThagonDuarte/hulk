@@ -230,9 +230,11 @@ uv run -m validation.compare_results \
 
 ## Model complexity (`src/utils/model_complexity.py`)
 
-Reports checkpoint file size, parameter counts, MACs, and FLOPs for YOLO
-`.pt` files and assembled Hydra model names. FLOPs use the Ultralytics
-convention: `1 MAC = 2 FLOPs`. Checkpoint reports are saved under
+Reports checkpoint file size, parameter counts, MACs, and FLOPs for YOLO,
+D-FINE, and native multi-task D-FINE `.pt` files, as well as assembled Hydra
+model names. FLOPs use the Ultralytics convention: `1 MAC = 2 FLOPs`.
+`--height` and `--width` override the square `--imgsz` default. Checkpoint
+reports are saved under
 `runs/complexity/<checkpoint-name>/report.json`. For Hydra model names, the
 assembled model is exported first, then `size MB` is measured from that
 exported file. Hydra exports and per-model reports are saved under
@@ -244,6 +246,12 @@ Examples:
 # Profile one checkpoint
 uv run -m utils.model_complexity \
   runs/val/yolo26m=f11+yolo26m/yolo26m=f11+yolo26m.pt
+
+# Profile a native multi-task checkpoint at deployment resolution
+uv run -m utils.model_complexity \
+  runs/train/dfine-multitask/best.pt \
+  --height 448 \
+  --width 544
 
 # Profile specific asset checkpoints
 uv run -m utils.model_complexity assets \

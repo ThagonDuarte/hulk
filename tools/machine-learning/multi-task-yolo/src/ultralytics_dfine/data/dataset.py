@@ -16,6 +16,17 @@ from torch.utils.data import Dataset
 from torchvision import ops, tv_tensors
 
 IMAGE_SUFFIXES = {".bmp", ".jpeg", ".jpg", ".png", ".tif", ".tiff", ".webp"}
+ImageSize = int | tuple[int, int]
+
+
+def resolve_image_size(image_size: ImageSize) -> tuple[int, int]:
+    """Return ``(height, width)`` while retaining square-call compatibility."""
+    size = (
+        (image_size, image_size) if isinstance(image_size, int) else image_size
+    )
+    if len(size) != 2 or any(value <= 0 for value in size):
+        raise ValueError("Image size must contain positive height and width")
+    return size
 
 
 class DatasetTarget(TypedDict):
@@ -30,6 +41,13 @@ class DatasetTarget(TypedDict):
     valid_detection_classes: NotRequired[Tensor]
     point_labels: NotRequired[Tensor]
     points: NotRequired[Tensor]
+    person_negative_verified: NotRequired[bool]
+    person_negative_eligible: NotRequired[bool]
+    robot_negative_verified: NotRequired[bool]
+    robot_negative_eligible: NotRequired[bool]
+    robot_negative_reviewed: NotRequired[bool]
+    robot_negative_excluded: NotRequired[bool]
+    annotation_file: NotRequired[str]
 
 
 @dataclass(frozen=True)
@@ -133,7 +151,7 @@ class DFINEDataset(Dataset[tuple[Tensor, DatasetTarget]]):
         data: str | Path | DatasetDefinition,
         split: Literal["train", "val", "test"],
         *,
-        image_size: int = 640,
+        image_size: ImageSize = 640,
         transition_epoch: int = 120,
         num_detection_classes: int | None = None,
         ignore_unlisted_classes: bool = False,
@@ -144,7 +162,7 @@ class DFINEDataset(Dataset[tuple[Tensor, DatasetTarget]]):
             else load_dataset_yaml(data)
         )
         self.split = split
-        self.image_size = image_size
+        self.image_size = resolve_image_size(image_size)
         self.transition_epoch = transition_epoch
         self.num_detection_classes = (
             len(self.definition.names)
@@ -176,7 +194,7 @@ class DFINEDataset(Dataset[tuple[Tensor, DatasetTarget]]):
         )
         self._finalize = transforms.Compose(
             [
-                transforms.Resize((image_size, image_size), antialias=True),
+                transforms.Resize(self.image_size, antialias=True),
                 transforms.SanitizeBoundingBoxes(min_size=1),
                 transforms.ToImage(),
                 transforms.ToDtype(torch.float32, scale=True),
@@ -288,7 +306,27 @@ class DFINEDataset(Dataset[tuple[Tensor, DatasetTarget]]):
             with Image.open(image_path) as loaded_image:
                 image = loaded_image.convert("RGB")
         width, height = image.size
+        original_width, original_height = width, height
         labels, boxes = self._load_labels(image_path, width, height)
+        if self.split == "train" and self.epoch < self.transition_epoch:
+            maximum_side = 2 * max(self.image_size)
+            if max(width, height) > maximum_side:
+                scale = maximum_side / max(width, height)
+                resized_width = max(1, round(width * scale))
+                resized_height = max(1, round(height * scale))
+                image = image.resize(
+                    (resized_width, resized_height),
+                    Image.Resampling.BILINEAR,
+                )
+                boxes *= torch.tensor(
+                    [
+                        resized_width / width,
+                        resized_height / height,
+                        resized_width / width,
+                        resized_height / height,
+                    ]
+                )
+                width, height = resized_width, resized_height
         transform_target: dict[str, Any] = {
             "boxes": tv_tensors.BoundingBoxes(
                 boxes,
@@ -305,13 +343,17 @@ class DFINEDataset(Dataset[tuple[Tensor, DatasetTarget]]):
             in_fmt="xyxy",
             out_fmt="cxcywh",
         ).as_subclass(Tensor)
+        target_height, target_width = self.image_size
         transformed_boxes = transformed_boxes / torch.tensor(
-            [self.image_size, self.image_size, self.image_size, self.image_size]
+            [target_width, target_height, target_width, target_height]
         )
         target: DatasetTarget = {
             "labels": transform_target["labels"].long(),
             "boxes": transformed_boxes.float(),
-            "orig_size": torch.tensor([height, width], dtype=torch.long),
+            "orig_size": torch.tensor(
+                [original_height, original_width],
+                dtype=torch.long,
+            ),
             "image_id": torch.tensor(index, dtype=torch.long),
             "path": image_path,
             "valid_detection_classes": torch.cat(

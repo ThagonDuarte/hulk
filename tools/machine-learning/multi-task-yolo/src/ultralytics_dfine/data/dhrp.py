@@ -1,7 +1,8 @@
 """Native adapter for the Diverse Humanoid Robot Pose dataset."""
 
-# ruff: noqa: S311, TRY003
+# ruff: noqa: C901, S311, TRY003
 
+import hashlib
 import json
 import math
 import random
@@ -16,6 +17,7 @@ from PIL import Image
 from torch import Tensor
 from torch.utils.data import Dataset
 
+from ultralytics_dfine.data.dataset import ImageSize, resolve_image_size
 from ultralytics_dfine.schemas import (
     DHRP_FLIP_IDX,
     DHRP_JOINT_PARENTS,
@@ -26,6 +28,14 @@ DHRP_NUM_KEYPOINTS = len(DHRP_KEYPOINT_NAMES)
 DHRP_ROBOT_CLASS_ID = 4
 DHRP_BOX_PADDING = 0.15
 DHRP_MIN_BOX_SIZE = 1.0
+DHRP_PERSON_NEGATIVE_MANIFEST_VERSION = 1
+DHRP_PERSON_NEGATIVE_ROLES = frozenset(
+    {
+        "primary_evaluation",
+        "stress_evaluation",
+        "loss_holdout_validation",
+    }
+)
 
 _EVE_ANNOTATION_FILE = "train_set_TargetHumanoidRobots_EVE.json"
 _EVE_BAD_ANNOTATION_INDEX = 303
@@ -65,6 +75,19 @@ class DHRPTarget(TypedDict):
     orig_size: Tensor
     image_id: Tensor
     path: Path
+    annotation_file: str
+    person_negative_verified: bool
+    person_negative_eligible: bool
+
+
+@dataclass(frozen=True)
+class DHRPPersonNegativeEvidence:
+    """Immutable evidence that one annotation source is person-free."""
+
+    annotation_sha256: str
+    image_set_sha256: str
+    records: int
+    role: str
 
 
 @dataclass(frozen=True)
@@ -77,6 +100,9 @@ class DHRPRecord:
     class_id: int
     box: tuple[float, float, float, float] | None
     keypoints: tuple[tuple[float, float, float], ...]
+    annotation_file: str
+    person_negative_verified: bool
+    person_negative_eligible: bool
 
     def target(self, image_id: int) -> DHRPTarget:
         """Build fresh tensors so transforms may mutate them safely."""
@@ -110,6 +136,9 @@ class DHRPRecord:
             ),
             "image_id": torch.tensor(image_id, dtype=torch.long),
             "path": self.image_path,
+            "annotation_file": self.annotation_file,
+            "person_negative_verified": self.person_negative_verified,
+            "person_negative_eligible": self.person_negative_eligible,
         }
 
 
@@ -137,6 +166,69 @@ def _require_sequence(value: object, context: str) -> Sequence[object]:
     if not isinstance(value, list):
         raise DHRPTypeError(context, "an array")
     return value
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as file:
+        while block := file.read(1024 * 1024):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _require_sha256(value: object, context: str) -> str:
+    if (
+        not isinstance(value, str)
+        or len(value) != 64
+        or any(character not in "0123456789abcdef" for character in value)
+    ):
+        raise DHRPFormatError(context, "must be a lowercase SHA-256")
+    return value
+
+
+def _load_person_negative_manifest(
+    path: str | Path | None,
+) -> tuple[dict[str, DHRPPersonNegativeEvidence], str | None]:
+    if path is None:
+        return {}, None
+    manifest_path = Path(path).expanduser().resolve()
+    with manifest_path.open(encoding="utf-8") as file:
+        data = _require_mapping(json.load(file), str(manifest_path))
+    if data.get("version") != DHRP_PERSON_NEGATIVE_MANIFEST_VERSION:
+        raise DHRPFormatError(manifest_path, "unsupported manifest version")
+    if data.get("policy") != "verified-person-free-dhrp-v1":
+        raise DHRPFormatError(manifest_path, "unsupported manifest policy")
+    raw_annotations = _require_mapping(
+        data.get("annotations"),
+        f"{manifest_path}: annotations",
+    )
+    evidence = {}
+    for name, raw_value in raw_annotations.items():
+        context = f"{manifest_path}: annotations.{name}"
+        if Path(name).name != name:
+            raise DHRPFormatError(context, "name must be a basename")
+        values = _require_mapping(raw_value, context)
+        records = values.get("records")
+        if not isinstance(records, int) or records <= 0:
+            raise DHRPFormatError(context, "records must be positive")
+        role = values.get("role")
+        if role not in DHRP_PERSON_NEGATIVE_ROLES:
+            raise DHRPFormatError(context, "unsupported evidence role")
+        evidence[name] = DHRPPersonNegativeEvidence(
+            annotation_sha256=_require_sha256(
+                values.get("annotation_sha256"),
+                f"{context}.annotation_sha256",
+            ),
+            image_set_sha256=_require_sha256(
+                values.get("image_set_sha256"),
+                f"{context}.image_set_sha256",
+            ),
+            records=records,
+            role=cast("str", role),
+        )
+    if not evidence:
+        raise DHRPFormatError(manifest_path, "manifest must not be empty")
+    return evidence, _sha256_file(manifest_path)
 
 
 def _validate_metadata(data: dict[str, object], annotation_path: Path) -> None:
@@ -208,13 +300,16 @@ def _parse_keypoints(
                 "must be binary",
             )
         finite = math.isfinite(x) and math.isfinite(y)
-        if finite and (x != 0.0 or y != 0.0):
+        non_sentinel = x != 0.0 or y != 0.0
+        in_frame = finite and 0.0 <= x < width and 0.0 <= y < height
+        valid_location = non_sentinel and in_frame
+        if valid_location:
             box_points.append((x, y))
         normalized.append(
             (
-                x / width if math.isfinite(x) else 0.0,
-                y / height if math.isfinite(y) else 0.0,
-                raw_visibility,
+                x / width if valid_location else 0.0,
+                y / height if valid_location else 0.0,
+                raw_visibility if valid_location else 0.0,
             )
         )
     return tuple(normalized), box_points
@@ -276,7 +371,18 @@ def _load_annotation_file(
     class_id: int,
     box_padding: float,
     minimum_box_size: float,
+    person_negative_evidence: DHRPPersonNegativeEvidence | None,
+    person_negative_roles: frozenset[str],
 ) -> list[DHRPRecord]:
+    if (
+        person_negative_evidence is not None
+        and _sha256_file(annotation_path)
+        != person_negative_evidence.annotation_sha256
+    ):
+        raise DHRPFormatError(
+            annotation_path,
+            "person-negative annotation SHA-256 mismatch",
+        )
     with annotation_path.open(encoding="utf-8") as file:
         data = _require_mapping(json.load(file), str(annotation_path))
     _validate_metadata(data, annotation_path)
@@ -291,6 +397,8 @@ def _load_annotation_file(
         )
 
     records = []
+    image_set_digest = hashlib.sha256()
+    image_set_digest.update(b"dhrp-person-negative-images-v1\0")
     for index, value in enumerate(annotations):
         context = f"{annotation_path}: annotation {index}"
         annotation = _require_mapping(value, context)
@@ -308,6 +416,10 @@ def _load_annotation_file(
             raise DHRPImageNotFoundError(context, image_path)
         with Image.open(image_path) as image:
             width, height = image.size
+        if person_negative_evidence is not None:
+            image_set_digest.update(
+                f"{corrected_path}\0{_sha256_file(image_path)}\n".encode()
+            )
         if width <= 0 or height <= 0:
             raise DHRPFormatError(context, "image dimensions must be positive")
         keypoints, box_points = _parse_keypoints(
@@ -330,8 +442,27 @@ def _load_annotation_file(
                     minimum_size=minimum_box_size,
                 ),
                 keypoints=keypoints,
+                annotation_file=annotation_path.name,
+                person_negative_verified=(person_negative_evidence is not None),
+                person_negative_eligible=(
+                    person_negative_evidence is not None
+                    and person_negative_evidence.role in person_negative_roles
+                ),
             )
         )
+    if person_negative_evidence is not None:
+        if len(records) != person_negative_evidence.records:
+            raise DHRPFormatError(
+                annotation_path,
+                "person-negative record count mismatch",
+            )
+        if image_set_digest.hexdigest() != (
+            person_negative_evidence.image_set_sha256
+        ):
+            raise DHRPFormatError(
+                annotation_path,
+                "person-negative image-set SHA-256 mismatch",
+            )
     return records
 
 
@@ -342,6 +473,8 @@ def load_dhrp_records(
     class_id: int = DHRP_ROBOT_CLASS_ID,
     box_padding: float = DHRP_BOX_PADDING,
     minimum_box_size: float = DHRP_MIN_BOX_SIZE,
+    person_negative_manifest: str | Path | None = None,
+    person_negative_roles: Sequence[str] = ("primary_evaluation",),
 ) -> tuple[DHRPRecord, ...]:
     """Parse one or more native DHRP train/eval annotation files."""
     if class_id < 0:
@@ -352,16 +485,40 @@ def load_dhrp_records(
         raise DHRPFormatError("minimum_box_size", "must be positive")
 
     dataset_root = Path(root).expanduser().resolve()
-    files = (
+    raw_files = (
         [annotation_files]
         if isinstance(annotation_files, (str, Path))
         else annotation_files
     )
-    records = []
-    for annotation_file in files:
+    files = []
+    for annotation_file in raw_files:
         annotation_path = Path(annotation_file).expanduser()
-        if not annotation_path.is_absolute():
-            annotation_path = dataset_root / annotation_path
+        files.append(
+            annotation_path
+            if annotation_path.is_absolute()
+            else dataset_root / annotation_path
+        )
+    selected_roles = frozenset(person_negative_roles)
+    if not selected_roles.issubset(DHRP_PERSON_NEGATIVE_ROLES):
+        raise DHRPFormatError(
+            "person_negative_roles",
+            "contains an unsupported role",
+        )
+    evidence, _ = _load_person_negative_manifest(person_negative_manifest)
+    paths_by_name = {path.name: path for path in files}
+    if len(paths_by_name) != len(files):
+        raise DHRPFormatError(
+            "annotation_files",
+            "annotation basenames must be unique",
+        )
+    unknown = sorted(set(evidence) - set(paths_by_name))
+    if unknown:
+        raise DHRPFormatError(
+            "person_negative_manifest",
+            "annotations are absent from this dataset: " + ", ".join(unknown),
+        )
+    records = []
+    for annotation_path in files:
         records.extend(
             _load_annotation_file(
                 dataset_root,
@@ -369,6 +526,8 @@ def load_dhrp_records(
                 class_id=class_id,
                 box_padding=box_padding,
                 minimum_box_size=minimum_box_size,
+                person_negative_evidence=evidence.get(annotation_path.name),
+                person_negative_roles=selected_roles,
             )
         )
     return tuple(records)
@@ -385,9 +544,11 @@ class DHRPDataset(Dataset[tuple[Tensor, DHRPTarget]]):
         class_id: int = DHRP_ROBOT_CLASS_ID,
         box_padding: float = DHRP_BOX_PADDING,
         minimum_box_size: float = DHRP_MIN_BOX_SIZE,
-        image_size: int = 640,
+        image_size: ImageSize = 640,
         horizontal_flip_probability: float = 0.5,
         training: bool = False,
+        person_negative_manifest: str | Path | None = None,
+        person_negative_roles: Sequence[str] = ("primary_evaluation",),
     ) -> None:
         self.records = load_dhrp_records(
             root,
@@ -395,8 +556,21 @@ class DHRPDataset(Dataset[tuple[Tensor, DHRPTarget]]):
             class_id=class_id,
             box_padding=box_padding,
             minimum_box_size=minimum_box_size,
+            person_negative_manifest=person_negative_manifest,
+            person_negative_roles=person_negative_roles,
         )
-        self.image_size = image_size
+        self.person_negative_manifest_sha256 = (
+            _sha256_file(Path(person_negative_manifest).expanduser().resolve())
+            if person_negative_manifest is not None
+            else None
+        )
+        self.person_negative_verified_records = sum(
+            record.person_negative_verified for record in self.records
+        )
+        self.person_negative_eligible_records = sum(
+            record.person_negative_eligible for record in self.records
+        )
+        self.image_size = resolve_image_size(image_size)
         self.horizontal_flip_probability = horizontal_flip_probability
         self.training = training
 
@@ -418,7 +592,7 @@ class DHRPDataset(Dataset[tuple[Tensor, DHRPTarget]]):
                 target["visibility"] = target["visibility"][:, DHRP_FLIP_IDX]
         image = transform_functional.resize(
             image_tensor,
-            [self.image_size, self.image_size],
+            list(self.image_size),
             antialias=True,
         )
         image = transform_functional.to_dtype(

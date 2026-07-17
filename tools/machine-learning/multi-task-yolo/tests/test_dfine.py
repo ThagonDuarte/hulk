@@ -9,6 +9,7 @@ from PIL import Image
 
 from ultralytics_dfine.config import (
     DFINEArchitectureConfig,
+    PoseHeadConfig,
     build_manifest,
     build_multitask_manifest,
 )
@@ -26,6 +27,13 @@ from utils.model_naming import (
     TaskType,
     UnsupportedHydraCompositionError,
 )
+
+
+class ConfigurationTests(unittest.TestCase):
+    def test_person_visibility_score_alpha_is_parse_only(self) -> None:
+        self.assertEqual(PoseHeadConfig().visibility_score_alpha, 0.0)
+        with self.assertRaisesRegex(ValueError, "must be zero"):
+            PoseHeadConfig(visibility_score_alpha=1.0)
 
 
 class ModelNamingTests(unittest.TestCase):
@@ -184,6 +192,43 @@ class DatasetTests(unittest.TestCase):
                 target["boxes"],
                 torch.tensor([[0.5, 0.5, 0.25, 0.5]]),
             )
+
+    def test_rectangular_image_size_preserves_normalized_boxes(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "images" / "val").mkdir(parents=True)
+            (root / "labels" / "val").mkdir(parents=True)
+            Image.new("RGB", (80, 40), color="white").save(
+                root / "images" / "val" / "image.jpg"
+            )
+            (root / "labels" / "val" / "image.txt").write_text(
+                "0 0.5 0.5 0.25 0.5\n",
+                encoding="utf-8",
+            )
+            data_path = root / "data.yaml"
+            data_path.write_text(
+                yaml.safe_dump(
+                    {
+                        "path": str(root),
+                        "names": {0: "object"},
+                        "train": "images/val",
+                        "val": "images/val",
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            image, target = DFINEDataset(
+                data_path,
+                "val",
+                image_size=(448, 544),
+            )[0]
+
+        self.assertEqual(tuple(image.shape), (3, 448, 544))
+        torch.testing.assert_close(
+            target["boxes"],
+            torch.tensor([[0.5, 0.5, 0.25, 0.5]]),
+        )
 
     def test_unlisted_model_class_can_be_explicitly_filtered(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -353,7 +398,6 @@ class CriterionTests(unittest.TestCase):
         torch.testing.assert_close(logits.grad[..., 0], torch.zeros(1, 2))
         self.assertTrue((logits.grad[..., 1] > 0).all())
 
-
 class ManifestTests(unittest.TestCase):
     def test_manifest_hash_is_stable(self) -> None:
         architecture = DFINEArchitectureConfig()
@@ -367,7 +411,19 @@ class ManifestTests(unittest.TestCase):
             DFINEArchitectureConfig(),
             ["Ball", "Robot", "Person"],
         )
-        self.assertEqual(manifest.schema_version, 2)
+        self.assertEqual(manifest.schema_version, 3)
+        self.assertEqual(
+            manifest.head_config["field_features"]["variant"],
+            "query_decoder",
+        )
+        self.assertEqual(
+            manifest.loss_config["field_features"]["point_weight"],
+            5.0,
+        )
+        self.assertEqual(
+            manifest.loss_config["field_features"]["area_normalized_weight"],
+            0.0,
+        )
         self.assertEqual(
             set(manifest.outputs),
             {

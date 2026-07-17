@@ -1,5 +1,7 @@
 # ruff: noqa: TRY003
 
+import hashlib
+import json
 import os
 from collections.abc import Iterable, Mapping
 from pathlib import Path
@@ -65,6 +67,14 @@ class HydraNv12Wrapper(nn.Module):
     def forward(self, x: ByteTensor) -> Tensor | tuple[Tensor, ...]:
         rgb = self.preprocessor(x).unsqueeze(0).permute(0, 3, 1, 2)
         return self.hydra_wrapper(rgb)
+
+
+def refresh_manifest_config_hash(manifest: dict[str, Any]) -> None:
+    """Update the manifest digest after export-specific metadata changes."""
+    values = dict(manifest)
+    values.pop("config_hash", None)
+    encoded = json.dumps(values, sort_keys=True).encode()
+    manifest["config_hash"] = hashlib.sha256(encoded).hexdigest()
 
 
 def set_export_mode(module: nn.Module) -> None:
@@ -136,17 +146,22 @@ def export_onnx(
     for name in output_names:
         dynamic_axes[name] = {0: "batch_size", 1: "num_predictions"}
 
-    torch.onnx.export(
-        wrapper,
-        (dummy_input,),
-        export_path,
-        input_names=[input_name],
-        output_names=output_names,
-        dynamic_axes=None if static_shapes else dynamic_axes,
-        opset_version=opset,
-        external_data=False,
-        dynamo=False,
-    )
+    mha_fastpath = torch.backends.mha.get_fastpath_enabled()
+    torch.backends.mha.set_fastpath_enabled(False)
+    try:
+        torch.onnx.export(
+            wrapper,
+            (dummy_input,),
+            export_path,
+            input_names=[input_name],
+            output_names=output_names,
+            dynamic_axes=None if static_shapes else dynamic_axes,
+            opset_version=opset,
+            external_data=False,
+            dynamo=False,
+        )
+    finally:
+        torch.backends.mha.set_fastpath_enabled(mha_fastpath)
     if verify:
         verify_onnx(wrapper, dummy_input, export_path, input_name)
 
@@ -417,7 +432,7 @@ def export_torchscript(
     default=False,
     help="Add NV12 preprocessing layer before Hydra model.",
 )
-def main(
+def main(  # noqa: C901
     hydra_model_names: list[HydraModelName],
     export_folder: Path,
     *,
@@ -504,6 +519,29 @@ def main(
                 manifest = hydra_model.dfine_multitask.checkpoint_payload()[
                     "manifest"
                 ]
+                preprocessing = manifest["preprocessing"]
+                preprocessing["input_size"] = [input_height, input_width]
+                if with_nv12_layer:
+                    preprocessing.update(
+                        {
+                            "input_dtype": "uint8",
+                            "input_shape": [
+                                input_height // 2,
+                                input_width // 2,
+                                6,
+                            ],
+                            "input_layout": "packed_nv12_h2_w2_6",
+                        }
+                    )
+                else:
+                    preprocessing.update(
+                        {
+                            "input_dtype": "float32",
+                            "input_shape": [1, 3, input_height, input_width],
+                            "input_layout": "nchw_rgb",
+                        }
+                    )
+                refresh_manifest_config_hash(manifest)
                 with export_path.with_suffix(".manifest.yaml").open(
                     "w",
                     encoding="utf-8",

@@ -16,6 +16,10 @@ from transformers import DFineConfig, DFineForObjectDetection
 
 from ultralytics_dfine.config import (
     DFINEArchitectureConfig,
+    FieldHeadConfig,
+    MultiTaskHeadConfig,
+    MultiTaskLossConfig,
+    PoseHeadConfig,
     build_multitask_manifest,
 )
 from ultralytics_dfine.loss.matcher import Target
@@ -48,6 +52,75 @@ def _head_tensor(output: Mapping[str, object], key: str) -> Tensor:
     return value
 
 
+def _border_coordinates(coordinates: Tensor, maximum: int) -> Tensor:
+    """Apply ``grid_sample`` border clipping and its boundary gradient."""
+    clipped = coordinates.clamp(0, maximum).detach()
+    interior = (coordinates > 0) & (coordinates < maximum)
+    return torch.where(interior, coordinates, clipped)
+
+
+def _bilinear_sample_border(feature: Tensor, grid: Tensor) -> Tensor:
+    """Sample a 2-D feature map like bilinear ``grid_sample``.
+
+    This is the checkpoint-neutral, ONNX-compatible equivalent of
+    ``grid_sample(..., padding_mode="border", align_corners=False)`` used by
+    the multi-task heads.  Keeping it in basic tensor operations avoids the
+    ONNX ``GridSample`` operator, which is unavailable on the deployment
+    target.
+    """
+    height = feature.shape[-2]
+    width = feature.shape[-1]
+    x = ((grid[..., 0] + 1) * width - 1) / 2
+    y = ((grid[..., 1] + 1) * height - 1) / 2
+    x = _border_coordinates(x, width - 1)
+    y = _border_coordinates(y, height - 1)
+
+    x0 = x.floor()
+    y0 = y.floor()
+    x1 = x0 + 1
+    y1 = y0 + 1
+    x0_index = x0.to(torch.int64)
+    y0_index = y0.to(torch.int64)
+    x1_index = x1.clamp(max=width - 1).to(torch.int64)
+    y1_index = y1.clamp(max=height - 1).to(torch.int64)
+
+    flattened = feature.flatten(2)
+
+    def gather(x_index: Tensor, y_index: Tensor) -> Tensor:
+        indices = (y_index * width + x_index).flatten(1)
+        indices = indices.unsqueeze(1).expand(-1, feature.shape[1], -1)
+        values = flattened.gather(2, indices)
+        return values.unflatten(2, grid.shape[1:-1])
+
+    northwest = gather(x0_index, y0_index)
+    northeast = gather(x1_index, y0_index)
+    southwest = gather(x0_index, y1_index)
+    southeast = gather(x1_index, y1_index)
+    northwest_weight = (x1 - x) * (y1 - y)
+    northeast_weight = (x - x0) * (y1 - y)
+    southwest_weight = (x1 - x) * (y - y0)
+    southeast_weight = (x - x0) * (y - y0)
+    return (
+        northwest * northwest_weight.unsqueeze(1)
+        + northeast * northeast_weight.unsqueeze(1)
+        + southwest * southwest_weight.unsqueeze(1)
+        + southeast * southeast_weight.unsqueeze(1)
+    )
+
+
+def _sample_encoder_feature(feature: Tensor, grid: Tensor) -> Tensor:
+    """Retain native training semantics and lower only ONNX exports."""
+    if torch.onnx.is_in_onnx_export():
+        return _bilinear_sample_border(feature, grid)
+    return functional.grid_sample(
+        feature,
+        grid,
+        mode="bilinear",
+        padding_mode="border",
+        align_corners=False,
+    )
+
+
 class QueryPoseHead(nn.Module):
     """Predict box-relative keypoints for each final D-FINE query."""
 
@@ -55,16 +128,22 @@ class QueryPoseHead(nn.Module):
         self,
         hidden_dim: int,
         schema: PoseSchemaConfig,
+        config: PoseHeadConfig | None = None,
     ) -> None:
         super().__init__()
         self.schema = schema
+        self.config = config or PoseHeadConfig()
         self.network = nn.Sequential(
             nn.Linear(hidden_dim + 4, hidden_dim),
             nn.GELU(),
             nn.Linear(hidden_dim, schema.keypoint_count * 3),
         )
 
-    def forward(self, query_features: Tensor, boxes: Tensor) -> HeadOutput:
+    def forward(
+        self,
+        query_features: Tensor,
+        boxes: Tensor,
+    ) -> HeadOutput:
         if query_features.shape[:2] != boxes.shape[:2]:
             raise ValueError("Pose queries and boxes must be aligned")
         values = self.network(torch.cat((query_features, boxes), dim=-1))
@@ -79,6 +158,61 @@ class QueryPoseHead(nn.Module):
         }
 
 
+class FieldSpatialRefiner(nn.Module):
+    """Refine field points from encoder samples at coarse predictions."""
+
+    def __init__(
+        self,
+        hidden_dim: int,
+        config: FieldHeadConfig,
+    ) -> None:
+        super().__init__()
+        self.config = config
+        self.level_projections = nn.ModuleList(
+            nn.Linear(hidden_dim, config.refinement_dim)
+            for _ in range(config.feature_levels)
+        )
+        input_dim = hidden_dim + config.refinement_dim * config.feature_levels
+        self.network = nn.Sequential(
+            nn.LayerNorm(input_dim),
+            nn.Linear(input_dim, config.refinement_dim),
+            nn.GELU(),
+            nn.Linear(config.refinement_dim, 2),
+        )
+        final = cast("nn.Linear", self.network[-1])
+        nn.init.zeros_(final.weight)
+        nn.init.zeros_(final.bias)
+
+    def forward(
+        self,
+        decoded: Tensor,
+        points: Tensor,
+        point_scale: Tensor,
+        encoder_features: tuple[Tensor, ...],
+    ) -> Tensor:
+        if len(encoder_features) != len(self.level_projections):
+            raise ValueError("Unexpected number of field encoder levels")
+        sample_points = (
+            points.detach() if self.config.detach_sampling_grid else points
+        )
+        grid = (sample_points * 2 - 1).unsqueeze(2)
+        sampled_levels = []
+        for feature, projection in zip(
+            encoder_features,
+            self.level_projections,
+            strict=True,
+        ):
+            sampled = _sample_encoder_feature(feature, grid)
+            sampled = sampled.squeeze(-1).transpose(1, 2)
+            sampled_levels.append(projection(sampled))
+        residual = self.network(
+            torch.cat((decoded, *sampled_levels), dim=-1)
+        ).tanh()
+        return (
+            points + residual * point_scale * self.config.refinement_scale
+        ).clamp(0, 1)
+
+
 class FieldFeatureHead(nn.Module):
     """Decode a fixed point set from shared HybridEncoder feature maps."""
 
@@ -89,11 +223,21 @@ class FieldFeatureHead(nn.Module):
         *,
         decoder_layers: int = 2,
         attention_heads: int = 8,
-        feature_levels: int = 3,
+        feature_levels: int | None = None,
+        config: FieldHeadConfig | None = None,
     ) -> None:
         super().__init__()
         self.schema = schema
         self.hidden_dim = hidden_dim
+        configured_levels = feature_levels or 3
+        self.config = config or FieldHeadConfig(
+            feature_levels=configured_levels
+        )
+        if (
+            feature_levels is not None
+            and feature_levels != self.config.feature_levels
+        ):
+            raise ValueError("Field feature-level settings disagree")
         layer = nn.TransformerDecoderLayer(
             d_model=hidden_dim,
             nhead=attention_heads,
@@ -106,10 +250,15 @@ class FieldFeatureHead(nn.Module):
         self.decoder = nn.TransformerDecoder(layer, decoder_layers)
         self.queries = nn.Embedding(schema.num_queries, hidden_dim)
         self.level_embeddings = nn.Parameter(
-            torch.empty(feature_levels, hidden_dim)
+            torch.empty(self.config.feature_levels, hidden_dim)
         )
         self.classifier = nn.Linear(hidden_dim, len(schema.class_names))
         self.point_predictor = nn.Linear(hidden_dim, 2)
+        self.spatial_refiner = (
+            FieldSpatialRefiner(hidden_dim, self.config)
+            if self.config.variant == "spatial_refine"
+            else None
+        )
         nn.init.normal_(self.level_embeddings, std=0.02)
         nn.init.zeros_(self.point_predictor.weight)
         nn.init.zeros_(self.point_predictor.bias)
@@ -188,13 +337,7 @@ class FieldFeatureHead(nn.Module):
         grid = grid.expand(features[0].shape[0], -1, -1, -1)
         sampled_levels = []
         for index, feature in enumerate(features):
-            sampled = functional.grid_sample(
-                feature,
-                grid,
-                mode="bilinear",
-                padding_mode="border",
-                align_corners=False,
-            )
+            sampled = _sample_encoder_feature(feature, grid)
             sampled = sampled.squeeze(-1).transpose(1, 2)
             sampled_levels.append(sampled + self.level_embeddings[index])
         local = torch.stack(sampled_levels).mean(0)
@@ -205,18 +348,26 @@ class FieldFeatureHead(nn.Module):
         queries = self._local_queries(features)
         decoded = self.decoder(queries, memory)
         offsets = self.point_predictor(decoded).tanh()
+        points = (
+            self.reference_points.unsqueeze(0) + offsets * self.point_scale
+        ).clamp(0, 1)
+        if self.spatial_refiner is not None:
+            points = self.spatial_refiner(
+                decoded,
+                points,
+                self.point_scale,
+                features,
+            )
         return {
             "pred_logits": self.classifier(decoded),
-            "pred_points": (
-                self.reference_points.unsqueeze(0) + offsets * self.point_scale
-            ).clamp(0, 1),
+            "pred_points": points,
         }
 
 
 class DFINEMultiTaskModel(nn.Module):
     """One D-FINE detector with person, robot, and field-feature heads."""
 
-    checkpoint_format_version = 2
+    checkpoint_format_version = 3
 
     def __init__(
         self,
@@ -225,6 +376,8 @@ class DFINEMultiTaskModel(nn.Module):
         person_schema: PoseSchemaConfig = PERSON_POSE_SCHEMA,
         robot_schema: PoseSchemaConfig = ROBOT_POSE_SCHEMA,
         field_schema: PointSetSchemaConfig = FIELD_FEATURE_SCHEMA,
+        head_config: MultiTaskHeadConfig | None = None,
+        loss_config: MultiTaskLossConfig | None = None,
     ) -> None:
         super().__init__()
         if not detector.names or detector.names[-1] != "Person":
@@ -232,10 +385,24 @@ class DFINEMultiTaskModel(nn.Module):
         if "Robot" not in detector.names:
             raise ValueError("D-FINE detector must contain the Robot class")
         self.detector = detector
+        self.head_config = head_config or MultiTaskHeadConfig()
+        self.loss_config = loss_config or MultiTaskLossConfig()
         hidden_dim = detector.architecture.hidden_dim
-        self.person_pose_head = QueryPoseHead(hidden_dim, person_schema)
-        self.robot_pose_head = QueryPoseHead(hidden_dim, robot_schema)
-        self.field_feature_head = FieldFeatureHead(hidden_dim, field_schema)
+        self.person_pose_head = QueryPoseHead(
+            hidden_dim,
+            person_schema,
+            self.head_config.person_pose,
+        )
+        self.robot_pose_head = QueryPoseHead(
+            hidden_dim,
+            robot_schema,
+            self.head_config.robot_pose,
+        )
+        self.field_feature_head = FieldFeatureHead(
+            hidden_dim,
+            field_schema,
+            config=self.head_config.field_features,
+        )
         self.schemas = {
             HeadId.PERSON_POSE: person_schema,
             HeadId.ROBOT_POSE: robot_schema,
@@ -275,7 +442,8 @@ class DFINEMultiTaskModel(nn.Module):
         )
         if not isinstance(checkpoint, dict):
             raise TypeError("Multi-task checkpoint must contain a dictionary")
-        if checkpoint.get("format_version") != cls.checkpoint_format_version:
+        format_version = checkpoint.get("format_version")
+        if format_version not in {2, cls.checkpoint_format_version}:
             raise ValueError("Unsupported multi-task checkpoint format")
         names = checkpoint.get("names")
         config_values = checkpoint.get("hf_config")
@@ -300,7 +468,22 @@ class DFINEMultiTaskModel(nn.Module):
             names,
             DFINEArchitectureConfig(**architecture_values),
         )
-        model = cls(detector)
+        head_config = MultiTaskHeadConfig()
+        loss_config = MultiTaskLossConfig()
+        if format_version == cls.checkpoint_format_version:
+            raw_head_config = checkpoint.get("head_config")
+            raw_loss_config = checkpoint.get("loss_config")
+            if not isinstance(raw_head_config, dict):
+                raise TypeError("Multi-task checkpoint has no head config")
+            if not isinstance(raw_loss_config, dict):
+                raise TypeError("Multi-task checkpoint has no loss config")
+            head_config = MultiTaskHeadConfig.from_dict(raw_head_config)
+            loss_config = MultiTaskLossConfig.from_dict(raw_loss_config)
+        model = cls(
+            detector,
+            head_config=head_config,
+            loss_config=loss_config,
+        )
         model.load_state_dict(state_dict, strict=True)
         return model
 
@@ -311,6 +494,8 @@ class DFINEMultiTaskModel(nn.Module):
             "names": self.detector.names,
             "architecture_config": asdict(self.detector.architecture),
             "hf_config": self.detector.core.config.to_dict(),
+            "head_config": asdict(self.head_config),
+            "loss_config": asdict(self.loss_config),
             "schemas": {
                 str(head_id): schema_to_dict(schema)
                 for head_id, schema in self.schemas.items()
@@ -319,6 +504,8 @@ class DFINEMultiTaskModel(nn.Module):
             "manifest": build_multitask_manifest(
                 self.detector.architecture,
                 self.detector.names,
+                self.head_config,
+                self.loss_config,
             ).to_dict(),
         }
 

@@ -4,9 +4,11 @@ from typing import Any, cast
 
 import torch
 
+from ultralytics_dfine.engine import metrics as independent_metrics
 from ultralytics_dfine.engine.metrics import (
     COCO_OKS_K,
     DHRP_OKS_K,
+    OKS_THRESHOLDS,
     FieldPointAPAccumulator,
     FieldPointLocalizationAccumulator,
     KeypointOKSAccumulator,
@@ -19,6 +21,149 @@ from ultralytics_dfine.schemas import (
 from ultralytics_dfine.schemas import (
     DHRP_OKS_K as SCHEMA_DHRP_K,
 )
+
+
+def _legacy_average_precision(
+    records: list[dict[str, Any]], target_count: int
+) -> tuple[float, ...]:
+    if target_count == 0:
+        return tuple(0.0 for _ in OKS_THRESHOLDS)
+    ordered = sorted(records, key=lambda record: record["score"], reverse=True)
+    values = []
+    for threshold_index in range(len(OKS_THRESHOLDS)):
+        true_positives = 0
+        false_positives = 0
+        recalls = []
+        precisions = []
+        for record in ordered:
+            if record["matches"][threshold_index]:
+                true_positives += 1
+            else:
+                false_positives += 1
+            recalls.append(true_positives / target_count)
+            precisions.append(
+                true_positives / (true_positives + false_positives)
+            )
+
+        for index in range(len(precisions) - 2, -1, -1):
+            precisions[index] = max(precisions[index], precisions[index + 1])
+        interpolated = 0.0
+        for recall_level in range(101):
+            recall = recall_level / 100
+            candidates = [
+                precision
+                for precision, observed_recall in zip(
+                    precisions,
+                    recalls,
+                    strict=True,
+                )
+                if observed_recall >= recall
+            ]
+            interpolated += max(candidates, default=0.0)
+        values.append(interpolated / 101)
+    return tuple(values)
+
+
+def _legacy_greedy_matches(
+    similarities: torch.Tensor,
+    scores: torch.Tensor,
+) -> list[dict[str, Any]]:
+    order = torch.argsort(scores, descending=True, stable=True).tolist()
+    matched_targets = [set[int]() for _ in OKS_THRESHOLDS]
+    records = []
+    for prediction_index in order:
+        matches = []
+        for threshold_index, threshold in enumerate(OKS_THRESHOLDS):
+            available = [
+                target_index
+                for target_index in range(similarities.shape[1])
+                if target_index not in matched_targets[threshold_index]
+            ]
+            if not available:
+                matches.append(False)
+                continue
+            available_similarities = similarities[prediction_index, available]
+            best_offset = int(torch.argmax(available_similarities).item())
+            best_target = available[best_offset]
+            is_match = (
+                float(similarities[prediction_index, best_target]) >= threshold
+            )
+            matches.append(is_match)
+            if is_match:
+                matched_targets[threshold_index].add(best_target)
+        records.append(
+            {
+                "score": float(scores[prediction_index]),
+                "matches": tuple(matches),
+            }
+        )
+    return records
+
+
+class MetricFastPathEquivalenceTests(unittest.TestCase):
+    def test_average_precision_matches_legacy_reference_exactly(self) -> None:
+        generator = torch.Generator().manual_seed(20260716)
+        for record_count in (0, 1, 2, 17, 301):
+            for target_count in (0, 1, 7, 53):
+                scores = torch.randint(
+                    0,
+                    8,
+                    (record_count,),
+                    generator=generator,
+                ).to(torch.float64)
+                matches = torch.randint(
+                    0,
+                    2,
+                    (record_count, len(OKS_THRESHOLDS)),
+                    generator=generator,
+                    dtype=torch.bool,
+                )
+                records = [
+                    {
+                        "score": float(scores[index]),
+                        "matches": tuple(matches[index].tolist()),
+                    }
+                    for index in range(record_count)
+                ]
+
+                self.assertEqual(
+                    independent_metrics._average_precision(
+                        records,
+                        target_count,
+                    ),
+                    _legacy_average_precision(records, target_count),
+                )
+
+    def test_greedy_matching_matches_legacy_reference_exactly(self) -> None:
+        generator = torch.Generator().manual_seed(20260716)
+        for prediction_count, target_count in (
+            (0, 0),
+            (5, 0),
+            (0, 4),
+            (1, 1),
+            (8, 3),
+            (300, 21),
+        ):
+            similarities = (
+                torch.randint(
+                    0,
+                    21,
+                    (prediction_count, target_count),
+                    generator=generator,
+                ).to(torch.float64)
+                / 20
+            )
+            scores = torch.randint(
+                0,
+                8,
+                (prediction_count,),
+                generator=generator,
+            ).to(torch.float64)
+
+            self.assertEqual(
+                independent_metrics._greedy_matches(similarities, scores),
+                _legacy_greedy_matches(similarities, scores),
+            )
 
 
 class KeypointOKSAccumulatorTests(unittest.TestCase):

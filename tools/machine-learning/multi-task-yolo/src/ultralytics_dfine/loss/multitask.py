@@ -11,6 +11,11 @@ import torch.nn.functional as functional
 from scipy.optimize import linear_sum_assignment
 from torch import Tensor
 
+from ultralytics_dfine.config import (
+    FieldLossConfig,
+    MultiTaskLossConfig,
+    PoseLossConfig,
+)
 from ultralytics_dfine.loss.criterion import CriterionResult, DFINECriterion
 from ultralytics_dfine.loss.matcher import Match, Target
 from ultralytics_dfine.schemas import (
@@ -80,16 +85,30 @@ class QueryPoseCriterion(nn.Module):
         schema: PoseSchemaConfig,
         class_id: int,
         *,
-        coordinate_weight: float = 1.0,
-        oks_weight: float = 1.0,
-        visibility_weight: float = 1.0,
+        config: PoseLossConfig | None = None,
+        coordinate_weight: float | None = None,
+        oks_weight: float | None = None,
+        visibility_weight: float | None = None,
     ) -> None:
         super().__init__()
+        settings = config or PoseLossConfig()
         self.schema = schema
         self.class_id = class_id
-        self.coordinate_weight = coordinate_weight
-        self.oks_weight = oks_weight
-        self.visibility_weight = visibility_weight
+        self.coordinate_space = settings.coordinate_space
+        self.smooth_l1_beta = settings.smooth_l1_beta
+        self.coordinate_weight = (
+            settings.coordinate_weight
+            if coordinate_weight is None
+            else coordinate_weight
+        )
+        self.oks_weight = (
+            settings.oks_weight if oks_weight is None else oks_weight
+        )
+        self.visibility_weight = (
+            settings.visibility_weight
+            if visibility_weight is None
+            else visibility_weight
+        )
         self.oks_constants: Tensor
         self.register_buffer(
             "oks_constants",
@@ -165,10 +184,16 @@ class QueryPoseCriterion(nn.Module):
             predicted.device,
         )
 
+        coordinate_error = predicted - target_xy
+        if self.coordinate_space == "box":
+            coordinate_error = coordinate_error / target_boxes[
+                :, None, 2:
+            ].clamp(min=1e-3)
         coordinate = functional.smooth_l1_loss(
-            predicted,
-            target_xy,
+            coordinate_error,
+            torch.zeros_like(coordinate_error),
             reduction="none",
+            beta=self.smooth_l1_beta,
         ).sum(-1)
         coordinate = (
             coordinate.masked_select(visible).sum() / visible_count
@@ -271,14 +296,21 @@ class FieldFeatureCriterion(nn.Module):
         gamma: float = 2.0,
         class_weight: float = 1.0,
         point_weight: float = 5.0,
+        config: FieldLossConfig | None = None,
     ) -> None:
         super().__init__()
+        settings = config or FieldLossConfig(
+            class_weight=class_weight,
+            point_weight=point_weight,
+            focal_alpha=alpha,
+            focal_gamma=gamma,
+        )
         self.num_classes = num_classes
         self.matcher = matcher or PointHungarianMatcher()
-        self.alpha = alpha
-        self.gamma = gamma
-        self.class_weight = class_weight
-        self.point_weight = point_weight
+        self.alpha = settings.focal_alpha
+        self.gamma = settings.focal_gamma
+        self.class_weight = settings.class_weight
+        self.point_weight = settings.point_weight
 
     def forward(
         self,
@@ -300,8 +332,26 @@ class FieldFeatureCriterion(nn.Module):
                 )
             ]
         ).to(logits.device)
+        target_points = torch.cat(
+            [
+                target["points"][target_indices]
+                for target, (_, target_indices) in zip(
+                    targets,
+                    matches,
+                    strict=True,
+                )
+            ]
+        ).to(points.device)
         if source_indices.numel() > 0:
-            target_classes[batch_indices, source_indices, matched_labels] = 1
+            class_targets = torch.ones_like(
+                matched_labels,
+                dtype=logits.dtype,
+            )
+            target_classes[
+                batch_indices,
+                source_indices,
+                matched_labels,
+            ] = class_targets
         probability = logits.sigmoid()
         cross_entropy = functional.binary_cross_entropy_with_logits(
             logits,
@@ -312,25 +362,16 @@ class FieldFeatureCriterion(nn.Module):
         alpha = self.alpha * target_classes + (1 - self.alpha) * (
             1 - target_classes
         )
+        weighted_class_loss = cross_entropy * modulation * alpha
         normalizer = _normalized_count(
             torch.tensor(matched_labels.numel(), device=logits.device),
             logits.device,
         )
-        class_loss = (cross_entropy * modulation * alpha).sum() / normalizer
+        class_loss = weighted_class_loss.sum() / normalizer
 
         if source_indices.numel() == 0:
             point_loss = points.sum() * 0
         else:
-            target_points = torch.cat(
-                [
-                    target["points"][target_indices]
-                    for target, (_, target_indices) in zip(
-                        targets,
-                        matches,
-                        strict=True,
-                    )
-                ]
-            ).to(points.device)
             point_loss = (
                 functional.l1_loss(
                     points[batch_indices, source_indices],
@@ -339,13 +380,10 @@ class FieldFeatureCriterion(nn.Module):
                 )
                 / normalizer
             )
-        return (
-            {
-                "field_class": class_loss * self.class_weight,
-                "field_point": point_loss * self.point_weight,
-            },
-            matches,
-        )
+        return {
+            "field_class": class_loss * self.class_weight,
+            "field_point": point_loss * self.point_weight,
+        }, matches
 
 
 class MultiTaskCriterion(nn.Module):
@@ -357,19 +395,26 @@ class MultiTaskCriterion(nn.Module):
         *,
         person_class_id: int = 7,
         robot_class_id: int = 4,
+        loss_config: MultiTaskLossConfig | None = None,
     ) -> None:
         super().__init__()
+        self.loss_config = loss_config or MultiTaskLossConfig()
         self.detection = DFINECriterion(num_detection_classes)
+        self.person_class_id = person_class_id
+        self.robot_class_id = robot_class_id
         self.person = QueryPoseCriterion(
             PERSON_POSE_SCHEMA,
             person_class_id,
+            config=self.loss_config.person_pose,
         )
         self.robot = QueryPoseCriterion(
             ROBOT_POSE_SCHEMA,
             robot_class_id,
+            config=self.loss_config.robot_pose,
         )
         self.field = FieldFeatureCriterion(
-            len(FIELD_FEATURE_SCHEMA.class_names)
+            len(FIELD_FEATURE_SCHEMA.class_names),
+            config=self.loss_config.field_features,
         )
 
     @staticmethod
@@ -430,6 +475,7 @@ class MultiTaskCriterion(nn.Module):
                 {
                     "labels": target["point_labels"],
                     "points": target["points"],
+                    "boxes": target["boxes"],
                 }
                 for target in targets
             ]

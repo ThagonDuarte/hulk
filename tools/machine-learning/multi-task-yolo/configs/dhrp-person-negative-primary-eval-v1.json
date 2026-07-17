@@ -1,0 +1,20 @@
+{
+  "version": 1,
+  "policy": "verified-person-free-dhrp-v1",
+  "image_set_digest_algorithm": "sha256(dhrp-person-negative-images-v1\\0 + effective_relative_path + \\0 + image_sha256 + \\n)",
+  "audit_mask_sha256": "bfcc4fa4e93e2c52f99fd7e8fecfbc5fd2cdb0aff94dac93c3605c62a05670b1",
+  "annotations": {
+    "eval_set_TargetHumanoidRobots_EVE.json": {
+      "annotation_sha256": "c2dd622e915c00534fb03207798f64007db0f406c0354a38f6072abeafbd0955",
+      "image_set_sha256": "04360d661c0c3afc3503b9b7959d5d9da2c9396eebff5c52bd6bbaeac1252508",
+      "records": 100,
+      "role": "primary_evaluation"
+    },
+    "eval_set_TargetHumanoidRobots_Phoenix.json": {
+      "annotation_sha256": "90c0ba131fd67f2a6638369fad62c89cf5240eac5d5f84cb3183d27023329c25",
+      "image_set_sha256": "b08208a46d096c108b6d9d5bf7494604e9e8271bb8636ab84153f39bdc2718f1",
+      "records": 168,
+      "role": "primary_evaluation"
+    }
+  }
+}

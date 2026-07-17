@@ -3,6 +3,7 @@
 # ruff: noqa: TRY003
 
 import math
+from bisect import bisect_left
 from collections import defaultdict
 from collections.abc import Sequence
 from typing import Literal, TypedDict
@@ -82,16 +83,10 @@ def _average_precision(
         interpolated = 0.0
         for recall_level in range(101):
             recall = recall_level / 100
-            candidates = [
-                precision
-                for precision, observed_recall in zip(
-                    precisions,
-                    recalls,
-                    strict=True,
-                )
-                if observed_recall >= recall
-            ]
-            interpolated += max(candidates, default=0.0)
+            index = bisect_left(recalls, recall)
+            interpolated += (
+                precisions[index] if index < len(precisions) else 0.0
+            )
         values.append(interpolated / 101)
     return tuple(values)
 
@@ -117,11 +112,33 @@ def _greedy_matches(
     scores: Tensor,
 ) -> list[_DetectionRecord]:
     order = torch.argsort(scores, descending=True, stable=True).tolist()
+    no_matches = tuple(False for _ in OKS_THRESHOLDS)
+    if similarities.shape[1] == 0:
+        return [
+            {
+                "score": float(scores[prediction_index]),
+                "matches": no_matches,
+            }
+            for prediction_index in order
+        ]
     matched_targets = [set[int]() for _ in OKS_THRESHOLDS]
+    saturated_thresholds = 0
     records: list[_DetectionRecord] = []
-    for prediction_index in order:
+    for order_index, prediction_index in enumerate(order):
+        if saturated_thresholds == len(OKS_THRESHOLDS):
+            records.extend(
+                {
+                    "score": float(scores[remaining_index]),
+                    "matches": no_matches,
+                }
+                for remaining_index in order[order_index:]
+            )
+            break
         matches = []
         for threshold_index, threshold in enumerate(OKS_THRESHOLDS):
+            if len(matched_targets[threshold_index]) == similarities.shape[1]:
+                matches.append(False)
+                continue
             available = [
                 target_index
                 for target_index in range(similarities.shape[1])
@@ -139,6 +156,11 @@ def _greedy_matches(
             matches.append(is_match)
             if is_match:
                 matched_targets[threshold_index].add(best_target)
+                if (
+                    len(matched_targets[threshold_index])
+                    == similarities.shape[1]
+                ):
+                    saturated_thresholds += 1
         records.append(
             {
                 "score": float(scores[prediction_index]),

@@ -186,7 +186,7 @@ class Hydra(nn.Module):
         )
         if (
             isinstance(checkpoint, dict)
-            and checkpoint.get("format_version") == 2
+            and checkpoint.get("format_version") in {2, 3}
             and checkpoint.get("architecture") == "dfine-multitask"
         ):
             model = DFINEMultiTaskModel.from_checkpoint(head_path)

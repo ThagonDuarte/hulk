@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 import json
+import pickle
 from dataclasses import asdict, dataclass
 from itertools import pairwise
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import click
 import torch
@@ -13,6 +14,7 @@ from ultralytics.models.yolo.model import YOLO
 from ultralytics.utils.torch_utils import get_flops
 
 from model.hydra import Hydra
+from ultralytics_dfine.nn import DFINEDetectionModel, DFINEMultiTaskModel
 from utils.export_hydra import (
     HydraWrapper,
     build_task_dict,
@@ -24,11 +26,14 @@ from utils.model_naming import HYDRA_MODEL_NAME_TYPE, HydraModelName
 GIGA = 1_000_000_000
 MEGA = 1_000_000
 
+ImageSize = tuple[int, int]
+CheckpointKind = Literal["dfine", "dfine-multitask", "yolo"]
+
 
 @dataclass(frozen=True)
 class ComplexityResult:
     path: str
-    input_size: int
+    input_size: int | ImageSize
     file_size_bytes: int
     file_size_mb: float
     layers: int | None
@@ -99,6 +104,70 @@ def model_file_size(path: Path) -> tuple[int, float]:
     return file_size_bytes, file_size_bytes / MEGA
 
 
+def normalize_image_size(imgsz: int | ImageSize) -> ImageSize:
+    """Return an explicit ``(height, width)`` pair."""
+    if isinstance(imgsz, int):
+        return imgsz, imgsz
+    return imgsz
+
+
+def report_image_size(image_size: ImageSize) -> int | ImageSize:
+    """Preserve the historical scalar schema for square reports."""
+    height, width = image_size
+    return height if height == width else image_size
+
+
+def resolve_cli_image_size(
+    imgsz: int,
+    width: int | None,
+    height: int | None,
+) -> ImageSize:
+    """Resolve rectangular overrides and validate every explicit dimension."""
+    if imgsz <= 0:
+        raise click.BadParameter("--imgsz must be > 0")  # noqa: TRY003
+    input_width = imgsz if width is None else width
+    input_height = imgsz if height is None else height
+    if input_width <= 0:
+        raise click.BadParameter("--width must be > 0")  # noqa: TRY003
+    if input_height <= 0:
+        raise click.BadParameter("--height must be > 0")  # noqa: TRY003
+    return input_height, input_width
+
+
+def checkpoint_kind(path: Path) -> CheckpointKind:
+    """Select the loader from safe, explicit checkpoint metadata."""
+    try:
+        checkpoint = torch.load(
+            path,
+            map_location="cpu",
+            weights_only=True,
+        )
+    except pickle.UnpicklingError:
+        # Ultralytics YOLO checkpoints contain allowlisted module objects and
+        # are intentionally loaded through YOLO's own trusted loader below.
+        return "yolo"
+    if not isinstance(checkpoint, dict):
+        return "yolo"
+    architecture = checkpoint.get("architecture")
+    if architecture == "dfine-multitask":
+        return "dfine-multitask"
+    if architecture == "dfine":
+        return "dfine"
+    return "yolo"
+
+
+def load_checkpoint_model(path: Path, device: str) -> nn.Module:
+    """Load a supported checkpoint without relying on trial-and-error."""
+    kind = checkpoint_kind(path)
+    if kind == "dfine-multitask":
+        model = DFINEMultiTaskModel.from_checkpoint(path)
+    elif kind == "dfine":
+        model = DFINEDetectionModel.from_checkpoint(path)
+    else:
+        model = YOLO(path).model
+    return model.to(device).eval()
+
+
 def hydra_output_dir(runs_dir: Path, hydra_model_name: HydraModelName) -> Path:
     return runs_dir / "complexity" / str(hydra_model_name)
 
@@ -153,25 +222,24 @@ def resolve_hydra_backbone_path(
 def profile_checkpoint(
     path: Path,
     *,
-    imgsz: int,
+    imgsz: int | ImageSize,
     device: str,
     report_path: Path | None = None,
 ) -> ComplexityResult:
     file_size_bytes, file_size_mb = model_file_size(path)
+    image_size = normalize_image_size(imgsz)
 
     with torch.inference_mode():
-        yolo_model = YOLO(path)
-        model = yolo_model.model.to(device)
-        model.eval()
+        model = load_checkpoint_model(path, device)
 
         # Ultralytics reports FLOPs as two floating point ops per MAC.
-        gflops = float(get_flops(model, imgsz=imgsz))
+        gflops = float(get_flops(model, imgsz=list(image_size)))
         flops = round(gflops * GIGA)
         macs = flops // 2
 
     result = ComplexityResult(
         path=display_path(path),
-        input_size=imgsz,
+        input_size=report_image_size(image_size),
         file_size_bytes=file_size_bytes,
         file_size_mb=file_size_mb,
         layers=count_leaf_modules(model),
@@ -193,13 +261,14 @@ def profile_checkpoint(
 def profile_hydra_model(
     hydra_model_name: HydraModelName,
     *,
-    imgsz: int,
+    imgsz: int | ImageSize,
     device: str,
     runs_dir: Path,
     assets_dir: Path,
     train_folder_path: Path,
     val_folder_path: Path,
 ) -> ComplexityResult:
+    image_size = normalize_image_size(imgsz)
     task_dict = build_task_dict(
         hydra_model_name=hydra_model_name,
         train_folder_path=train_folder_path,
@@ -232,12 +301,12 @@ def profile_hydra_model(
         model.eval()
 
         # Ultralytics reports FLOPs as two floating point ops per MAC.
-        gflops = float(get_flops(model, imgsz=imgsz))
+        gflops = float(get_flops(model, imgsz=list(image_size)))
         flops = round(gflops * GIGA)
         macs = flops // 2
 
         dummy_input = torch.zeros(
-            (1, 3, imgsz, imgsz),
+            (1, 3, *image_size),
             dtype=torch.float32,
             device=device,
         )
@@ -246,7 +315,7 @@ def profile_hydra_model(
     file_size_bytes, file_size_mb = model_file_size(export_path)
     result = ComplexityResult(
         path=str(hydra_model_name),
-        input_size=imgsz,
+        input_size=report_image_size(image_size),
         file_size_bytes=file_size_bytes,
         file_size_mb=file_size_mb,
         layers=count_leaf_modules(model),
@@ -264,14 +333,14 @@ def profile_hydra_model(
 
 def error_result(
     path: Path,
-    imgsz: int,
+    imgsz: int | ImageSize,
     exc: Exception,
     report_path: Path | None = None,
 ) -> ComplexityResult:
     file_size_bytes, file_size_mb = model_file_size(path)
     return ComplexityResult(
         path=display_path(path),
-        input_size=imgsz,
+        input_size=report_image_size(normalize_image_size(imgsz)),
         file_size_bytes=file_size_bytes,
         file_size_mb=file_size_mb,
         layers=None,
@@ -289,7 +358,7 @@ def error_result(
 
 def hydra_error_result(
     hydra_model_name: HydraModelName,
-    imgsz: int,
+    imgsz: int | ImageSize,
     runs_dir: Path,
     exc: Exception,
 ) -> ComplexityResult:
@@ -297,7 +366,7 @@ def hydra_error_result(
     export_path = hydra_export_path(runs_dir, hydra_model_name)
     return ComplexityResult(
         path=str(hydra_model_name),
-        input_size=imgsz,
+        input_size=report_image_size(normalize_image_size(imgsz)),
         file_size_bytes=0,
         file_size_mb=0,
         layers=None,
@@ -413,6 +482,16 @@ def write_report(path: Path, result: ComplexityResult) -> None:
     help="Square input image size used for FLOPs estimation.",
 )
 @click.option(
+    "--width",
+    type=int,
+    help="Input width. Defaults to --imgsz.",
+)
+@click.option(
+    "--height",
+    type=int,
+    help="Input height. Defaults to --imgsz.",
+)
+@click.option(
     "--device",
     default="cpu",
     show_default=True,
@@ -481,6 +560,8 @@ def main(
     paths: tuple[Path, ...],
     *,
     imgsz: int,
+    width: int | None,
+    height: int | None,
     device: str,
     checkpoint_name: tuple[str, ...],
     hydra_model_names: tuple[HydraModelName, ...],
@@ -491,8 +572,7 @@ def main(
     json_output: Path | None,
     strict: bool,
 ) -> None:
-    if imgsz <= 0:
-        raise click.BadParameter("--imgsz must be > 0")  # noqa: TRY003
+    image_size = resolve_cli_image_size(imgsz, width, height)
 
     search_paths = paths
     if not search_paths and not hydra_model_names:
@@ -505,7 +585,7 @@ def main(
             results.append(
                 profile_checkpoint(
                     weight_path,
-                    imgsz=imgsz,
+                    imgsz=image_size,
                     device=device,
                     report_path=report_path,
                 )
@@ -513,7 +593,7 @@ def main(
         except Exception as exc:
             if strict:
                 raise click.ClickException(str(exc)) from exc
-            result = error_result(weight_path, imgsz, exc, report_path)
+            result = error_result(weight_path, image_size, exc, report_path)
             write_report(report_path, result)
             results.append(result)
 
@@ -524,7 +604,7 @@ def main(
             results.append(
                 profile_hydra_model(
                     hydra_model_name,
-                    imgsz=imgsz,
+                    imgsz=image_size,
                     device=device,
                     runs_dir=runs_dir,
                     assets_dir=assets_dir,
@@ -537,7 +617,7 @@ def main(
                 raise click.ClickException(str(exc)) from exc
             result = hydra_error_result(
                 hydra_model_name,
-                imgsz,
+                image_size,
                 runs_dir,
                 exc,
             )

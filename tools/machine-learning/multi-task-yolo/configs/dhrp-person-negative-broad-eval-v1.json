@@ -1,0 +1,44 @@
+{
+  "version": 1,
+  "policy": "verified-person-free-dhrp-v1",
+  "image_set_digest_algorithm": "sha256(dhrp-person-negative-images-v1\\0 + effective_relative_path + \\0 + image_sha256 + \\n)",
+  "audit_mask_sha256": "e9c9f710bfcd848bd850475ece0cd03fbc6b2c4ed3b3a297038c6ee931bbd255",
+  "annotations": {
+    "eval_set_TargetHumanoidRobots_Atlas.json": {
+      "annotation_sha256": "0a4a4b7ff667132a3ad778ffac850bf490950d9abdce6a62d46f8c2084613449",
+      "image_set_sha256": "7556c723a62ed16029c4db5f3745098b9cf23b531205e03a41323a9c0cc12952",
+      "records": 141,
+      "role": "stress_evaluation"
+    },
+    "eval_set_TargetHumanoidRobots_DARwIn-OP.json": {
+      "annotation_sha256": "73a3a860e3383fe483d412cf96ec06a0233a524f7e78805c157089e72e2d6cbb",
+      "image_set_sha256": "e0eaa71b13b81729a40b7ede446f3bae75c07bf008e7f55e4de27e8e9d54d31e",
+      "records": 134,
+      "role": "stress_evaluation"
+    },
+    "eval_set_TargetHumanoidRobots_EVE.json": {
+      "annotation_sha256": "c2dd622e915c00534fb03207798f64007db0f406c0354a38f6072abeafbd0955",
+      "image_set_sha256": "04360d661c0c3afc3503b9b7959d5d9da2c9396eebff5c52bd6bbaeac1252508",
+      "records": 100,
+      "role": "stress_evaluation"
+    },
+    "eval_set_TargetHumanoidRobots_FIGURE01.json": {
+      "annotation_sha256": "0a59f778d9d1f2709ab452ae6ae4d90bce3d76304e987b0b93514ca888fd6130",
+      "image_set_sha256": "5640033d27f56b8a2e8d291c3c17ebf06ab219d872ca018894cf05c50c7f827b",
+      "records": 146,
+      "role": "stress_evaluation"
+    },
+    "eval_set_TargetHumanoidRobots_Kepler.json": {
+      "annotation_sha256": "1bdf453df27d23dbfaa7dd0ddabcd838e87d1c018258a10461a7a62c3be55d4b",
+      "image_set_sha256": "e5c75f2a3ada898e9582d50158a25d884bf809c608f1b00e552e70f080ea7e2c",
+      "records": 136,
+      "role": "stress_evaluation"
+    },
+    "eval_set_TargetHumanoidRobots_Phoenix.json": {
+      "annotation_sha256": "90c0ba131fd67f2a6638369fad62c89cf5240eac5d5f84cb3183d27023329c25",
+      "image_set_sha256": "b08208a46d096c108b6d9d5bf7494604e9e8271bb8636ab84153f39bdc2718f1",
+      "records": 168,
+      "role": "stress_evaluation"
+    }
+  }
+}
