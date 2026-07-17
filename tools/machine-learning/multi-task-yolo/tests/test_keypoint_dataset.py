@@ -3,6 +3,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import torch
 import yaml
@@ -48,7 +49,7 @@ class YOLOKeypointDatasetTests(unittest.TestCase):
         root: Path,
         data: Path,
         *,
-        role: str = "primary_evaluation",
+        role: str = "train_negative",
         eligible: tuple[str, ...] = ("images/train/image.jpg",),
         excluded: tuple[str, ...] = (),
     ) -> Path:
@@ -178,10 +179,10 @@ class YOLOKeypointDatasetTests(unittest.TestCase):
     def test_robot_negative_manifest_marks_exact_population(self) -> None:
         points = " ".join("0.25 0.5 2" for _ in range(17))
         for role, excluded, reviewed, verified, eligible in (
-            ("primary_evaluation", (), True, True, True),
-            ("stress_evaluation", (), True, True, False),
+            ("train_negative", (), True, True, True),
+            ("primary_evaluation", (), True, True, False),
             (
-                "primary_evaluation",
+                "train_negative",
                 ("images/train/image.jpg",),
                 True,
                 False,
@@ -344,7 +345,7 @@ class YOLOKeypointDatasetTests(unittest.TestCase):
                         ).hexdigest(),
                         "splits": {
                             "train": {
-                                "role": "primary_evaluation",
+                                "role": "train_negative",
                                 "records": 1,
                                 "eligible_records": 1,
                                 "excluded": [],
@@ -549,6 +550,29 @@ class YOLOKeypointDatasetTests(unittest.TestCase):
             target["points"],
             torch.tensor([[0.6, 0.7]]),
         )
+
+    def test_field_affine_removes_points_transformed_out_of_frame(self) -> None:
+        image = torch.full((3, 40, 80), 255, dtype=torch.uint8)
+        labels = torch.tensor([0])
+        boxes = torch.tensor([[0.95, 0.5, 0.1, 0.2]])
+        keypoints = torch.tensor([[[0.99, 0.5, 1.0]]])
+        parameters = [0, 0.08, 0, 1, 0, 0]
+
+        with patch(
+            "ultralytics_dfine.data.keypoints.random.uniform",
+            side_effect=parameters,
+        ):
+            _, labels, boxes, keypoints = YOLOKeypointDataset._field_affine(
+                image,
+                labels,
+                boxes,
+                keypoints,
+            )
+
+        self.assertEqual(labels.numel(), 0)
+        self.assertEqual(boxes.shape, (0, 4))
+        self.assertEqual(keypoints.shape, (0, 1, 3))
+
 
 if __name__ == "__main__":
     unittest.main()

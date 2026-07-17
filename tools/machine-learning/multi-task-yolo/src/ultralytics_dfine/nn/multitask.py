@@ -121,6 +121,104 @@ def _sample_encoder_feature(feature: Tensor, grid: Tensor) -> Tensor:
     )
 
 
+class SpatialPoseRefiner(nn.Module):
+    """Refine coarse joints with encoder features sampled at each joint."""
+
+    def __init__(
+        self,
+        hidden_dim: int,
+        config: PoseHeadConfig,
+    ) -> None:
+        super().__init__()
+        self.config = config
+        self.level_projections = nn.ModuleList(
+            nn.Linear(hidden_dim, config.refinement_dim)
+            for _ in range(config.feature_levels)
+        )
+        input_dim = (
+            hidden_dim
+            + config.refinement_dim * config.feature_levels
+            + config.refinement_dim
+        )
+        self.network = nn.Sequential(
+            nn.LayerNorm(input_dim),
+            nn.Linear(input_dim, config.refinement_dim),
+            nn.GELU(),
+            nn.Linear(config.refinement_dim, 3),
+        )
+        final = cast("nn.Linear", self.network[-1])
+        nn.init.zeros_(final.weight)
+        nn.init.zeros_(final.bias)
+
+    def forward(
+        self,
+        query_features: Tensor,
+        boxes: Tensor,
+        coarse_keypoints: Tensor,
+        coarse_visibility: Tensor,
+        encoder_features: tuple[Tensor, ...],
+        joint_embeddings: Tensor,
+    ) -> HeadOutput:
+        if len(encoder_features) != len(self.level_projections):
+            raise ValueError("Unexpected number of pose encoder levels")
+        sample_points = (
+            coarse_keypoints.detach()
+            if self.config.detach_sampling_grid
+            else coarse_keypoints
+        )
+        batch, queries, keypoints, _ = sample_points.shape
+        grid = (sample_points * 2 - 1).reshape(
+            batch,
+            queries * keypoints,
+            1,
+            2,
+        )
+        sampled_levels = []
+        for feature, projection in zip(
+            encoder_features,
+            self.level_projections,
+            strict=True,
+        ):
+            sampled = _sample_encoder_feature(feature, grid)
+            sampled = (
+                sampled.squeeze(-1)
+                .transpose(1, 2)
+                .reshape(
+                    batch,
+                    queries,
+                    keypoints,
+                    feature.shape[1],
+                )
+            )
+            sampled_levels.append(projection(sampled))
+        query_context = query_features[:, :, None, :].expand(
+            -1,
+            -1,
+            keypoints,
+            -1,
+        )
+        joint_context = joint_embeddings[None, None].expand(
+            batch,
+            queries,
+            -1,
+            -1,
+        )
+        values = self.network(
+            torch.cat(
+                (query_context, *sampled_levels, joint_context),
+                dim=-1,
+            )
+        )
+        sizes = boxes[..., None, 2:]
+        keypoint_delta = (
+            values[..., :2].tanh() * sizes * self.config.refinement_scale
+        )
+        return {
+            "pred_keypoints": (coarse_keypoints + keypoint_delta).clamp(0, 1),
+            "pred_visibility": coarse_visibility + values[..., 2],
+        }
+
+
 class QueryPoseHead(nn.Module):
     """Predict box-relative keypoints for each final D-FINE query."""
 
@@ -138,11 +236,25 @@ class QueryPoseHead(nn.Module):
             nn.GELU(),
             nn.Linear(hidden_dim, schema.keypoint_count * 3),
         )
+        self.joint_embeddings: nn.Embedding | None = None
+        self.spatial_refiner: SpatialPoseRefiner | None = None
+        if self.config.variant != "query_mlp":
+            self.joint_embeddings = nn.Embedding(
+                schema.keypoint_count,
+                self.config.refinement_dim,
+            )
+            if self.config.variant == "spatial_refine":
+                self.spatial_refiner = SpatialPoseRefiner(
+                    hidden_dim,
+                    self.config,
+                )
 
     def forward(
         self,
         query_features: Tensor,
         boxes: Tensor,
+        encoder_features: tuple[Tensor, ...] | None = None,
+        shared_refiner: SpatialPoseRefiner | None = None,
     ) -> HeadOutput:
         if query_features.shape[:2] != boxes.shape[:2]:
             raise ValueError("Pose queries and boxes must be aligned")
@@ -152,10 +264,25 @@ class QueryPoseHead(nn.Module):
         centers = boxes[..., None, :2]
         sizes = boxes[..., None, 2:]
         keypoints = (centers + offsets * sizes).clamp(0.0, 1.0)
-        return {
+        coarse = {
             "pred_keypoints": keypoints,
             "pred_visibility": values[..., 2],
         }
+        if self.config.variant == "query_mlp":
+            return coarse
+        if encoder_features is None or self.joint_embeddings is None:
+            raise ValueError("Spatial pose heads require encoder features")
+        refiner = self.spatial_refiner or shared_refiner
+        if refiner is None:
+            raise ValueError("Shared spatial pose refiner is missing")
+        return refiner(
+            query_features,
+            boxes,
+            coarse["pred_keypoints"],
+            coarse["pred_visibility"],
+            encoder_features,
+            self.joint_embeddings.weight,
+        )
 
 
 class FieldSpatialRefiner(nn.Module):
@@ -398,6 +525,11 @@ class DFINEMultiTaskModel(nn.Module):
             robot_schema,
             self.head_config.robot_pose,
         )
+        self.shared_pose_refiner = (
+            SpatialPoseRefiner(hidden_dim, self.head_config.person_pose)
+            if self.head_config.person_pose.variant == "shared_spatial_refine"
+            else None
+        )
         self.field_feature_head = FieldFeatureHead(
             hidden_dim,
             field_schema,
@@ -525,15 +657,33 @@ class DFINEMultiTaskModel(nn.Module):
             raise TypeError("D-FINE output is missing encoder feature maps")
         encoder_features = cast("tuple[Tensor, ...]", raw_encoder_features)
         outputs: MultiTaskOutput = {str(HeadId.OBJECT): detection}
-        if active_head in {None, HeadId.PERSON_POSE}:
+        person_batch_robot_negative = (
+            targets is not None
+            and self.loss_config.person_batch_robot_visibility_weight > 0
+        )
+        robot_batch_person_negative = (
+            targets is not None
+            and self.loss_config.robot_batch_person_visibility_weight > 0
+        )
+        include_person = active_head in {None, HeadId.PERSON_POSE} or (
+            robot_batch_person_negative and active_head == HeadId.ROBOT_POSE
+        )
+        include_robot = active_head in {None, HeadId.ROBOT_POSE} or (
+            person_batch_robot_negative and active_head == HeadId.PERSON_POSE
+        )
+        if include_person:
             outputs[str(HeadId.PERSON_POSE)] = self.person_pose_head(
                 query_features,
                 boxes,
+                encoder_features,
+                self.shared_pose_refiner,
             )
-        if active_head in {None, HeadId.ROBOT_POSE}:
+        if include_robot:
             outputs[str(HeadId.ROBOT_POSE)] = self.robot_pose_head(
                 query_features,
                 boxes,
+                encoder_features,
+                self.shared_pose_refiner,
             )
         if active_head in {None, HeadId.FIELD_FEATURES}:
             outputs[str(HeadId.FIELD_FEATURES)] = self.field_feature_head(
@@ -648,6 +798,13 @@ class DFINEMultiTaskModel(nn.Module):
                 )
                 .sigmoid()
             )
+            visibility_alpha = (
+                self.head_config.person_pose.visibility_score_alpha
+            )
+            if visibility_alpha > 0:
+                pixel_person_boxes[..., 4] = pixel_person_boxes[..., 4] * (
+                    person_visibility.mean(-1).pow(visibility_alpha)
+                )
             pixel_person = self._pixel_keypoints(person_keypoints, images)
             deployed["person_pose_output"] = torch.cat(
                 (

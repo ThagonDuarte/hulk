@@ -85,7 +85,7 @@ class MultiTaskTrainingConfig:
     render_max_detections: int = 20
     weight_decay: float = 1e-4
     warmup_steps: int = 500
-    learning_rate_schedule: Literal["constant"] = "constant"
+    learning_rate_schedule: Literal["constant", "cosine"] = "constant"
     minimum_learning_rate_ratio: float = 0.1
     clip_max_norm: float = 0.1
     ema_decay: float = 0.9999
@@ -140,7 +140,7 @@ class MultiTaskTrainingConfig:
 
 
 _ROLE_PREFIXES = {
-    "person_head": ("person_pose_head.",),
+    "person_head": ("person_pose_head.", "shared_pose_refiner."),
     "robot_head": ("robot_pose_head.",),
     "field_head": ("field_feature_head.",),
     "classifiers": ("detector.core.model.decoder.class_embed.",),
@@ -176,7 +176,16 @@ TRAINABLE_PROFILES = {
     "stage1": STAGE_TRAINABLE_ROLES[1],
     "stage2": STAGE_TRAINABLE_ROLES[2],
     "stage3": STAGE_TRAINABLE_ROLES[3],
+    "object_decoder_only": ("classifiers", "proposal", "decoder"),
+    "pose_aligned_decoder_no_classifier": ("proposal", "decoder"),
+    "pose_aligned_decoder": (
+        "classifiers",
+        "proposal",
+        "decoder",
+    ),
+    "cross_negative_classifier_only": ("classifiers",),
     "field_head_only": ("field_head",),
+    "pose_head_only": ("person_head", "robot_head"),
 }
 
 _EXACT_RESUME_CONFIG_FIELDS = (
@@ -219,6 +228,8 @@ _EXACT_RESUME_PROVENANCE_FIELDS = (
     "object_data_sha256",
     "person_data_sha256",
     "field_data_sha256",
+    "coco_robot_negative_manifest_sha256",
+    "dhrp_person_negative_manifest_sha256",
 )
 
 
@@ -489,6 +500,7 @@ class MultiTaskTrainer:
         self.wandb_run_id: str | None = None
         self.pending_validation_epoch: int | None = None
         self.pending_train_losses: dict[str, float] = {}
+        self.last_epoch_diagnostics: dict[str, float] = {}
         self.best_fitness = float("-inf")
         self.best_scores = {
             "object_field": float("-inf"),
@@ -809,6 +821,12 @@ class MultiTaskTrainer:
         values.update(
             {f"train/epoch/{name}": value for name, value in losses.items()}
         )
+        values.update(
+            {
+                f"train/epoch/{name}": value
+                for name, value in self.last_epoch_diagnostics.items()
+            }
+        )
         self._append_local_metrics("train_epoch", values)
         if self.wandb_run is not None:
             self.wandb_run.log(values)
@@ -988,11 +1006,31 @@ class MultiTaskTrainer:
         ]
         return torch.optim.AdamW(parameter_groups, betas=(0.9, 0.999))
 
+    def _planned_optimizer_updates(self) -> int:
+        steps = self.config.steps_per_epoch or sum(
+            len(loader) for loader in self.train_loaders.values()
+        )
+        return steps * self.config.epochs
+
     def _learning_rate_scale(self) -> float:
         step = self.scheduler_step
         if self.config.warmup_steps > 0 and step < self.config.warmup_steps:
             return (step + 1) / self.config.warmup_steps
-        return 1.0
+        if self.config.learning_rate_schedule == "constant":
+            return 1.0
+        decay_steps = self._planned_optimizer_updates() - (
+            self.config.warmup_steps
+        )
+        progress = min(
+            1.0,
+            max(
+                0.0,
+                (step - self.config.warmup_steps) / max(decay_steps - 1, 1),
+            ),
+        )
+        cosine = (1 + math.cos(math.pi * progress)) / 2
+        minimum = self.config.minimum_learning_rate_ratio
+        return minimum + (1 - minimum) * cosine
 
     def _set_learning_rates(self) -> None:
         scale = self._learning_rate_scale()
@@ -1044,7 +1082,14 @@ class MultiTaskTrainer:
             yield task, batch
 
     def _enforce_batch_norm_stats_policy(self) -> None:
-        specialized = self.config.stage_name == "field_head_only"
+        specialized = self.config.stage_name in {
+            "object_decoder_only",
+            "pose_aligned_decoder_no_classifier",
+            "pose_aligned_decoder",
+            "cross_negative_classifier_only",
+            "field_head_only",
+            "pose_head_only",
+        }
         freeze_frozen = self.config.freeze_frozen_bn_stats or specialized
         if not self.config.freeze_all_bn_stats and not freeze_frozen:
             return
@@ -1070,7 +1115,40 @@ class MultiTaskTrainer:
                 set_dataset_epoch(epoch)
         totals: dict[str, float] = {}
         counts: dict[str, int] = {}
+        cross_negative_counts = torch.zeros(
+            8,
+            dtype=torch.float64,
+            device=self.device,
+        )
         for task, (images, targets) in self._scheduled_batches(epoch):
+            if task == HeadId.PERSON_POSE:
+                cross_negative_counts[0] += len(targets)
+                cross_negative_counts[1] += sum(
+                    target.get("robot_negative_reviewed") is True
+                    for target in targets
+                )
+                cross_negative_counts[2] += sum(
+                    target.get("robot_negative_verified") is True
+                    for target in targets
+                )
+                cross_negative_counts[3] += sum(
+                    target.get("robot_negative_eligible") is True
+                    for target in targets
+                )
+                cross_negative_counts[4] += sum(
+                    target.get("robot_negative_excluded") is True
+                    for target in targets
+                )
+            elif task == HeadId.ROBOT_POSE:
+                cross_negative_counts[5] += len(targets)
+                cross_negative_counts[6] += sum(
+                    target.get("person_negative_verified") is True
+                    for target in targets
+                )
+                cross_negative_counts[7] += sum(
+                    target.get("person_negative_eligible") is True
+                    for target in targets
+                )
             step_started = time.monotonic()
             images = images.to(self.device, non_blocking=True)
             moved_targets = _move_targets(targets, self.device)
@@ -1127,6 +1205,85 @@ class MultiTaskTrainer:
                 value = torch.tensor(averages[name], device=self.device)
                 dist.all_reduce(value, op=dist.ReduceOp.SUM)
                 averages[name] = float(value) / self.world_size
+            dist.all_reduce(cross_negative_counts, op=dist.ReduceOp.SUM)
+        (
+            person_records,
+            robot_negative_reviewed_records,
+            robot_negative_verified_records,
+            robot_negative_eligible_records,
+            robot_negative_excluded_records,
+            robot_records,
+            person_negative_verified_records,
+            person_negative_eligible_records,
+        ) = (float(value) for value in cross_negative_counts.tolist())
+        loss_config = getattr(self.model, "loss_config", None)
+        person_robot_detector = float(
+            getattr(loss_config, "person_batch_robot_detector_weight", 0.0)
+        )
+        robot_person_detector = float(
+            getattr(loss_config, "robot_batch_person_detector_weight", 0.0)
+        )
+        person_robot_visibility = float(
+            getattr(loss_config, "person_batch_robot_visibility_weight", 0.0)
+        )
+        robot_person_visibility = float(
+            getattr(loss_config, "robot_batch_person_visibility_weight", 0.0)
+        )
+        self.last_epoch_diagnostics = {
+            "cross_negative/person_records_seen": person_records,
+            "cross_negative/robot_records_seen": robot_records,
+            "cross_negative/person_robot_reviewed_seen": (
+                robot_negative_reviewed_records
+            ),
+            "cross_negative/person_robot_excluded_seen": (
+                robot_negative_excluded_records
+            ),
+            "cross_negative/person_robot_unreviewed_seen": (
+                person_records - robot_negative_reviewed_records
+            ),
+            "cross_negative/person_robot_verified_seen": (
+                robot_negative_verified_records
+            ),
+            "cross_negative/person_robot_eligible_seen": (
+                robot_negative_eligible_records
+            ),
+            "cross_negative/person_robot_eligible_fraction": (
+                robot_negative_eligible_records / person_records
+                if person_records
+                else 0.0
+            ),
+            "cross_negative/robot_person_verified_seen": (
+                person_negative_verified_records
+            ),
+            "cross_negative/robot_person_eligible_seen": (
+                person_negative_eligible_records
+            ),
+            "cross_negative/robot_person_eligible_fraction": (
+                person_negative_eligible_records / robot_records
+                if robot_records
+                else 0.0
+            ),
+            "cross_negative/person_robot_detector_applied_records": (
+                robot_negative_eligible_records
+                if person_robot_detector > 0
+                else 0.0
+            ),
+            "cross_negative/robot_person_detector_applied_records": (
+                person_negative_eligible_records
+                if robot_person_detector > 0
+                else 0.0
+            ),
+            "cross_negative/person_robot_visibility_applied_records": (
+                robot_negative_eligible_records
+                if person_robot_visibility > 0
+                else 0.0
+            ),
+            "cross_negative/robot_person_visibility_applied_records": (
+                person_negative_eligible_records
+                if robot_person_visibility > 0
+                else 0.0
+            ),
+        }
         self._capture_runtime_states()
         return averages
 

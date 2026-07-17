@@ -9,7 +9,6 @@ from PIL import Image
 
 from ultralytics_dfine.config import (
     DFINEArchitectureConfig,
-    PoseHeadConfig,
     build_manifest,
     build_multitask_manifest,
 )
@@ -27,13 +26,6 @@ from utils.model_naming import (
     TaskType,
     UnsupportedHydraCompositionError,
 )
-
-
-class ConfigurationTests(unittest.TestCase):
-    def test_person_visibility_score_alpha_is_parse_only(self) -> None:
-        self.assertEqual(PoseHeadConfig().visibility_score_alpha, 0.0)
-        with self.assertRaisesRegex(ValueError, "must be zero"):
-            PoseHeadConfig(visibility_score_alpha=1.0)
 
 
 class ModelNamingTests(unittest.TestCase):
@@ -397,6 +389,44 @@ class CriterionTests(unittest.TestCase):
         assert logits.grad is not None
         torch.testing.assert_close(logits.grad[..., 0], torch.zeros(1, 2))
         self.assertTrue((logits.grad[..., 1] > 0).all())
+
+    def test_detection_class_loss_weights_scale_masked_vfl_gradient(
+        self,
+    ) -> None:
+        logits = torch.zeros(1, 2, 2, requires_grad=True)
+        targets = [
+            {
+                "labels": torch.empty(0, dtype=torch.long),
+                "boxes": torch.empty(0, 4),
+                "valid_detection_classes": torch.tensor([False, True]),
+                "detection_class_loss_weights": torch.tensor([0.25, 1.0]),
+            }
+        ]
+        empty_match = [
+            (
+                torch.empty(0, dtype=torch.long),
+                torch.empty(0, dtype=torch.long),
+            )
+        ]
+
+        loss = DFINECriterion(2)._loss_vfl(
+            {
+                "pred_logits": logits,
+                "pred_boxes": torch.rand(1, 2, 4),
+            },
+            targets,
+            empty_match,
+            1.0,
+        )["loss_vfl"]
+        loss.backward()
+
+        assert logits.grad is not None
+        self.assertTrue((logits.grad[..., 0] > 0).all())
+        torch.testing.assert_close(
+            logits.grad[..., 0],
+            logits.grad[..., 1] * 0.25,
+        )
+
 
 class ManifestTests(unittest.TestCase):
     def test_manifest_hash_is_stable(self) -> None:

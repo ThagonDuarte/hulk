@@ -1,0 +1,31 @@
+{
+  "version": 1,
+  "policy": "verified-person-free-dhrp-v1",
+  "image_set_digest_algorithm": "sha256(dhrp-person-negative-images-v1\\0 + effective_relative_path + \\0 + image_sha256 + \\n)",
+  "annotations": {
+    "train_set_Synthetic_characterSim1.json": {
+      "annotation_sha256": "df4a60e631dafd7bfbf213eaa7059e38e6db98e50882ee5ca75786518ad4cff3",
+      "image_set_sha256": "d7e5e1f9455ef9da0262295d97d7b8290b9351725b30b1b135e64e36f4c6e680",
+      "records": 3103,
+      "role": "train_negative"
+    },
+    "train_set_Synthetic_characterSim2.json": {
+      "annotation_sha256": "a6bfdd13aff2858c5d917dfa64d533200696d32b4ed8fb8dad18b76fb8b7fc69",
+      "image_set_sha256": "02212d23317a758df7b1b00fdf8226376a93e6759a155aa4048554c86cdb1bdc",
+      "records": 919,
+      "role": "train_negative"
+    },
+    "train_set_Synthetic_characterSim3.json": {
+      "annotation_sha256": "4d16d03b8184713aba184992fb51431ebc90e5da6a8f81bf3a0010c4aece9862",
+      "image_set_sha256": "b4c07b78fdb18a6ad3c357617dd6e2800c0766a122e8ce2e0f49922074d3a1a8",
+      "records": 905,
+      "role": "train_negative"
+    },
+    "train_set_Synthetic_characterSim4.json": {
+      "annotation_sha256": "efd6bc93675a127e51c9652cdaf423eeb91a6d00980ed2696f1d7e2b31e727ec",
+      "image_set_sha256": "9b95347710919bd18c25f933c9ea91e36b95efcecdb82a0d3963a91c356cbfad",
+      "records": 925,
+      "role": "loss_holdout_validation"
+    }
+  }
+}

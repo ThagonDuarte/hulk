@@ -26,7 +26,11 @@ def _require_finite(**values: float) -> None:
 class PoseHeadConfig:
     """Architecture and deployment scoring for a query-aligned pose head."""
 
-    variant: Literal["query_mlp"] = "query_mlp"
+    variant: Literal[
+        "query_mlp",
+        "spatial_refine",
+        "shared_spatial_refine",
+    ] = "query_mlp"
     refinement_dim: int = 64
     refinement_scale: float = 0.25
     feature_levels: int = 3
@@ -38,7 +42,11 @@ class PoseHeadConfig:
             refinement_scale=self.refinement_scale,
             visibility_score_alpha=self.visibility_score_alpha,
         )
-        if self.variant != "query_mlp":
+        if self.variant not in {
+            "query_mlp",
+            "spatial_refine",
+            "shared_spatial_refine",
+        }:
             raise ValueError("Unsupported pose-head variant")
         if self.refinement_dim <= 0:
             raise ValueError("Pose refinement_dim must be positive")
@@ -46,8 +54,8 @@ class PoseHeadConfig:
             raise ValueError("Pose refinement_scale must be positive")
         if self.feature_levels <= 0:
             raise ValueError("Pose feature_levels must be positive")
-        if self.visibility_score_alpha != 0.0:
-            raise ValueError("visibility_score_alpha must be zero")
+        if self.visibility_score_alpha < 0:
+            raise ValueError("visibility_score_alpha must be non-negative")
 
 
 @dataclass(frozen=True)
@@ -79,6 +87,34 @@ class MultiTaskHeadConfig:
     person_pose: PoseHeadConfig = field(default_factory=PoseHeadConfig)
     robot_pose: PoseHeadConfig = field(default_factory=PoseHeadConfig)
     field_features: FieldHeadConfig = field(default_factory=FieldHeadConfig)
+
+    def __post_init__(self) -> None:
+        shared = (
+            self.person_pose.variant == "shared_spatial_refine",
+            self.robot_pose.variant == "shared_spatial_refine",
+        )
+        if any(shared) and not all(shared):
+            raise ValueError(
+                "Person and robot pose heads must both use the shared refiner"
+            )
+        if all(shared):
+            shared_fields = (
+                "refinement_dim",
+                "refinement_scale",
+                "feature_levels",
+                "detach_sampling_grid",
+            )
+            mismatched = [
+                name
+                for name in shared_fields
+                if getattr(self.person_pose, name)
+                != getattr(self.robot_pose, name)
+            ]
+            if mismatched:
+                raise ValueError(
+                    "Shared pose refiners require matching configuration: "
+                    + ", ".join(mismatched)
+                )
 
     @classmethod
     def from_dict(cls, values: dict[str, Any]) -> "MultiTaskHeadConfig":
@@ -156,8 +192,8 @@ class FieldLossConfig:
             area_scale_floor=self.area_scale_floor,
             area_scale_cap=self.area_scale_cap,
         )
-        if self.classification_mode != "binary":
-            raise ValueError("Only binary field classification is supported")
+        if self.classification_mode not in {"binary", "strict_quality"}:
+            raise ValueError("Unsupported field classification mode")
         if (
             min(
                 self.class_weight,
@@ -181,8 +217,6 @@ class FieldLossConfig:
             raise ValueError(
                 "Field area_scale_cap must be at least area_scale_floor"
             )
-        if self.area_normalized_weight != 0:
-            raise ValueError("Area-normalized field loss is not supported")
 
 
 @dataclass(frozen=True)
@@ -194,6 +228,10 @@ class MultiTaskLossConfig:
     field_features: FieldLossConfig = field(default_factory=FieldLossConfig)
     cross_pose_visibility_negative_weight: float = 0.0
     cross_pose_detector_negative_weight: float = 0.0
+    person_batch_robot_visibility_negative_weight: float | None = None
+    robot_batch_person_visibility_negative_weight: float | None = None
+    person_batch_robot_detector_negative_weight: float | None = None
+    robot_batch_person_detector_negative_weight: float | None = None
 
     def __post_init__(self) -> None:
         values = {
@@ -203,12 +241,66 @@ class MultiTaskLossConfig:
             "cross_pose_detector_negative_weight": (
                 self.cross_pose_detector_negative_weight
             ),
+            **{
+                name: value
+                for name, value in (
+                    (
+                        "person_batch_robot_visibility_negative_weight",
+                        self.person_batch_robot_visibility_negative_weight,
+                    ),
+                    (
+                        "robot_batch_person_visibility_negative_weight",
+                        self.robot_batch_person_visibility_negative_weight,
+                    ),
+                    (
+                        "person_batch_robot_detector_negative_weight",
+                        self.person_batch_robot_detector_negative_weight,
+                    ),
+                    (
+                        "robot_batch_person_detector_negative_weight",
+                        self.robot_batch_person_detector_negative_weight,
+                    ),
+                )
+                if value is not None
+            },
         }
         _require_finite(
             **values,
         )
-        if any(value != 0 for value in values.values()):
-            raise ValueError("Cross-pose negative training is not supported")
+        if any(value < 0 for value in values.values()):
+            raise ValueError("Cross-pose negative weights must be non-negative")
+
+    @property
+    def person_batch_robot_visibility_weight(self) -> float:
+        value = self.person_batch_robot_visibility_negative_weight
+        return (
+            self.cross_pose_visibility_negative_weight
+            if value is None
+            else value
+        )
+
+    @property
+    def robot_batch_person_visibility_weight(self) -> float:
+        value = self.robot_batch_person_visibility_negative_weight
+        return (
+            self.cross_pose_visibility_negative_weight
+            if value is None
+            else value
+        )
+
+    @property
+    def person_batch_robot_detector_weight(self) -> float:
+        value = self.person_batch_robot_detector_negative_weight
+        return (
+            self.cross_pose_detector_negative_weight if value is None else value
+        )
+
+    @property
+    def robot_batch_person_detector_weight(self) -> float:
+        value = self.robot_batch_person_detector_negative_weight
+        return (
+            self.cross_pose_detector_negative_weight if value is None else value
+        )
 
     @classmethod
     def from_dict(cls, values: dict[str, Any]) -> "MultiTaskLossConfig":
@@ -229,6 +321,46 @@ class MultiTaskLossConfig:
             ),
             cross_pose_detector_negative_weight=float(
                 values.get("cross_pose_detector_negative_weight", 0.0)
+            ),
+            person_batch_robot_visibility_negative_weight=(
+                float(value)
+                if (
+                    value := values.get(
+                        "person_batch_robot_visibility_negative_weight"
+                    )
+                )
+                is not None
+                else None
+            ),
+            robot_batch_person_visibility_negative_weight=(
+                float(value)
+                if (
+                    value := values.get(
+                        "robot_batch_person_visibility_negative_weight"
+                    )
+                )
+                is not None
+                else None
+            ),
+            person_batch_robot_detector_negative_weight=(
+                float(value)
+                if (
+                    value := values.get(
+                        "person_batch_robot_detector_negative_weight"
+                    )
+                )
+                is not None
+                else None
+            ),
+            robot_batch_person_detector_negative_weight=(
+                float(value)
+                if (
+                    value := values.get(
+                        "robot_batch_person_detector_negative_weight"
+                    )
+                )
+                is not None
+                else None
             ),
         )
 

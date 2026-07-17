@@ -116,12 +116,10 @@ class DHRPDatasetTests(unittest.TestCase):
         self.assertFalse(target["person_negative_verified"])
         self.assertFalse(target["person_negative_eligible"])
 
-    def test_exact_manifest_marks_only_selected_evaluation_role_eligible(
-        self,
-    ) -> None:
+    def test_exact_manifest_marks_only_training_role_eligible(self) -> None:
         points = [[10.0, 20.0, 1.0] for _ in range(14)]
         for role, eligible in (
-            ("primary_evaluation", True),
+            ("train_negative", True),
             ("loss_holdout_validation", False),
         ):
             with (
@@ -161,7 +159,7 @@ class DHRPDatasetTests(unittest.TestCase):
             manifest = self._write_person_negative_manifest(
                 root,
                 annotation,
-                role="primary_evaluation",
+                role="train_negative",
             )
             Image.new("RGB", (100, 200), color="black").save(
                 root / "train" / "robot.png"
@@ -185,7 +183,7 @@ class DHRPDatasetTests(unittest.TestCase):
             manifest = self._write_person_negative_manifest(
                 root,
                 annotation,
-                role="primary_evaluation",
+                role="train_negative",
             )
             baseline = dataset_target_fingerprint(DHRPDataset(root, annotation))
             eligible = dataset_target_fingerprint(

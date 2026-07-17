@@ -1,0 +1,72 @@
+*** Begin Patch
+*** Update File: tools/detection_replay/src/cache.rs
+@@
+ fn read_model_run_manifest(path: &Path) -> Result<ModelRunManifest> {
+     match read_bincode(path) {
+-        Ok(manifest) => Ok(manifest),
++        Ok(manifest) => {
++            validate_current_model_run_identity(&manifest)?;
++            Ok(manifest)
++        }
+         Err(current_error) => match read_bincode::<V4ModelRunManifest>(path) {
+@@
+ fn model_run_key(
+@@
+     Ok(format!("model-{}", &digest[..16]))
+ }
++
++fn validate_current_model_run_identity(manifest: &ModelRunManifest) -> Result<()> {
++    let expected = model_run_key(
++        &manifest.canonical_model_path,
++        &manifest.model_hash,
++        &manifest.recording_fingerprint,
++        manifest.per_head_thresholds,
++        manifest.robot_visibility_score_alpha,
++        manifest.frame_start,
++        manifest.frame_end,
++        manifest.total_frame_count,
++    )?;
++    if manifest.run_key == expected {
++        return Ok(());
++    }
++    bail!("current model run key does not match its payload identity")
++}
+ 
+ fn validate_v4_model_run_identity(manifest: &V4ModelRunManifest) -> Result<()> {
+@@
+     #[test]
++    fn current_manifest_rejects_mutated_identity_payload() {
++        let directory = tempfile::tempdir().unwrap();
++        let path = directory.path().join(MANIFEST_FILE);
++        let mut value = manifest(2);
++        value
++            .per_head_thresholds
++            .object_minimum_candidate_confidence = 0.2;
++        write_bincode_atomic(&path, &value).unwrap();
++
++        let error = read_model_run_manifest(&path).unwrap_err();
++        assert!(
++            format!("{error:#}")
++                .contains("current model run key does not match its payload identity")
++        );
++    }
++
++    #[test]
++    fn current_manifest_allows_mutated_nonidentity_metadata() {
++        let directory = tempfile::tempdir().unwrap();
++        let path = directory.path().join(MANIFEST_FILE);
++        let mut value = manifest(2);
++        value.label = "renamed".to_string();
++        value.completed_frame_count = 1;
++        value.state = ModelRunState::Incomplete;
++        value.provider_note = Some("provider metadata".to_string());
++        write_bincode_atomic(&path, &value).unwrap();
++
++        let loaded = read_model_run_manifest(&path).unwrap();
++        assert_eq!(loaded.run_key, value.run_key);
++        assert_eq!(loaded.label, "renamed");
++    }
++
++    #[test]
+     fn truncated_current_manifest_is_not_treated_as_prior_schema() {
+*** End Patch

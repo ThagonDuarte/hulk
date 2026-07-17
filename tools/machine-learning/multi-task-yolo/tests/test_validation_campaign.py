@@ -23,6 +23,10 @@ from ultralytics_dfine.engine.multitask_validator import (
 from ultralytics_dfine.nn import DFINEMultiTaskModel
 from ultralytics_dfine.schemas import HeadId
 from utils.nv12_to_rgb import NV12ToRgb
+from utils.prepare_annotato_dataset import (
+    _field_complete,
+    _field_validation_eligible,
+)
 from validation.compare_multitask import (
     _MATCH_THRESHOLDS,
     _RECALL_THRESHOLDS,
@@ -761,6 +765,18 @@ class ValidationDataTests(unittest.TestCase):
             list(cast(dict[str, object], merged["tasks"])),
             ["field_features", "object"],
         )
+
+    def test_field_complete_accepts_authoritative_negative_images(self) -> None:
+        negative = [{"class": "Ball"}]
+        positive = [{"class": "GoalPost", "point": [0.2, 0.3]}]
+        incomplete = [{"class": "GoalPost", "migration_skipped": True}]
+
+        self.assertTrue(_field_complete(negative))
+        self.assertTrue(_field_complete(positive))
+        self.assertFalse(_field_complete(incomplete))
+        self.assertFalse(_field_validation_eligible(negative))
+        self.assertTrue(_field_validation_eligible(positive))
+        self.assertFalse(_field_validation_eligible(incomplete))
 
     def test_subset_manifest_is_deterministic_and_fingerprint_checked(
         self,

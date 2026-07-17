@@ -1,0 +1,700 @@
+*** Begin Patch
+*** Update File: tools/detection_replay/src/cache.rs
+@@
+ pub const CACHE_VERSION: u32 = 2;
+ pub const PREDICTION_CHUNK_SIZE: usize = 128;
+ const RECORDING_FINGERPRINT_VERSION: u32 = 1;
+-// The original identity captured neither supplemental output; v2 added field features and v3
+-// adds robot poses.
+-const MODEL_RUN_PAYLOAD_VERSION: u32 = 3;
++// The original identity captured neither supplemental output; v2 added field features, v3
++// added robot poses, and v4 adds robot-pose visibility scoring to the identity.
++const MODEL_RUN_PAYLOAD_VERSION: u32 = 4;
+ const FIELD_FEATURE_CACHE_VERSION: u32 = 1;
+ const ROBOT_POSE_CACHE_VERSION: u32 = 1;
+ 
+@@
+     pub state: ModelRunState,
+     pub error: Option<String>,
+     pub provider_note: Option<String>,
++    // Keep new bincode fields at the end; `PriorModelRunManifest` decodes the v2 schema.
++    pub robot_visibility_score_alpha: f32,
+ }
+ 
+ impl ModelRunManifest {
+@@
+         total_frame_count: usize,
+         frame_range: RangeInclusive<usize>,
+     ) -> Result<Self> {
++        Self::new_with_robot_visibility_alpha(
++            label,
++            canonical_model_path,
++            model_hash,
++            recording_fingerprint,
++            thresholds,
++            0.0,
++            total_frame_count,
++            frame_range,
++        )
++    }
++
++    #[allow(clippy::too_many_arguments)]
++    pub fn new_with_robot_visibility_alpha(
++        label: impl Into<String>,
++        canonical_model_path: PathBuf,
++        model_hash: [u8; 32],
++        recording_fingerprint: RecordingFingerprint,
++        thresholds: DetectionThresholds,
++        robot_visibility_score_alpha: f32,
++        total_frame_count: usize,
++        frame_range: RangeInclusive<usize>,
++    ) -> Result<Self> {
+         let label = label.into();
+         let thresholds = thresholds.validate()?;
++        let robot_visibility_score_alpha =
++            validate_robot_visibility_score_alpha(robot_visibility_score_alpha)?;
+         let frame_start = *frame_range.start();
+         let frame_end = *frame_range.end();
+         validate_frame_range(frame_start, frame_end, total_frame_count)?;
+@@
+             &model_hash,
+             &recording_fingerprint,
+             thresholds,
++            robot_visibility_score_alpha,
+             frame_start,
+             frame_end,
+             total_frame_count,
+@@
+             state: ModelRunState::Running,
+             error: None,
+             provider_note: None,
++            robot_visibility_score_alpha,
+         })
+     }
+ 
+@@
+     provider_note: Option<String>,
+ }
+ 
++// `ModelRunManifest` before robot visibility scoring was made configurable. Bincode encodes
++// structs positionally, so serde defaults cannot make an appended field backward compatible.
++#[derive(Debug, Serialize, Deserialize)]
++struct PriorModelRunManifest {
++    run_key: String,
++    label: String,
++    canonical_model_path: PathBuf,
++    model_hash: [u8; 32],
++    recording_fingerprint: RecordingFingerprint,
++    thresholds: DetectionThresholds,
++    total_frame_count: usize,
++    frame_start: usize,
++    frame_end: usize,
++    completed_frame_count: usize,
++    cache_version: u32,
++    state: ModelRunState,
++    error: Option<String>,
++    provider_note: Option<String>,
++}
++
++impl From<PriorModelRunManifest> for ModelRunManifest {
++    fn from(prior: PriorModelRunManifest) -> Self {
++        Self {
++            run_key: prior.run_key,
++            label: prior.label,
++            canonical_model_path: prior.canonical_model_path,
++            model_hash: prior.model_hash,
++            recording_fingerprint: prior.recording_fingerprint,
++            thresholds: prior.thresholds,
++            total_frame_count: prior.total_frame_count,
++            frame_start: prior.frame_start,
++            frame_end: prior.frame_end,
++            completed_frame_count: prior.completed_frame_count,
++            cache_version: prior.cache_version,
++            state: prior.state,
++            error: prior.error,
++            provider_note: prior.provider_note,
++            robot_visibility_score_alpha: 0.0,
++        }
++    }
++}
++
+ pub struct PredictionStore {
+     _lock_file: File,
+     run_directory: PathBuf,
+@@
+         let manifest_path = run_directory.join(MANIFEST_FILE);
+ 
+         let mut manifest = if manifest_path.exists() {
+-            let existing: ModelRunManifest = read_bincode(&manifest_path)?;
++            let existing = read_model_run_manifest(&manifest_path)?;
+             validate_model_run_manifest(&existing)?;
+             validate_same_run(&existing, &proposed)?;
+             ModelRunManifest {
+@@
+     let root = cache_directory.as_ref().join(MODEL_RUNS_DIRECTORY);
+     let _lock_file = lock_model_run(&root, run_key, true)?;
+     let run_directory = root.join(run_key);
+-    let manifest: ModelRunManifest = read_bincode(&run_directory.join(MANIFEST_FILE))?;
++    let manifest = read_model_run_manifest(&run_directory.join(MANIFEST_FILE))?;
+     if manifest.run_key != run_key
+         || !manifest
+             .recording_fingerprint
+@@
+         .file_name()
+         .and_then(|name| name.to_str())
+         .wrap_err("model run directory name is not valid UTF-8")?;
+-    if read_bincode::<ModelRunManifest>(&directory.join(MANIFEST_FILE)).is_ok() {
++    if read_model_run_manifest(&directory.join(MANIFEST_FILE)).is_ok() {
+         return Ok(None);
+     }
+     let legacy: LegacyModelRunManifest = read_bincode(&directory.join(MANIFEST_FILE))?;
+@@
+     let target = root.join(&migrated.run_key);
+     let _target_lock = lock_model_run(root, &migrated.run_key, true)?;
+     if target != directory && target.exists() {
+-        let target_manifest: ModelRunManifest = read_bincode(&target.join(MANIFEST_FILE))?;
++        let target_manifest = read_model_run_manifest(&target.join(MANIFEST_FILE))?;
+         validate_model_run_manifest(&target_manifest)?;
+         validate_same_run(&target_manifest, &migrated)?;
+         if target_manifest.completed_frame_count >= migrated.completed_frame_count {
+@@
+     recording_fingerprint: &RecordingFingerprint,
+     total_frame_count: usize,
+ ) -> Result<Option<LoadedPredictionRun>> {
+-    let mut manifest: ModelRunManifest = read_bincode(&directory.join(MANIFEST_FILE))?;
++    let mut manifest = read_model_run_manifest(&directory.join(MANIFEST_FILE))?;
+     validate_model_run_manifest(&manifest)?;
+     if directory.file_name().and_then(|name| name.to_str()) != Some(&manifest.run_key) {
+         bail!("model run directory name does not match its manifest key");
+@@
+         .join(RECORDED_BASELINE_FILE))
+ }
+ 
++fn read_model_run_manifest(path: &Path) -> Result<ModelRunManifest> {
++    match read_bincode(path) {
++        Ok(manifest) => Ok(manifest),
++        Err(current_error) => read_bincode::<PriorModelRunManifest>(path)
++            .map(ModelRunManifest::from)
++            .map_err(|prior_error| {
++                prior_error.wrap_err(format!(
++                    "also failed to decode current model run manifest: {current_error:#}"
++                ))
++            }),
++    }
++}
++
+ pub(crate) fn read_bincode<T: DeserializeOwned>(path: &Path) -> Result<T> {
+     let file = File::open(path).wrap_err_with(|| format!("failed to open {}", path.display()))?;
+     let length = file
+@@
+     Ok(file)
+ }
+ 
++#[allow(clippy::too_many_arguments)]
+ fn model_run_key(
+     canonical_model_path: &Path,
+     model_hash: &[u8; 32],
+     recording_fingerprint: &RecordingFingerprint,
+     thresholds: DetectionThresholds,
++    robot_visibility_score_alpha: f32,
+     frame_start: usize,
+     frame_end: usize,
+     total_frame_count: usize,
+ ) -> Result<String> {
+     validate_frame_range(frame_start, frame_end, total_frame_count)?;
++    let robot_visibility_score_alpha =
++        validate_robot_visibility_score_alpha(robot_visibility_score_alpha)?;
+     let identity = bincode::serialize(&(
+         canonical_model_path,
+         model_hash,
+@@
+         thresholds,
+         CACHE_VERSION,
+         MODEL_RUN_PAYLOAD_VERSION,
++        robot_visibility_score_alpha.to_bits(),
+         frame_start,
+         frame_end,
+         total_frame_count,
+@@
+         || existing.model_hash != proposed.model_hash
+         || existing.recording_fingerprint != proposed.recording_fingerprint
+         || existing.thresholds != proposed.thresholds
++        || existing.robot_visibility_score_alpha.to_bits()
++            != proposed.robot_visibility_score_alpha.to_bits()
+         || existing.total_frame_count != proposed.total_frame_count
+         || existing.frame_start != proposed.frame_start
+         || existing.frame_end != proposed.frame_end
+@@
+ 
+ fn validate_model_run_manifest(manifest: &ModelRunManifest) -> Result<()> {
+     let target_count = manifest.target_frame_count()?;
++    let robot_visibility_score_alpha =
++        validate_robot_visibility_score_alpha(manifest.robot_visibility_score_alpha)?;
+     if manifest.cache_version != CACHE_VERSION
+         || manifest.completed_frame_count > target_count
+         || manifest.thresholds.validate()? != manifest.thresholds
++        || robot_visibility_score_alpha.to_bits() != manifest.robot_visibility_score_alpha.to_bits()
+     {
+         bail!("model run manifest contains invalid values");
+     }
+@@
+     if value == 0.0 { 0.0 } else { value }
+ }
+ 
++pub(crate) fn validate_robot_visibility_score_alpha(value: f32) -> Result<f32> {
++    if !value.is_finite() || value < 0.0 {
++        bail!("robot visibility score alpha must be finite and non-negative, got {value}");
++    }
++    Ok(normalize_zero(value))
++}
++
+ pub(crate) fn validate_baseline(
+     directory: &Path,
+     baseline: &RecordedBaseline,
+@@
+     }
+ 
+     #[test]
++    fn robot_visibility_alpha_is_canonical_and_changes_run_identity() {
++        let with_alpha = |alpha| {
++            ModelRunManifest::new_with_robot_visibility_alpha(
++                "alpha",
++                PathBuf::from("/tmp/model.onnx"),
++                [7; 32],
++                fingerprint(),
++                DetectionThresholds::default(),
++                alpha,
++                1,
++                0..=0,
++            )
++        };
++
++        let zero = with_alpha(0.0).unwrap();
++        let negative_zero = with_alpha(-0.0).unwrap();
++        let one = with_alpha(1.0).unwrap();
++        assert_eq!(zero.run_key, negative_zero.run_key);
++        assert_eq!(
++            negative_zero.robot_visibility_score_alpha.to_bits(),
++            0.0_f32.to_bits()
++        );
++        assert_ne!(zero.run_key, one.run_key);
++        assert_eq!(one.robot_visibility_score_alpha, 1.0);
++
++        for invalid in [-1.0, f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
++            let error = with_alpha(invalid).unwrap_err();
++            assert!(error.to_string().contains("finite and non-negative"));
++        }
++    }
++
++    #[test]
++    fn prior_manifest_schema_loads_as_alpha_zero() {
++        let cache = tempfile::tempdir().unwrap();
++        let fingerprint = fingerprint();
++        let model_path = PathBuf::from("/tmp/model.onnx");
++        let model_hash = [7; 32];
++        let thresholds = DetectionThresholds::default();
++        let identity = bincode::serialize(&(
++            &model_path,
++            &model_hash,
++            &fingerprint,
++            thresholds,
++            CACHE_VERSION,
++            3_u32,
++            0_usize,
++            0_usize,
++            1_usize,
++        ))
++        .unwrap();
++        let digest = blake3::hash(&identity).to_hex().to_string();
++        let run_key = format!("model-{}", &digest[..16]);
++        let directory = cache.path().join(MODEL_RUNS_DIRECTORY).join(&run_key);
++        fs::create_dir_all(&directory).unwrap();
++        write_bincode_atomic(
++            &directory.join(MANIFEST_FILE),
++            &PriorModelRunManifest {
++                run_key: run_key.clone(),
++                label: "prior".to_string(),
++                canonical_model_path: model_path,
++                model_hash,
++                recording_fingerprint: fingerprint.clone(),
++                thresholds,
++                total_frame_count: 1,
++                frame_start: 0,
++                frame_end: 0,
++                completed_frame_count: 0,
++                cache_version: CACHE_VERSION,
++                state: ModelRunState::Incomplete,
++                error: None,
++                provider_note: None,
++            },
++        )
++        .unwrap();
++
++        let runs = load_all_runs(cache.path(), &fingerprint, 1).unwrap();
++        let prior = runs.iter().find(|run| run.key == run_key).unwrap();
++        assert_eq!(
++            prior
++                .manifest
++                .as_ref()
++                .unwrap()
++                .robot_visibility_score_alpha
++                .to_bits(),
++            0.0_f32.to_bits()
++        );
++    }
++
++    #[test]
+     fn chunks_resume_and_distinguish_empty_from_absent() {
+         let cache = tempfile::tempdir().unwrap();
+         let mut store = PredictionStore::open(cache.path(), manifest(130)).unwrap();
+*** Update File: tools/detection_replay/src/runner.rs
+@@
+ };
+ 
+ use crate::{
+-    cache::{DetectionThresholds, ModelRunManifest, Prediction, PredictionStore, hash_model},
++    cache::{
++        DetectionThresholds, ModelRunManifest, Prediction, PredictionStore, hash_model,
++        validate_robot_visibility_score_alpha,
++    },
+     recording::{OriginalFrame, Recording},
+ };
+ 
+@@
+     pub label: String,
+     pub model_path: PathBuf,
+     pub thresholds: DetectionThresholds,
++    pub robot_visibility_score_alpha: f32,
+     pub frame_limit: Option<usize>,
+     pub start_frame: usize,
+     pub end_frame: Option<usize>,
+@@
+             label: label.into(),
+             model_path: model_path.into(),
+             thresholds: DetectionThresholds::default(),
++            robot_visibility_score_alpha: 0.0,
+             frame_limit: None,
+             start_frame: 0,
+             end_frame: None,
+@@
+     F: FnMut(RunProgress<'_>),
+ {
+     let cache_directory = recording.cache_directory();
++    let robot_visibility_score_alpha =
++        validate_robot_visibility_score_alpha(config.robot_visibility_score_alpha)?;
+     let (canonical_model_path, model_hash) = hash_model(&config.model_path)?;
+     let frame_end = config
+         .end_frame
+         .unwrap_or_else(|| recording.frame_count().saturating_sub(1));
+-    let proposed = ModelRunManifest::new(
++    let proposed = ModelRunManifest::new_with_robot_visibility_alpha(
+         config.label.clone(),
+         canonical_model_path,
+         model_hash,
+         recording.fingerprint().clone(),
+         config.thresholds,
++        robot_visibility_score_alpha,
+         recording.frame_count(),
+         config.start_frame..=frame_end,
+     )?;
+@@
+     manifest: &ModelRunManifest,
+     thresholds: DetectionThresholds,
+ ) -> Result<()> {
++    let robot_visibility_score_alpha =
++        validate_robot_visibility_score_alpha(manifest.robot_visibility_score_alpha)?;
+     let parent = manifest
+         .canonical_model_path
+         .parent()
+@@
+         robot_pose_detection_parameters: RobotPoseDetectionParameters {
+             maximum_intersection_over_union: thresholds.maximum_intersection_over_union,
+             minimum_candidate_confidence: thresholds.minimum_candidate_confidence,
+-            visibility_score_alpha: 0.0,
++            visibility_score_alpha: robot_visibility_score_alpha,
+         },
+         field_feature_detection_parameters: FieldFeatureDetectionParameters {
+             minimum_candidate_confidence: thresholds.minimum_candidate_confidence,
+@@
+         let config = ModelRunConfig::new("model", "model.onnx");
+         assert_eq!(config.thresholds.minimum_candidate_confidence, 0.05);
+         assert_eq!(config.thresholds.maximum_intersection_over_union, 0.4);
++        assert_eq!(config.robot_visibility_score_alpha, 0.0);
+         assert_eq!(config.cleanup_warning_after, Duration::from_secs(5));
+     }
+ 
+     #[test]
++    fn generated_parameters_include_robot_visibility_alpha() {
++        let directory = tempfile::tempdir().unwrap();
++        let thresholds = DetectionThresholds::default();
++        let manifest = ModelRunManifest::new_with_robot_visibility_alpha(
++            "model",
++            PathBuf::from("/tmp/model.onnx"),
++            [7; 32],
++            crate::cache::RecordingFingerprint {
++                canonical_path: PathBuf::from("/tmp/recording.mcap"),
++                size: 1,
++                modified_unix_nanos: 1,
++                format_version: 1,
++            },
++            thresholds,
++            1.25,
++            1,
++            0..=0,
++        )
++        .unwrap();
++        write_detection_parameters(directory.path(), &manifest, thresholds).unwrap();
++
++        let parameters: DetectionParameters =
++            serde_json::from_reader(File::open(directory.path().join("detection.json5")).unwrap())
++                .unwrap();
++        assert_eq!(
++            parameters
++                .robot_pose_detection_parameters
++                .visibility_score_alpha,
++            1.25
++        );
++    }
++
++    #[test]
++    fn generated_parameters_reject_invalid_robot_visibility_alpha() {
++        let directory = tempfile::tempdir().unwrap();
++        let mut manifest = ModelRunManifest::new(
++            "model",
++            PathBuf::from("/tmp/model.onnx"),
++            [7; 32],
++            crate::cache::RecordingFingerprint {
++                canonical_path: PathBuf::from("/tmp/recording.mcap"),
++                size: 1,
++                modified_unix_nanos: 1,
++                format_version: 1,
++            },
++            DetectionThresholds::default(),
++            1,
++            0..=0,
++        )
++        .unwrap();
++
++        for invalid in [-1.0, f32::NAN, f32::INFINITY] {
++            manifest.robot_visibility_score_alpha = invalid;
++            let error = write_detection_parameters(
++                directory.path(),
++                &manifest,
++                DetectionThresholds::default(),
++            )
++            .unwrap_err();
++            assert!(error.to_string().contains("finite and non-negative"));
++        }
++    }
++
++    #[test]
+     fn progress_target_never_precedes_cached_frames() {
+         assert_eq!(target_frame_count(100, Some(10), 80), 80);
+         assert_eq!(target_frame_count(100, Some(10), 5), 10);
+*** Update File: tools/detection_replay/src/main.rs
+@@
+         confidence: f32,
+         #[arg(long, default_value_t = 0.4)]
+         iou: f32,
++        /// Exponent applied to mean robot-keypoint visibility when scoring robot poses.
++        #[arg(
++            long,
++            default_value_t = 0.0,
++            allow_hyphen_values = true,
++            value_parser = parse_robot_visibility_alpha
++        )]
++        robot_visibility_alpha: f32,
+         /// Stop after this many frames in the selected range. Useful for provider smoke tests.
+         #[arg(long)]
+         limit: Option<usize>,
+@@
+             cache_dir,
+             confidence,
+             iou,
++            robot_visibility_alpha,
+             limit,
+             frames,
+         } => {
+@@
+                 for model in model {
+                     let mut config = ModelRunConfig::new(model.label.clone(), model.path);
+                     config.thresholds = thresholds;
++                    config.robot_visibility_score_alpha = robot_visibility_alpha;
+                     config.frame_limit = limit;
+                     config.start_frame = start_frame;
+                     config.end_frame = Some(end_frame);
+@@
+     recording.with_extension("detection-replay-cache")
+ }
+ 
++fn parse_robot_visibility_alpha(value: &str) -> std::result::Result<f32, String> {
++    let alpha = value
++        .parse::<f32>()
++        .map_err(|error| format!("invalid robot visibility alpha `{value}`: {error}"))?;
++    if !alpha.is_finite() || alpha < 0.0 {
++        return Err(format!(
++            "robot visibility alpha must be finite and non-negative, got {value}"
++        ));
++    }
++    Ok(if alpha == 0.0 { 0.0 } else { alpha })
++}
++
+ fn exit_after_webgpu(result: Result<()>) -> Result<()> {
+     #[cfg(target_os = "linux")]
+     {
+@@
+     #[cfg(not(target_os = "linux"))]
+     result
+ }
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    fn parse_prerender_alpha(value: &str) -> std::result::Result<f32, clap::Error> {
++        let arguments = Arguments::try_parse_from([
++            "detection-replay",
++            "prerender",
++            "recording.mcap",
++            "--model",
++            "candidate=model.onnx",
++            "--robot-visibility-alpha",
++            value,
++        ])?;
++        let Command::Prerender {
++            robot_visibility_alpha,
++            ..
++        } = arguments.command
++        else {
++            unreachable!();
++        };
++        Ok(robot_visibility_alpha)
++    }
++
++    #[test]
++    fn prerender_accepts_non_negative_robot_visibility_alpha() {
++        assert_eq!(parse_prerender_alpha("1.25").unwrap(), 1.25);
++        assert_eq!(
++            parse_prerender_alpha("-0").unwrap().to_bits(),
++            0.0_f32.to_bits()
++        );
++    }
++
++    #[test]
++    fn prerender_rejects_invalid_robot_visibility_alpha() {
++        for invalid in ["-1", "NaN", "inf", "-inf"] {
++            let error = parse_prerender_alpha(invalid).unwrap_err();
++            assert!(error.to_string().contains("finite and non-negative"));
++        }
++    }
++}
+*** Update File: tools/detection_replay/src/cache.rs
+@@
+ fn read_model_run_manifest(path: &Path) -> Result<ModelRunManifest> {
+     match read_bincode(path) {
+         Ok(manifest) => Ok(manifest),
+-        Err(current_error) => read_bincode::<PriorModelRunManifest>(path)
+-            .map(ModelRunManifest::from)
+-            .map_err(|prior_error| {
++        Err(current_error) => {
++            let prior = read_bincode::<PriorModelRunManifest>(path).map_err(|prior_error| {
+                 prior_error.wrap_err(format!(
+                     "also failed to decode current model run manifest: {current_error:#}"
+                 ))
+-            }),
++            })?;
++            validate_prior_model_run_identity(&prior).map_err(|prior_error| {
++                prior_error.wrap_err(format!(
++                    "failed to decode current model run manifest: {current_error:#}"
++                ))
++            })?;
++            Ok(prior.into())
++        }
+     }
+ }
+ 
+@@
+     Ok(format!("model-{}", &digest[..16]))
+ }
+ 
++fn validate_prior_model_run_identity(manifest: &PriorModelRunManifest) -> Result<()> {
++    for payload_version in [None, Some(2), Some(3)] {
++        if manifest.run_key == prior_model_run_key(manifest, payload_version)? {
++            return Ok(());
++        }
++    }
++    bail!("prior model run key does not match a pre-alpha payload identity")
++}
++
++fn prior_model_run_key(
++    manifest: &PriorModelRunManifest,
++    payload_version: Option<u32>,
++) -> Result<String> {
++    let identity = match payload_version {
++        Some(payload_version) => bincode::serialize(&(
++            &manifest.canonical_model_path,
++            &manifest.model_hash,
++            &manifest.recording_fingerprint,
++            manifest.thresholds,
++            manifest.cache_version,
++            payload_version,
++            manifest.frame_start,
++            manifest.frame_end,
++            manifest.total_frame_count,
++        )),
++        None => bincode::serialize(&(
++            &manifest.canonical_model_path,
++            &manifest.model_hash,
++            &manifest.recording_fingerprint,
++            manifest.thresholds,
++            manifest.cache_version,
++            manifest.frame_start,
++            manifest.frame_end,
++            manifest.total_frame_count,
++        )),
++    }
++    .wrap_err("failed to serialize prior model run identity")?;
++    let digest = blake3::hash(&identity).to_hex().to_string();
++    Ok(format!("model-{}", &digest[..16]))
++}
++
+ fn validate_same_run(existing: &ModelRunManifest, proposed: &ModelRunManifest) -> Result<()> {
+     if existing.run_key != proposed.run_key
+         || existing.canonical_model_path != proposed.canonical_model_path
+@@
+     }
+ 
+     #[test]
++    fn truncated_current_manifest_is_not_treated_as_prior_schema() {
++        let directory = tempfile::tempdir().unwrap();
++        let path = directory.path().join(MANIFEST_FILE);
++        let manifest = ModelRunManifest::new_with_robot_visibility_alpha(
++            "current",
++            PathBuf::from("/tmp/model.onnx"),
++            [7; 32],
++            fingerprint(),
++            DetectionThresholds::default(),
++            1.0,
++            1,
++            0..=0,
++        )
++        .unwrap();
++        write_bincode_atomic(&path, &manifest).unwrap();
++        let length = path.metadata().unwrap().len();
++        OpenOptions::new()
++            .write(true)
++            .open(&path)
++            .unwrap()
++            .set_len(length - std::mem::size_of::<f32>() as u64)
++            .unwrap();
++
++        let error = read_model_run_manifest(&path).unwrap_err();
++        assert!(format!("{error:#}").contains("pre-alpha payload identity"));
++    }
++
++    #[test]
+     fn chunks_resume_and_distinguish_empty_from_absent() {
+         let cache = tempfile::tempdir().unwrap();
+         let mut store = PredictionStore::open(cache.path(), manifest(130)).unwrap();
+*** End Patch
+

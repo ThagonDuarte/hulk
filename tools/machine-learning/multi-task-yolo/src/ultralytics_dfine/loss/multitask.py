@@ -307,10 +307,88 @@ class FieldFeatureCriterion(nn.Module):
         )
         self.num_classes = num_classes
         self.matcher = matcher or PointHungarianMatcher()
+        self.classification_mode = settings.classification_mode
         self.alpha = settings.focal_alpha
         self.gamma = settings.focal_gamma
         self.class_weight = settings.class_weight
         self.point_weight = settings.point_weight
+        self.quality_sigma = settings.quality_sigma
+        self.area_normalized_weight = settings.area_normalized_weight
+        self.area_normalized_beta = settings.area_normalized_beta
+        self.area_scale_floor = settings.area_scale_floor
+        self.area_scale_cap = settings.area_scale_cap
+
+    def _matched_target_boxes(
+        self,
+        targets: list[Target],
+        matches: list[Match],
+        source_indices: Tensor,
+        device: torch.device,
+    ) -> Tensor | None:
+        needs_boxes = (
+            self.classification_mode == "strict_quality"
+            or self.area_normalized_weight > 0
+        )
+        if source_indices.numel() == 0 or not needs_boxes:
+            return None
+        try:
+            return torch.cat(
+                [
+                    target["boxes"][target_indices]
+                    for target, (_, target_indices) in zip(
+                        targets,
+                        matches,
+                        strict=True,
+                    )
+                ]
+            ).to(device)
+        except KeyError as error:
+            loss_name = (
+                "Strict field quality"
+                if self.classification_mode == "strict_quality"
+                else "Area-normalized field point loss"
+            )
+            raise ValueError(f"{loss_name} requires target boxes") from error
+
+    def _area_normalized_loss(
+        self,
+        points: Tensor,
+        target_points: Tensor,
+        target_boxes: Tensor | None,
+        batch_indices: Tensor,
+        source_indices: Tensor,
+        normalizer: Tensor,
+    ) -> Tensor | None:
+        if self.area_normalized_weight == 0:
+            return None
+        if source_indices.numel() == 0:
+            return points.sum() * 0
+        if target_boxes is None:
+            raise RuntimeError("Matched field boxes are missing")
+        scale = (
+            target_boxes[:, 2:4]
+            .clamp_min(0)
+            .prod(dim=-1)
+            .sqrt()
+            .clamp(
+                min=self.area_scale_floor,
+                max=self.area_scale_cap,
+            )
+            .to(dtype=points.dtype)
+        )
+        normalized_error = (
+            points[batch_indices, source_indices] - target_points
+        ) / scale[:, None]
+        return (
+            functional.smooth_l1_loss(
+                normalized_error,
+                torch.zeros_like(normalized_error),
+                beta=self.area_normalized_beta,
+                reduction="sum",
+            )
+            / normalizer
+            * self.area_normalized_weight
+        )
 
     def forward(
         self,
@@ -342,11 +420,30 @@ class FieldFeatureCriterion(nn.Module):
                 )
             ]
         ).to(points.device)
+        target_boxes = self._matched_target_boxes(
+            targets,
+            matches,
+            source_indices,
+            points.device,
+        )
         if source_indices.numel() > 0:
             class_targets = torch.ones_like(
                 matched_labels,
                 dtype=logits.dtype,
             )
+            if self.classification_mode == "strict_quality":
+                if target_boxes is None:
+                    raise RuntimeError("Matched field boxes are missing")
+                squared_distance = (
+                    (points[batch_indices, source_indices] - target_points)
+                    .square()
+                    .sum(-1)
+                )
+                area = (target_boxes[:, 2] * target_boxes[:, 3]).clamp(min=1e-8)
+                denominator = 2 * area * self.quality_sigma * self.quality_sigma
+                class_targets = torch.exp(
+                    -squared_distance / denominator
+                ).detach()
             target_classes[
                 batch_indices,
                 source_indices,
@@ -359,10 +456,13 @@ class FieldFeatureCriterion(nn.Module):
             reduction="none",
         )
         modulation = (target_classes - probability).abs().pow(self.gamma)
-        alpha = self.alpha * target_classes + (1 - self.alpha) * (
-            1 - target_classes
-        )
-        weighted_class_loss = cross_entropy * modulation * alpha
+        if self.classification_mode == "strict_quality":
+            weighted_class_loss = cross_entropy * modulation
+        else:
+            alpha = self.alpha * target_classes + (1 - self.alpha) * (
+                1 - target_classes
+            )
+            weighted_class_loss = cross_entropy * modulation * alpha
         normalizer = _normalized_count(
             torch.tensor(matched_labels.numel(), device=logits.device),
             logits.device,
@@ -380,10 +480,21 @@ class FieldFeatureCriterion(nn.Module):
                 )
                 / normalizer
             )
-        return {
+        losses = {
             "field_class": class_loss * self.class_weight,
             "field_point": point_loss * self.point_weight,
-        }, matches
+        }
+        area_normalized_loss = self._area_normalized_loss(
+            points,
+            target_points,
+            target_boxes,
+            batch_indices,
+            source_indices,
+            normalizer,
+        )
+        if area_normalized_loss is not None:
+            losses["field_point_area_normalized"] = area_normalized_loss
+        return losses, matches
 
 
 class MultiTaskCriterion(nn.Module):
@@ -416,6 +527,18 @@ class MultiTaskCriterion(nn.Module):
             len(FIELD_FEATURE_SCHEMA.class_names),
             config=self.loss_config.field_features,
         )
+        self.person_batch_robot_visibility_negative_weight = (
+            self.loss_config.person_batch_robot_visibility_weight
+        )
+        self.robot_batch_person_visibility_negative_weight = (
+            self.loss_config.robot_batch_person_visibility_weight
+        )
+        self.person_batch_robot_detector_negative_weight = (
+            self.loss_config.person_batch_robot_detector_weight
+        )
+        self.robot_batch_person_detector_negative_weight = (
+            self.loss_config.robot_batch_person_detector_weight
+        )
 
     @staticmethod
     def _head(
@@ -436,6 +559,121 @@ class MultiTaskCriterion(nn.Module):
         zero = torch.stack([value.sum() * 0 for value in output.values()]).sum()
         return {f"{prefix}_inactive": zero}
 
+    def _cross_pose_visibility_negative(
+        self,
+        output: dict[str, Tensor],
+        eligible: Tensor,
+        weight: float,
+    ) -> Tensor:
+        logits = output["pred_visibility"]
+        if eligible.shape != (logits.shape[0],):
+            raise ValueError(
+                "Person-negative eligibility must match the batch size"
+            )
+        per_record = (
+            functional.binary_cross_entropy_with_logits(
+                logits,
+                torch.zeros_like(logits),
+                reduction="none",
+            )
+            .flatten(1)
+            .mean(1)
+        )
+        denominator = _normalized_count(
+            eligible.sum(),
+            logits.device,
+        )
+        return per_record[eligible].sum() * weight / denominator
+
+    @staticmethod
+    def _negative_eligibility(
+        targets: list[Target],
+        device: torch.device,
+        *,
+        key: str,
+        description: str,
+    ) -> Tensor:
+        values = []
+        for target in targets:
+            value = target.get(key)
+            if not isinstance(value, bool):
+                raise TypeError(
+                    f"{description} targets require boolean eligibility"
+                )
+            values.append(value)
+        return torch.tensor(values, dtype=torch.bool, device=device)
+
+    def _detection_targets(
+        self,
+        targets: list[Target],
+        active_head: HeadId,
+    ) -> list[Target]:
+        """Weight only the opposite pose class as a detector negative."""
+        if active_head not in {
+            HeadId.PERSON_POSE,
+            HeadId.ROBOT_POSE,
+        }:
+            return targets
+        weight = (
+            self.person_batch_robot_detector_negative_weight
+            if active_head == HeadId.PERSON_POSE
+            else self.robot_batch_person_detector_negative_weight
+        )
+        if weight == 0:
+            return targets
+        eligibility_key = (
+            "robot_negative_eligible"
+            if active_head == HeadId.PERSON_POSE
+            else "person_negative_eligible"
+        )
+        eligibility_description = (
+            "Person-to-Robot negative"
+            if active_head == HeadId.PERSON_POSE
+            else "Robot-to-Person negative"
+        )
+        negative_class = (
+            self.robot_class_id
+            if active_head == HeadId.PERSON_POSE
+            else self.person_class_id
+        )
+        weighted_targets = []
+        changed = False
+        for target in targets:
+            eligibility = target.get(eligibility_key)
+            if not isinstance(eligibility, bool):
+                raise TypeError(
+                    f"{eligibility_description} targets require boolean "
+                    "eligibility"
+                )
+            if not eligibility:
+                weighted_targets.append(target)
+                continue
+            valid = target.get("valid_detection_classes")
+            class_weights = (
+                torch.ones(
+                    self.detection.num_classes,
+                    dtype=torch.float32,
+                    device=target["labels"].device,
+                )
+                if valid is None
+                else valid.to(dtype=torch.float32).clone()
+            )
+            if class_weights.shape != (self.detection.num_classes,):
+                raise ValueError(
+                    "valid_detection_classes must match D-FINE logits"
+                )
+            if (target["labels"] == negative_class).any():
+                raise ValueError(
+                    "Cross-pose detector negatives cannot mask a positive "
+                    "target"
+                )
+            class_weights[negative_class] = weight
+            weighted_target = dict(target)
+            weighted_target["detection_class_loss_weights"] = class_weights
+            weighted_targets.append(weighted_target)
+            changed = True
+        return weighted_targets if changed else targets
+
     def forward(
         self,
         outputs: dict[str, dict[str, object]],
@@ -443,9 +681,10 @@ class MultiTaskCriterion(nn.Module):
         active_head: HeadId,
     ) -> CriterionResult:
         detection_output = outputs[str(HeadId.OBJECT)]
+        detection_targets = self._detection_targets(targets, active_head)
         detection = self.detection.forward_with_matches(
             detection_output,
-            targets,
+            detection_targets,
         )
         losses = dict(detection.losses)
 
@@ -458,6 +697,20 @@ class MultiTaskCriterion(nn.Module):
                     detection.final_matches,
                 ).to_dict("person")
             )
+            if self.person_batch_robot_visibility_negative_weight > 0:
+                robot_output = self._head(outputs, HeadId.ROBOT_POSE)
+                losses["robot_cross_visibility_negative"] = (
+                    self._cross_pose_visibility_negative(
+                        robot_output,
+                        self._negative_eligibility(
+                            targets,
+                            robot_output["pred_visibility"].device,
+                            key="robot_negative_eligible",
+                            description="Person-to-Robot negative",
+                        ),
+                        self.person_batch_robot_visibility_negative_weight,
+                    )
+                )
 
         if active_head == HeadId.ROBOT_POSE:
             robot_output = self._head(outputs, HeadId.ROBOT_POSE)
@@ -468,6 +721,20 @@ class MultiTaskCriterion(nn.Module):
                     detection.final_matches,
                 ).to_dict("robot")
             )
+            if self.robot_batch_person_visibility_negative_weight > 0:
+                person_output = self._head(outputs, HeadId.PERSON_POSE)
+                losses["person_cross_visibility_negative"] = (
+                    self._cross_pose_visibility_negative(
+                        person_output,
+                        self._negative_eligibility(
+                            targets,
+                            person_output["pred_visibility"].device,
+                            key="person_negative_eligible",
+                            description="Robot-to-Person negative",
+                        ),
+                        self.robot_batch_person_visibility_negative_weight,
+                    )
+                )
 
         if active_head == HeadId.FIELD_FEATURES:
             field_output = self._head(outputs, HeadId.FIELD_FEATURES)

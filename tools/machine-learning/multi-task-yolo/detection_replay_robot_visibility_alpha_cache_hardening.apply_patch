@@ -1,0 +1,111 @@
+*** Begin Patch
+*** Update File: tools/detection_replay/src/cache.rs
+@@
+ fn read_model_run_manifest(path: &Path) -> Result<ModelRunManifest> {
+     match read_bincode(path) {
+         Ok(manifest) => Ok(manifest),
+-        Err(current_error) => read_bincode::<PriorModelRunManifest>(path)
+-            .map(ModelRunManifest::from)
+-            .map_err(|prior_error| {
++        Err(current_error) => {
++            let prior = read_bincode::<PriorModelRunManifest>(path).map_err(|prior_error| {
+                 prior_error.wrap_err(format!(
+                     "also failed to decode current model run manifest: {current_error:#}"
+                 ))
+-            }),
++            })?;
++            validate_prior_model_run_identity(&prior).map_err(|prior_error| {
++                prior_error.wrap_err(format!(
++                    "failed to decode current model run manifest: {current_error:#}"
++                ))
++            })?;
++            Ok(prior.into())
++        }
+     }
+ }
+ 
+@@
+     Ok(format!("model-{}", &digest[..16]))
+ }
+ 
++fn validate_prior_model_run_identity(manifest: &PriorModelRunManifest) -> Result<()> {
++    for payload_version in [None, Some(2), Some(3)] {
++        if manifest.run_key == prior_model_run_key(manifest, payload_version)? {
++            return Ok(());
++        }
++    }
++    bail!("prior model run key does not match a pre-alpha payload identity")
++}
++
++fn prior_model_run_key(
++    manifest: &PriorModelRunManifest,
++    payload_version: Option<u32>,
++) -> Result<String> {
++    let identity = match payload_version {
++        Some(payload_version) => bincode::serialize(&(
++            &manifest.canonical_model_path,
++            &manifest.model_hash,
++            &manifest.recording_fingerprint,
++            manifest.thresholds,
++            manifest.cache_version,
++            payload_version,
++            manifest.frame_start,
++            manifest.frame_end,
++            manifest.total_frame_count,
++        )),
++        None => bincode::serialize(&(
++            &manifest.canonical_model_path,
++            &manifest.model_hash,
++            &manifest.recording_fingerprint,
++            manifest.thresholds,
++            manifest.cache_version,
++            manifest.frame_start,
++            manifest.frame_end,
++            manifest.total_frame_count,
++        )),
++    }
++    .wrap_err("failed to serialize prior model run identity")?;
++    let digest = blake3::hash(&identity).to_hex().to_string();
++    Ok(format!("model-{}", &digest[..16]))
++}
++
+ fn validate_same_run(existing: &ModelRunManifest, proposed: &ModelRunManifest) -> Result<()> {
+     if existing.run_key != proposed.run_key
+         || existing.canonical_model_path != proposed.canonical_model_path
+@@
+     }
+ 
+     #[test]
++    fn truncated_current_manifest_is_not_treated_as_prior_schema() {
++        let directory = tempfile::tempdir().unwrap();
++        let path = directory.path().join(MANIFEST_FILE);
++        let manifest = ModelRunManifest::new_with_robot_visibility_alpha(
++            "current",
++            PathBuf::from("/tmp/model.onnx"),
++            [7; 32],
++            fingerprint(),
++            DetectionThresholds::default(),
++            1.0,
++            1,
++            0..=0,
++        )
++        .unwrap();
++        write_bincode_atomic(&path, &manifest).unwrap();
++        let length = path.metadata().unwrap().len();
++        OpenOptions::new()
++            .write(true)
++            .open(&path)
++            .unwrap()
++            .set_len(length - std::mem::size_of::<f32>() as u64)
++            .unwrap();
++
++        let error = read_model_run_manifest(&path).unwrap_err();
++        assert!(format!("{error:#}").contains("pre-alpha payload identity"));
++    }
++
++    #[test]
+     fn chunks_resume_and_distinguish_empty_from_absent() {
+         let cache = tempfile::tempdir().unwrap();
+         let mut store = PredictionStore::open(cache.path(), manifest(130)).unwrap();
+*** End Patch
+

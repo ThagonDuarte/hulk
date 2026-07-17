@@ -1,0 +1,247 @@
+diff --git a/crates/types/src/parameters.rs b/crates/types/src/parameters.rs
+--- a/crates/types/src/parameters.rs
++++ b/crates/types/src/parameters.rs
+@@ -349,7 +349,7 @@ pub struct DetectionParameters {
+     pub model_name: String,
+     pub object_detection_parameters: ObjectDetectionParameters,
+     pub pose_detection_parameters: PoseDetectionParameters,
+-    pub robot_pose_detection_parameters: PoseDetectionParameters,
++    pub robot_pose_detection_parameters: RobotPoseDetectionParameters,
+     pub field_feature_detection_parameters: FieldFeatureDetectionParameters,
+ }
+ 
+@@ -365,6 +365,14 @@ pub struct PoseDetectionParameters {
+     pub minimum_candidate_confidence: f32,
+ }
+ 
++#[derive(Clone, Debug, Default, Deserialize, Serialize, ros_z::Message)]
++pub struct RobotPoseDetectionParameters {
++    pub maximum_intersection_over_union: f32,
++    pub minimum_candidate_confidence: f32,
++    #[serde(default)]
++    pub visibility_score_alpha: f32,
++}
++
+ #[derive(Clone, Debug, Default, Deserialize, Serialize, ros_z::Message)]
+ pub struct FieldFeatureDetectionParameters {
+     pub minimum_candidate_confidence: f32,
+diff --git a/etc/parameters/base/detection.json5 b/etc/parameters/base/detection.json5
+--- a/etc/parameters/base/detection.json5
++++ b/etc/parameters/base/detection.json5
+@@ -13,6 +13,7 @@
+   robot_pose_detection_parameters: {
+     maximum_intersection_over_union: 0.5,
+     minimum_candidate_confidence: 0.5,
++    visibility_score_alpha: 0.0,
+   },
+   field_feature_detection_parameters: {
+     minimum_candidate_confidence: 0.35,
+diff --git a/tools/detection_replay/src/runner.rs b/tools/detection_replay/src/runner.rs
+--- a/tools/detection_replay/src/runner.rs
++++ b/tools/detection_replay/src/runner.rs
+@@ -19,6 +19,6 @@ use types::{
+     parameters::{
+         DetectionParameters, FieldFeatureDetectionParameters, ObjectDetectionParameters,
+-        PoseDetectionParameters,
++        PoseDetectionParameters, RobotPoseDetectionParameters,
+     },
+     pose_detection::{FieldFeatureDetection, Pose, RobotPoseDetection},
+     time_wrapper::TimeWrapper,
+@@ -556,9 +556,10 @@ fn write_detection_parameters(
+             maximum_intersection_over_union: thresholds.maximum_intersection_over_union,
+             minimum_candidate_confidence: thresholds.minimum_candidate_confidence,
+         },
+-        robot_pose_detection_parameters: PoseDetectionParameters {
++        robot_pose_detection_parameters: RobotPoseDetectionParameters {
+             maximum_intersection_over_union: thresholds.maximum_intersection_over_union,
+             minimum_candidate_confidence: thresholds.minimum_candidate_confidence,
++            visibility_score_alpha: 0.0,
+         },
+         field_feature_detection_parameters: FieldFeatureDetectionParameters {
+             minimum_candidate_confidence: thresholds.minimum_candidate_confidence,
+diff --git a/crates/nodes/detection/src/lib.rs b/crates/nodes/detection/src/lib.rs
+--- a/crates/nodes/detection/src/lib.rs
++++ b/crates/nodes/detection/src/lib.rs
+@@ -236,6 +236,9 @@ async fn run(
+                 parameters
+                     .robot_pose_detection_parameters
+                     .minimum_candidate_confidence,
++                parameters
++                    .robot_pose_detection_parameters
++                    .visibility_score_alpha,
+             )?;
+             let detected_field_features = extract_field_feature_detections(
+                 &outputs,
+@@ -562,41 +565,72 @@ fn extract_candidate_pose_detections(
+ fn extract_robot_pose_detections(
+     outputs: &ModelOutputs,
+     confidence_threshold: f32,
++    visibility_score_alpha: f32,
+ ) -> Result<Vec<RobotPoseDetection>> {
++    if !visibility_score_alpha.is_finite() || visibility_score_alpha < 0.0 {
++        bail!("robot pose visibility score alpha must be finite and non-negative");
++    }
+     let Some(robot_poses) = &outputs.robot_poses else {
+         return Ok(Vec::new());
+     };
++
++    fn calibrated_confidence(
++        object_confidence: f32,
++        keypoint_rows: &ArrayView2<f32>,
++        visibility_score_alpha: f32,
++    ) -> Option<f32> {
++        if !object_confidence.is_finite() {
++            return None;
++        }
++        if visibility_score_alpha == 0.0 {
++            return Some(object_confidence);
++        }
++        let mut visibility_sum = 0.0;
++        for keypoint in keypoint_rows.axis_iter(Axis(0)) {
++            let visibility = keypoint[2];
++            if !visibility.is_finite() || !(0.0..=1.0).contains(&visibility) {
++                return None;
++            }
++            visibility_sum += visibility;
++        }
++        let keypoint_count = keypoint_rows.len_of(Axis(0));
++        if keypoint_count == 0 {
++            return None;
++        }
++        let mean_visibility = visibility_sum / keypoint_count as f32;
++        let confidence = object_confidence * mean_visibility.powf(visibility_score_alpha);
++        confidence.is_finite().then_some(confidence)
++    }
+ 
+     outputs
+         .objects
+         .axis_iter(Axis(0))
+         .zip(robot_poses.axis_iter(Axis(0)))
+         .filter_map(|(object_row, keypoint_rows)| {
+-            let confidence = object_row[4];
+             let class_index = object_row[5] as usize;
+-            if !confidence.is_finite()
+-                || confidence < confidence_threshold
+-                || class_index != RobocupObjectLabel::Robot as usize
+-            {
++            if class_index != RobocupObjectLabel::Robot as usize {
+                 return None;
+             }
+-            Some((object_row, keypoint_rows))
++            let confidence =
++                calibrated_confidence(object_row[4], &keypoint_rows, visibility_score_alpha)?;
++            (confidence >= confidence_threshold).then_some((object_row, keypoint_rows, confidence))
+         })
+-        .map(|(object_row, keypoint_rows)| {
+-            let object_values: [f32; NUMBER_OF_VALUES_PER_OBJECT] = object_row
++        .map(|(object_row, keypoint_rows, confidence)| {
++            let mut object_values: [f32; NUMBER_OF_VALUES_PER_OBJECT] = object_row
+                 .as_slice()
+                 .expect("slice is not contiguous")
+                 .try_into()
+                 .expect("object row has invalid length");
++            object_values[4] = confidence;
+             let keypoint_values: [f32; 42] = keypoint_rows
+                 .as_slice()
+                 .expect("slice is not contiguous")
+                 .try_into()
+                 .expect("robot keypoints have invalid length");
+             Ok(RobotPoseDetection {
+                 object: Object::from(object_values),
+                 keypoints: RobotKeypoints::from(&keypoint_values),
+             })
+         })
+         .collect()
+ }
+@@ -707,6 +741,6 @@ mod tests {
+         assert!(poses.is_empty());
+         assert!(
+-            extract_robot_pose_detections(&outputs, 0.0)
++            extract_robot_pose_detections(&outputs, 0.0, 0.0)
+                 .unwrap()
+                 .is_empty()
+         );
+@@ -890,6 +924,83 @@ mod tests {
+         assert_eq!(detections[0].label, FieldFeatureLabel::TSpot);
+     }
+ 
++    #[test]
++    fn robot_pose_alpha_zero_preserves_legacy_confidence() {
++        let mut objects = Array2::zeros((NUMBER_OF_DETECTIONS, NUMBER_OF_VALUES_PER_OBJECT));
++        objects[[0, 4]] = 0.8;
++        objects[[0, 5]] = RobocupObjectLabel::Robot as usize as f32;
++        let robot_poses = Array3::zeros((NUMBER_OF_DETECTIONS, 14, 3));
++        let outputs = ModelOutputs {
++            objects: objects.view(),
++            poses: None,
++            robot_poses: Some(robot_poses.view()),
++            field_features: None,
++        };
++
++        let legacy = extract_robot_pose_detections(&outputs, 0.5, 0.0).unwrap();
++        let calibrated = extract_robot_pose_detections(&outputs, 0.5, 1.0).unwrap();
++
++        assert_eq!(legacy.len(), 1);
++        assert_eq!(legacy[0].object.bounding_box.confidence, 0.8);
++        assert!(calibrated.is_empty());
++    }
++
++    #[test]
++    fn robot_pose_calibration_changes_only_pose_threshold_and_nms() {
++        let mut objects = Array2::zeros((NUMBER_OF_DETECTIONS, NUMBER_OF_VALUES_PER_OBJECT));
++        for index in 0..2 {
++            objects[[index, 0]] = 0.0;
++            objects[[index, 1]] = 0.0;
++            objects[[index, 2]] = 10.0;
++            objects[[index, 3]] = 10.0;
++            objects[[index, 5]] = RobocupObjectLabel::Robot as usize as f32;
++        }
++        objects[[0, 4]] = 0.9;
++        objects[[1, 4]] = 0.8;
++        let mut robot_poses = Array3::zeros((NUMBER_OF_DETECTIONS, 14, 3));
++        for keypoint in 0..14 {
++            robot_poses[[0, keypoint, 2]] = 0.1;
++            robot_poses[[1, keypoint, 2]] = 1.0;
++        }
++        let outputs = ModelOutputs {
++            objects: objects.view(),
++            poses: None,
++            robot_poses: Some(robot_poses.view()),
++            field_features: None,
++        };
++
++        let detected_objects = non_maximum_suppression(
++            extract_candidate_object_detections(&outputs, 0.5).unwrap(),
++            0.5,
++        );
++        let detected_robot_poses = non_maximum_suppression(
++            extract_robot_pose_detections(&outputs, 0.0, 1.0).unwrap(),
++            0.5,
++        );
++
++        assert_eq!(detected_objects.len(), 1);
++        assert_eq!(detected_robot_poses.len(), 1);
++        assert_eq!(detected_objects[0].bounding_box.confidence, 0.9);
++        assert_eq!(detected_robot_poses[0].object.bounding_box.confidence, 0.8);
++    }
++
++    #[test]
++    fn robot_pose_visibility_alpha_must_be_valid() {
++        let objects = Array2::zeros((NUMBER_OF_DETECTIONS, NUMBER_OF_VALUES_PER_OBJECT));
++        let robot_poses = Array3::zeros((NUMBER_OF_DETECTIONS, 14, 3));
++        let outputs = ModelOutputs {
++            objects: objects.view(),
++            poses: None,
++            robot_poses: Some(robot_poses.view()),
++            field_features: None,
++        };
++
++        for alpha in [-1.0, f32::NAN, f32::INFINITY] {
++            let error = extract_robot_pose_detections(&outputs, 0.0, alpha).unwrap_err();
++            assert!(error.to_string().contains("visibility score alpha"));
++        }
++    }
++
+     #[test]
+     fn field_feature_suppression_keeps_distinct_classes_and_best_duplicate() {
+         let detections = vec![

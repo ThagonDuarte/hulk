@@ -63,16 +63,21 @@ class DFINEExporter:
             device=torch_device,
         )
         output_names = ["boxes", "logits"] if mode == "raw" else ["detections"]
-        torch.onnx.export(
-            wrapper,
-            (example,),
-            destination,
-            input_names=["images"],
-            output_names=output_names,
-            opset_version=opset,
-            external_data=False,
-            dynamo=False,
-        )
+        mha_fastpath = torch.backends.mha.get_fastpath_enabled()
+        torch.backends.mha.set_fastpath_enabled(False)
+        try:
+            torch.onnx.export(
+                wrapper,
+                (example,),
+                destination,
+                input_names=["images"],
+                output_names=output_names,
+                opset_version=opset,
+                external_data=False,
+                dynamo=False,
+            )
+        finally:
+            torch.backends.mha.set_fastpath_enabled(mha_fastpath)
         metadata = build_manifest(
             self.model.architecture,
             self.model.names,

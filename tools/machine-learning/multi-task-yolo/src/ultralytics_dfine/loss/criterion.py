@@ -203,7 +203,31 @@ class DFINECriterion(nn.Module):
         )
         if valid_classes.shape != (logits.shape[0], self.num_classes):
             raise ValueError("valid_detection_classes must match D-FINE logits")
-        loss = loss * valid_classes[:, None, :]
+        if any("detection_class_loss_weights" in target for target in targets):
+            class_weights = []
+            for target, valid in zip(targets, valid_classes, strict=True):
+                raw_weights = target.get("detection_class_loss_weights")
+                weights = (
+                    valid.to(dtype=logits.dtype)
+                    if raw_weights is None
+                    else raw_weights.to(
+                        device=logits.device,
+                        dtype=logits.dtype,
+                    )
+                )
+                if weights.shape != (self.num_classes,):
+                    raise ValueError(
+                        "detection_class_loss_weights must match D-FINE logits"
+                    )
+                if not torch.isfinite(weights).all() or (weights < 0).any():
+                    raise ValueError(
+                        "detection_class_loss_weights must be finite and "
+                        "non-negative"
+                    )
+                class_weights.append(weights)
+            loss = loss * torch.stack(class_weights)[:, None, :]
+        else:
+            loss = loss * valid_classes[:, None, :]
         loss = loss.mean(1).sum() * logits.shape[1] / num_boxes
         return {"loss_vfl": loss}
 

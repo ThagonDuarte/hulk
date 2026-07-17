@@ -449,7 +449,9 @@ def _merge_shards(output_dir: Path, world_size: int) -> None:
 )
 @click.option(
     "--coco-robot-negative-role",
-    type=click.Choice(["primary_evaluation", "stress_evaluation"]),
+    type=click.Choice(
+        ["train_negative", "primary_evaluation", "stress_evaluation"]
+    ),
     default="primary_evaluation",
     show_default=True,
 )
@@ -473,6 +475,7 @@ def _merge_shards(output_dir: Path, world_size: int) -> None:
     "--dhrp-person-negative-role",
     type=click.Choice(
         [
+            "train_negative",
             "primary_evaluation",
             "stress_evaluation",
             "loss_holdout_validation",

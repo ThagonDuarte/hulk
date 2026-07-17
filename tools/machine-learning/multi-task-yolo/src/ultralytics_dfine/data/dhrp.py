@@ -31,6 +31,7 @@ DHRP_MIN_BOX_SIZE = 1.0
 DHRP_PERSON_NEGATIVE_MANIFEST_VERSION = 1
 DHRP_PERSON_NEGATIVE_ROLES = frozenset(
     {
+        "train_negative",
         "primary_evaluation",
         "stress_evaluation",
         "loss_holdout_validation",
@@ -474,7 +475,7 @@ def load_dhrp_records(
     box_padding: float = DHRP_BOX_PADDING,
     minimum_box_size: float = DHRP_MIN_BOX_SIZE,
     person_negative_manifest: str | Path | None = None,
-    person_negative_roles: Sequence[str] = ("primary_evaluation",),
+    person_negative_roles: Sequence[str] = ("train_negative",),
 ) -> tuple[DHRPRecord, ...]:
     """Parse one or more native DHRP train/eval annotation files."""
     if class_id < 0:
@@ -548,7 +549,7 @@ class DHRPDataset(Dataset[tuple[Tensor, DHRPTarget]]):
         horizontal_flip_probability: float = 0.5,
         training: bool = False,
         person_negative_manifest: str | Path | None = None,
-        person_negative_roles: Sequence[str] = ("primary_evaluation",),
+        person_negative_roles: Sequence[str] = ("train_negative",),
     ) -> None:
         self.records = load_dhrp_records(
             root,

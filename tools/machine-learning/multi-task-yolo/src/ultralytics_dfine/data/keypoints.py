@@ -15,6 +15,8 @@ import torchvision.transforms.v2.functional as transform_functional
 from PIL import Image
 from torch import Tensor
 from torch.utils.data import Dataset
+from torchvision.transforms import InterpolationMode
+from torchvision.tv_tensors import BoundingBoxFormat
 
 from ultralytics_dfine.data.dataset import (
     DatasetDefinition,
@@ -32,7 +34,7 @@ ROBOT_NEGATIVE_POPULATION_DIGEST_ALGORITHM = (
     r"ordered(relative_path + \0 + image_sha256 + \n))"
 )
 ROBOT_NEGATIVE_ROLES = frozenset(
-    {"primary_evaluation", "stress_evaluation"}
+    {"train_negative", "primary_evaluation", "stress_evaluation"}
 )
 
 
@@ -291,11 +293,11 @@ class YOLOKeypointDataset(Dataset[tuple[Tensor, DatasetTarget]]):
         num_detection_classes: int = 8,
         image_size: int | tuple[int, int] = 640,
         horizontal_flip_probability: float = 0.5,
-        augmentation_profile: Literal["basic"] = "basic",
+        augmentation_profile: Literal["basic", "field-v1"] = "basic",
         point_set: bool = False,
         point_label_ids: tuple[int, ...] | None = None,
         robot_negative_manifest: str | Path | None = None,
-        robot_negative_roles: Sequence[str] = ("primary_evaluation",),
+        robot_negative_roles: Sequence[str] = ("train_negative",),
     ) -> None:
         self.definition = (
             data
@@ -328,7 +330,7 @@ class YOLOKeypointDataset(Dataset[tuple[Tensor, DatasetTarget]]):
         if not 0 <= horizontal_flip_probability <= 1:
             raise ValueError("horizontal_flip_probability must be in [0, 1]")
         self.horizontal_flip_probability = horizontal_flip_probability
-        if augmentation_profile != "basic":
+        if augmentation_profile not in {"basic", "field-v1"}:
             raise ValueError("Unsupported keypoint augmentation profile")
         self.augmentation_profile = augmentation_profile
         self.point_set = point_set
@@ -337,6 +339,8 @@ class YOLOKeypointDataset(Dataset[tuple[Tensor, DatasetTarget]]):
             global_class_ids
         ):
             raise ValueError("Point label mapping and classes must match")
+        if augmentation_profile == "field-v1" and not point_set:
+            raise ValueError("field-v1 augmentation requires a point set")
         self.split = split
         sources = getattr(self.definition, split)
         if not sources:
@@ -555,6 +559,92 @@ class YOLOKeypointDataset(Dataset[tuple[Tensor, DatasetTarget]]):
             else torch.empty((0, self.keypoint_count, 3)),
         )
 
+    @staticmethod
+    def _photometric_distortion(image: Tensor) -> Tensor:
+        image = transform_functional.adjust_brightness(
+            image,
+            random.uniform(0.8, 1.2),
+        )
+        image = transform_functional.adjust_contrast(
+            image,
+            random.uniform(0.8, 1.2),
+        )
+        image = transform_functional.adjust_saturation(
+            image,
+            random.uniform(0.8, 1.2),
+        )
+        return transform_functional.adjust_hue(
+            image,
+            random.uniform(-0.05, 0.05),
+        )
+
+    @staticmethod
+    def _field_affine(
+        image: Tensor,
+        local_labels: Tensor,
+        boxes: Tensor,
+        keypoints: Tensor,
+    ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+        height, width = image.shape[-2:]
+        angle = random.uniform(-5, 5)
+        translate = [
+            random.uniform(-0.08, 0.08) * width,
+            random.uniform(-0.08, 0.08) * height,
+        ]
+        scale = random.uniform(0.85, 1.15)
+        shear = [random.uniform(-2, 2), random.uniform(-2, 2)]
+        image = transform_functional.affine(
+            image,
+            angle,
+            translate,
+            scale,
+            shear,
+            interpolation=InterpolationMode.BILINEAR,
+            fill=[0.0],
+        )
+        if boxes.numel() == 0:
+            return image, local_labels, boxes, keypoints
+        box_scale = boxes.new_tensor([width, height, width, height])
+        pixel_boxes = transform_functional.affine_bounding_boxes(
+            boxes * box_scale,
+            BoundingBoxFormat.CXCYWH,
+            (height, width),
+            angle,
+            translate,
+            scale,
+            shear,
+            clamping_mode="hard",
+        )
+        pixel_points = keypoints[..., :2] * keypoints.new_tensor(
+            [width, height]
+        )
+        pixel_points, _ = transform_functional.affine_keypoints(
+            pixel_points,
+            (height, width),
+            angle,
+            translate,
+            scale,
+            shear,
+        )
+        point_in_frame = (
+            (pixel_points[..., 0] >= 0)
+            & (pixel_points[..., 0] < width)
+            & (pixel_points[..., 1] >= 0)
+            & (pixel_points[..., 1] < height)
+        ).all(dim=1)
+        box_is_valid = (pixel_boxes[:, 2:] >= 1).all(dim=1)
+        keep = point_in_frame & box_is_valid
+        transformed_keypoints = keypoints.clone()
+        transformed_keypoints[..., :2] = pixel_points / keypoints.new_tensor(
+            [width, height]
+        )
+        return (
+            image,
+            local_labels[keep],
+            pixel_boxes[keep] / box_scale,
+            transformed_keypoints[keep],
+        )
+
     def __getitem__(self, index: int) -> tuple[Tensor, DatasetTarget]:
         image_path = self.images[index]
         with Image.open(image_path) as loaded_image:
@@ -571,6 +661,18 @@ class YOLOKeypointDataset(Dataset[tuple[Tensor, DatasetTarget]]):
                 boxes[:, 0] = 1 - boxes[:, 0]
                 keypoints[..., 0] = 1 - keypoints[..., 0]
                 keypoints = keypoints[:, self.flip_idx]
+        if self.split == "train" and self.augmentation_profile == "field-v1":
+            if random.random() < 0.5:
+                image_tensor = self._photometric_distortion(image_tensor)
+            if random.random() < 0.5:
+                image_tensor, local_labels, boxes, keypoints = (
+                    self._field_affine(
+                        image_tensor,
+                        local_labels,
+                        boxes,
+                        keypoints,
+                    )
+                )
         image = transform_functional.resize(
             image_tensor,
             list(self.output_size),

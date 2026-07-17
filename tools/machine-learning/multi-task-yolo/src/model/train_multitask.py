@@ -13,6 +13,7 @@ import click
 import torch
 from torch.utils.data import DataLoader, DistributedSampler
 
+from ultralytics_dfine.config import MultiTaskHeadConfig, MultiTaskLossConfig
 from ultralytics_dfine.data import (
     DFINEDataset,
     DHRPDataset,
@@ -151,23 +152,68 @@ def _profile_training_tasks(profile: str) -> set[HeadId]:
         }
     if profile in {"stage2", "stage3"}:
         return set(HeadId)
+    if profile == "object_decoder_only":
+        return {HeadId.OBJECT}
+    if profile in {
+        "pose_aligned_decoder_no_classifier",
+        "pose_aligned_decoder",
+    }:
+        return {HeadId.OBJECT, HeadId.PERSON_POSE, HeadId.ROBOT_POSE}
+    if profile == "cross_negative_classifier_only":
+        return {
+            HeadId.OBJECT,
+            HeadId.PERSON_POSE,
+            HeadId.ROBOT_POSE,
+        }
     if profile == "field_head_only":
         return {HeadId.FIELD_FEATURES}
+    if profile == "pose_head_only":
+        return {HeadId.PERSON_POSE, HeadId.ROBOT_POSE}
     raise ValueError(f"Unknown trainable profile: {profile}")
 
 
 def _configured_model(
     model: DFINEMultiTaskModel,
     *,
+    pose_head_variant: str | None,
+    pose_refinement_dim: int | None,
+    pose_refinement_scale: float | None,
+    pose_visibility_score_alpha: float | None,
     field_head_variant: str | None,
     field_refinement_dim: int | None,
     field_refinement_scale: float | None,
+    pose_coordinate_space: str | None,
+    pose_smooth_l1_beta: float | None,
+    pose_coordinate_weight: float | None,
+    pose_oks_weight: float | None,
+    pose_visibility_weight: float | None,
+    cross_pose_visibility_negative_weight: float,
+    cross_pose_detector_negative_weight: float,
+    person_batch_robot_visibility_negative_weight: float | None,
+    robot_batch_person_visibility_negative_weight: float | None,
+    person_batch_robot_detector_negative_weight: float | None,
+    robot_batch_person_detector_negative_weight: float | None,
     field_classification_mode: str | None,
     field_class_weight: float | None,
     field_point_weight: float | None,
     field_focal_alpha: float | None,
     field_focal_gamma: float | None,
+    field_quality_sigma: float | None,
+    field_area_normalized_weight: float | None,
+    field_area_normalized_beta: float | None,
+    field_area_scale_floor: float | None,
+    field_area_scale_cap: float | None,
 ) -> DFINEMultiTaskModel:
+    pose_head_updates = {
+        key: value
+        for key, value in (
+            ("variant", pose_head_variant),
+            ("refinement_dim", pose_refinement_dim),
+            ("refinement_scale", pose_refinement_scale),
+            ("visibility_score_alpha", pose_visibility_score_alpha),
+        )
+        if value is not None
+    }
     field_head_updates = {
         key: value
         for key, value in (
@@ -177,13 +223,31 @@ def _configured_model(
         )
         if value is not None
     }
-    head_config = replace(
-        model.head_config,
+    head_config = MultiTaskHeadConfig(
+        person_pose=replace(
+            model.head_config.person_pose,
+            **pose_head_updates,
+        ),
+        robot_pose=replace(
+            model.head_config.robot_pose,
+            **pose_head_updates,
+        ),
         field_features=replace(
             model.head_config.field_features,
             **field_head_updates,
         ),
     )
+    pose_loss_updates = {
+        key: value
+        for key, value in (
+            ("coordinate_space", pose_coordinate_space),
+            ("smooth_l1_beta", pose_smooth_l1_beta),
+            ("coordinate_weight", pose_coordinate_weight),
+            ("oks_weight", pose_oks_weight),
+            ("visibility_weight", pose_visibility_weight),
+        )
+        if value is not None
+    }
     field_loss_updates = {
         key: value
         for key, value in (
@@ -192,14 +256,44 @@ def _configured_model(
             ("point_weight", field_point_weight),
             ("focal_alpha", field_focal_alpha),
             ("focal_gamma", field_focal_gamma),
+            ("quality_sigma", field_quality_sigma),
+            ("area_normalized_weight", field_area_normalized_weight),
+            ("area_normalized_beta", field_area_normalized_beta),
+            ("area_scale_floor", field_area_scale_floor),
+            ("area_scale_cap", field_area_scale_cap),
         )
         if value is not None
     }
-    loss_config = replace(
-        model.loss_config,
+    loss_config = MultiTaskLossConfig(
+        person_pose=replace(
+            model.loss_config.person_pose,
+            **pose_loss_updates,
+        ),
+        robot_pose=replace(
+            model.loss_config.robot_pose,
+            **pose_loss_updates,
+        ),
         field_features=replace(
             model.loss_config.field_features,
             **field_loss_updates,
+        ),
+        cross_pose_visibility_negative_weight=(
+            cross_pose_visibility_negative_weight
+        ),
+        cross_pose_detector_negative_weight=(
+            cross_pose_detector_negative_weight
+        ),
+        person_batch_robot_visibility_negative_weight=(
+            person_batch_robot_visibility_negative_weight
+        ),
+        robot_batch_person_visibility_negative_weight=(
+            robot_batch_person_visibility_negative_weight
+        ),
+        person_batch_robot_detector_negative_weight=(
+            person_batch_robot_detector_negative_weight
+        ),
+        robot_batch_person_detector_negative_weight=(
+            robot_batch_person_detector_negative_weight
         ),
     )
     if head_config == model.head_config:
@@ -216,6 +310,8 @@ def _configured_model(
         name
         for name in (*incompatible.missing_keys, *incompatible.unexpected_keys)
         if "spatial_refiner" not in name
+        and "shared_pose_refiner" not in name
+        and ".joint_embeddings." not in name
     ]
     if unsupported:
         raise RuntimeError(
@@ -247,6 +343,12 @@ def _audit_dataset(
             "missing_label_files": 0,
             "rows": count,
             "ignored_rows": 0,
+            "person_negative_verified_records": (
+                dataset.person_negative_verified_records
+            ),
+            "person_negative_eligible_records": (
+                dataset.person_negative_eligible_records
+            ),
         }
     raise TypeError(f"Unsupported dataset type: {type(dataset).__name__}")
 
@@ -264,9 +366,17 @@ def _audit_dataset(
     required=True,
 )
 @click.option(
+    "--coco-robot-negative-manifest",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+)
+@click.option(
     "--dhrp-root",
     type=click.Path(exists=True, path_type=Path),
     required=True,
+)
+@click.option(
+    "--dhrp-person-negative-manifest",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
 )
 @click.option("--field-data", type=click.Path(exists=True, path_type=Path))
 @click.option("--output-dir", type=click.Path(path_type=Path), required=True)
@@ -285,7 +395,12 @@ def _audit_dataset(
             "stage1",
             "stage2",
             "stage3",
+            "object_decoder_only",
+            "pose_aligned_decoder_no_classifier",
+            "pose_aligned_decoder",
+            "cross_negative_classifier_only",
             "field_head_only",
+            "pose_head_only",
         ]
     ),
 )
@@ -317,8 +432,14 @@ def _audit_dataset(
 @click.option("--warmup-steps", type=click.IntRange(min=0), default=500)
 @click.option(
     "--learning-rate-schedule",
-    type=click.Choice(["constant"]),
+    type=click.Choice(["constant", "cosine"]),
     default="constant",
+    show_default=True,
+)
+@click.option(
+    "--minimum-learning-rate-ratio",
+    type=FiniteFloatRange(min=0, max=1),
+    default=0.1,
     show_default=True,
 )
 @click.option("--clip-max-norm", type=FiniteFloatRange(min=0), default=0.1)
@@ -354,6 +475,19 @@ def _audit_dataset(
     show_default=True,
 )
 @click.option(
+    "--pose-head-variant",
+    type=click.Choice(["query_mlp", "spatial_refine", "shared_spatial_refine"]),
+)
+@click.option("--pose-refinement-dim", type=click.IntRange(min=1))
+@click.option(
+    "--pose-refinement-scale",
+    type=FiniteFloatRange(min=0, min_open=True),
+)
+@click.option(
+    "--pose-visibility-score-alpha",
+    type=FiniteFloatRange(min=0),
+)
+@click.option(
     "--field-head-variant",
     type=click.Choice(["query_decoder", "spatial_refine"]),
 )
@@ -363,8 +497,51 @@ def _audit_dataset(
     type=FiniteFloatRange(min=0, min_open=True),
 )
 @click.option(
+    "--pose-coordinate-space",
+    type=click.Choice(["image", "box"]),
+)
+@click.option(
+    "--pose-smooth-l1-beta",
+    type=FiniteFloatRange(min=0, min_open=True),
+)
+@click.option("--pose-coordinate-weight", type=FiniteFloatRange(min=0))
+@click.option("--pose-oks-weight", type=FiniteFloatRange(min=0))
+@click.option("--pose-visibility-weight", type=FiniteFloatRange(min=0))
+@click.option(
+    "--cross-pose-visibility-negative-weight",
+    type=FiniteFloatRange(min=0),
+    default=0.0,
+    show_default=True,
+)
+@click.option(
+    "--cross-pose-detector-negative-weight",
+    type=FiniteFloatRange(min=0),
+    default=0.0,
+    show_default=True,
+)
+@click.option(
+    "--person-batch-robot-visibility-negative-weight",
+    type=FiniteFloatRange(min=0),
+    default=None,
+)
+@click.option(
+    "--robot-batch-person-visibility-negative-weight",
+    type=FiniteFloatRange(min=0),
+    default=None,
+)
+@click.option(
+    "--person-batch-robot-detector-negative-weight",
+    type=FiniteFloatRange(min=0),
+    default=None,
+)
+@click.option(
+    "--robot-batch-person-detector-negative-weight",
+    type=FiniteFloatRange(min=0),
+    default=None,
+)
+@click.option(
     "--field-classification-mode",
-    type=click.Choice(["binary"]),
+    type=click.Choice(["binary", "strict_quality"]),
 )
 @click.option("--field-class-weight", type=FiniteFloatRange(min=0))
 @click.option("--field-point-weight", type=FiniteFloatRange(min=0))
@@ -374,8 +551,32 @@ def _audit_dataset(
 )
 @click.option("--field-focal-gamma", type=FiniteFloatRange(min=0))
 @click.option(
+    "--field-quality-sigma",
+    type=FiniteFloatRange(min=0, min_open=True),
+)
+@click.option(
+    "--field-area-normalized-weight",
+    type=FiniteFloatRange(min=0),
+    default=None,
+)
+@click.option(
+    "--field-area-normalized-beta",
+    type=FiniteFloatRange(min=0, min_open=True),
+    default=None,
+)
+@click.option(
+    "--field-area-scale-floor",
+    type=FiniteFloatRange(min=0, min_open=True),
+    default=None,
+)
+@click.option(
+    "--field-area-scale-cap",
+    type=FiniteFloatRange(min=0, min_open=True),
+    default=None,
+)
+@click.option(
     "--field-augmentation-profile",
-    type=click.Choice(["basic"]),
+    type=click.Choice(["basic", "field-v1"]),
     default="basic",
     show_default=True,
 )
@@ -429,7 +630,9 @@ def main(
     model_source: str,
     object_data: Path,
     person_data: Path,
+    coco_robot_negative_manifest: Path | None,
     dhrp_root: Path,
+    dhrp_person_negative_manifest: Path | None,
     field_data: Path | None,
     output_dir: Path,
     resume: Path | None,
@@ -463,6 +666,7 @@ def main(
     weight_decay: float,
     warmup_steps: int,
     learning_rate_schedule: str,
+    minimum_learning_rate_ratio: float,
     clip_max_norm: float,
     ema_decay: float,
     ema_warmups: int,
@@ -473,14 +677,34 @@ def main(
     ddp_find_unused_parameters: bool,
     strict_deterministic: bool,
     sdpa_backend: str,
+    pose_head_variant: str | None,
+    pose_refinement_dim: int | None,
+    pose_refinement_scale: float | None,
+    pose_visibility_score_alpha: float | None,
     field_head_variant: str | None,
     field_refinement_dim: int | None,
     field_refinement_scale: float | None,
+    pose_coordinate_space: str | None,
+    pose_smooth_l1_beta: float | None,
+    pose_coordinate_weight: float | None,
+    pose_oks_weight: float | None,
+    pose_visibility_weight: float | None,
+    cross_pose_visibility_negative_weight: float,
+    cross_pose_detector_negative_weight: float,
+    person_batch_robot_visibility_negative_weight: float | None,
+    robot_batch_person_visibility_negative_weight: float | None,
+    person_batch_robot_detector_negative_weight: float | None,
+    robot_batch_person_detector_negative_weight: float | None,
     field_classification_mode: str | None,
     field_class_weight: float | None,
     field_point_weight: float | None,
     field_focal_alpha: float | None,
     field_focal_gamma: float | None,
+    field_quality_sigma: float | None,
+    field_area_normalized_weight: float | None,
+    field_area_normalized_beta: float | None,
+    field_area_scale_floor: float | None,
+    field_area_scale_cap: float | None,
     field_augmentation_profile: str,
     device: str,
     object_weight: float,
@@ -512,6 +736,60 @@ def main(
         )
     if field_data is None:
         training_tasks.discard(HeadId.FIELD_FEATURES)
+    directional_visibility = (
+        person_batch_robot_visibility_negative_weight,
+        robot_batch_person_visibility_negative_weight,
+    )
+    directional_detector = (
+        person_batch_robot_detector_negative_weight,
+        robot_batch_person_detector_negative_weight,
+    )
+    if cross_pose_visibility_negative_weight > 0 and any(
+        value is not None for value in directional_visibility
+    ):
+        raise click.UsageError(
+            "Do not combine the legacy visibility-negative weight with "
+            "directional weights"
+        )
+    if cross_pose_detector_negative_weight > 0 and any(
+        value is not None for value in directional_detector
+    ):
+        raise click.UsageError(
+            "Do not combine the legacy detector-negative weight with "
+            "directional weights"
+        )
+    robot_person_visibility = (
+        cross_pose_visibility_negative_weight
+        if robot_batch_person_visibility_negative_weight is None
+        else robot_batch_person_visibility_negative_weight
+    )
+    robot_person_detector = (
+        cross_pose_detector_negative_weight
+        if robot_batch_person_detector_negative_weight is None
+        else robot_batch_person_detector_negative_weight
+    )
+    person_robot_visibility = (
+        cross_pose_visibility_negative_weight
+        if person_batch_robot_visibility_negative_weight is None
+        else person_batch_robot_visibility_negative_weight
+    )
+    person_robot_detector = (
+        cross_pose_detector_negative_weight
+        if person_batch_robot_detector_negative_weight is None
+        else person_batch_robot_detector_negative_weight
+    )
+    if (
+        person_robot_visibility > 0 or person_robot_detector > 0
+    ) and coco_robot_negative_manifest is None:
+        raise click.UsageError(
+            "COCO-to-Robot negatives require --coco-robot-negative-manifest"
+        )
+    if (
+        robot_person_visibility > 0 or robot_person_detector > 0
+    ) and dhrp_person_negative_manifest is None:
+        raise click.UsageError(
+            "DHRP-to-Person negatives require --dhrp-person-negative-manifest"
+        )
     train_image_size = _resolve_image_size(
         square=image_size,
         height=train_height,
@@ -568,6 +846,8 @@ def main(
         flip_idx=COCO_FLIP_IDX,
         global_class_ids=(7,),
         image_size=validation_image_size,
+        robot_negative_manifest=coco_robot_negative_manifest,
+        robot_negative_roles=("primary_evaluation",),
     )
     if HeadId.PERSON_POSE in training_tasks:
         train_datasets[HeadId.PERSON_POSE] = YOLOKeypointDataset(
@@ -578,6 +858,8 @@ def main(
             flip_idx=COCO_FLIP_IDX,
             global_class_ids=(7,),
             image_size=train_image_size,
+            robot_negative_manifest=coco_robot_negative_manifest,
+            robot_negative_roles=("train_negative",),
         )
     if HeadId.ROBOT_POSE in training_tasks:
         train_datasets[HeadId.ROBOT_POSE] = DHRPDataset(
@@ -585,6 +867,7 @@ def main(
             _dhrp_annotations(dhrp_root, "train"),
             image_size=train_image_size,
             training=True,
+            person_negative_manifest=dhrp_person_negative_manifest,
         )
     validation_datasets[HeadId.ROBOT_POSE] = DHRPDataset(
         dhrp_root,
@@ -628,7 +911,7 @@ def main(
                 global_class_ids=field_global_class_ids,
                 image_size=train_image_size,
                 augmentation_profile=cast(
-                    "Literal['basic']",
+                    "Literal['basic', 'field-v1']",
                     field_augmentation_profile,
                 ),
                 point_set=True,
@@ -655,14 +938,46 @@ def main(
     initialization_source = str(resume) if resume is not None else model_source
     model = _configured_model(
         _load_model(initialization_source),
+        pose_head_variant=pose_head_variant,
+        pose_refinement_dim=pose_refinement_dim,
+        pose_refinement_scale=pose_refinement_scale,
+        pose_visibility_score_alpha=pose_visibility_score_alpha,
         field_head_variant=field_head_variant,
         field_refinement_dim=field_refinement_dim,
         field_refinement_scale=field_refinement_scale,
+        pose_coordinate_space=pose_coordinate_space,
+        pose_smooth_l1_beta=pose_smooth_l1_beta,
+        pose_coordinate_weight=pose_coordinate_weight,
+        pose_oks_weight=pose_oks_weight,
+        pose_visibility_weight=pose_visibility_weight,
+        cross_pose_visibility_negative_weight=(
+            cross_pose_visibility_negative_weight
+        ),
+        cross_pose_detector_negative_weight=(
+            cross_pose_detector_negative_weight
+        ),
+        person_batch_robot_visibility_negative_weight=(
+            person_batch_robot_visibility_negative_weight
+        ),
+        robot_batch_person_visibility_negative_weight=(
+            robot_batch_person_visibility_negative_weight
+        ),
+        person_batch_robot_detector_negative_weight=(
+            person_batch_robot_detector_negative_weight
+        ),
+        robot_batch_person_detector_negative_weight=(
+            robot_batch_person_detector_negative_weight
+        ),
         field_classification_mode=field_classification_mode,
         field_class_weight=field_class_weight,
         field_point_weight=field_point_weight,
         field_focal_alpha=field_focal_alpha,
         field_focal_gamma=field_focal_gamma,
+        field_quality_sigma=field_quality_sigma,
+        field_area_normalized_weight=field_area_normalized_weight,
+        field_area_normalized_beta=field_area_normalized_beta,
+        field_area_scale_floor=field_area_scale_floor,
+        field_area_scale_cap=field_area_scale_cap,
     )
     train_loaders = {}
     for index, (task, dataset) in enumerate(train_datasets.items()):
@@ -748,9 +1063,10 @@ def main(
         weight_decay=weight_decay,
         warmup_steps=warmup_steps,
         learning_rate_schedule=cast(
-            "Literal['constant']",
+            "Literal['constant', 'cosine']",
             learning_rate_schedule,
         ),
+        minimum_learning_rate_ratio=minimum_learning_rate_ratio,
         clip_max_norm=clip_max_norm,
         ema_decay=ema_decay,
         ema_warmups=ema_warmups,
@@ -774,6 +1090,26 @@ def main(
             "ddp_find_unused_parameters": str(ddp_find_unused_parameters),
             "strict_deterministic": str(strict_deterministic),
             "sdpa_backend": sdpa_backend,
+            "dhrp_person_negative_manifest_sha256": (
+                train_datasets[
+                    HeadId.ROBOT_POSE
+                ].person_negative_manifest_sha256
+                if isinstance(
+                    train_datasets.get(HeadId.ROBOT_POSE),
+                    DHRPDataset,
+                )
+                else None
+            ),
+            "coco_robot_negative_manifest_sha256": (
+                train_datasets[
+                    HeadId.PERSON_POSE
+                ].robot_negative_manifest_sha256
+                if isinstance(
+                    train_datasets.get(HeadId.PERSON_POSE),
+                    YOLOKeypointDataset,
+                )
+                else None
+            ),
             "object_data_sha256": _file_sha256(object_data),
             "person_data_sha256": _file_sha256(person_data),
             **(

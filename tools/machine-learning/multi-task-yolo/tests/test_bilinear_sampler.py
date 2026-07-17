@@ -9,12 +9,14 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as functional
 
-from ultralytics_dfine.config import FieldHeadConfig
+from ultralytics_dfine.config import FieldHeadConfig, PoseHeadConfig
 from ultralytics_dfine.nn.multitask import (
     FieldFeatureHead,
+    QueryPoseHead,
     _bilinear_sample_border,
     _sample_encoder_feature,
 )
+from ultralytics_dfine.schemas import PERSON_POSE_SCHEMA
 
 
 class _SamplerModule(nn.Module):
@@ -154,23 +156,40 @@ class BilinearSamplerParityTests(unittest.TestCase):
             variant="spatial_refine",
             refinement_dim=8,
         )
-        module = FieldFeatureHead(
-            16,
-            attention_heads=4,
-            config=field_config,
+        pose_config = PoseHeadConfig(
+            variant="spatial_refine",
+            refinement_dim=8,
         )
-        clone = FieldFeatureHead(
-            16,
-            attention_heads=4,
-            config=field_config,
+        modules = (
+            (
+                FieldFeatureHead(
+                    16,
+                    attention_heads=4,
+                    config=field_config,
+                ),
+                FieldFeatureHead(
+                    16,
+                    attention_heads=4,
+                    config=field_config,
+                ),
+            ),
+            (
+                QueryPoseHead(16, PERSON_POSE_SCHEMA, pose_config),
+                QueryPoseHead(16, PERSON_POSE_SCHEMA, pose_config),
+            ),
         )
-        state = module.state_dict()
-        self.assertEqual(tuple(state), tuple(clone.state_dict()))
-        self.assertFalse(
-            any("sampler" in name for name, _ in module.named_modules())
-        )
-        self.assertTrue(state)
-        clone.load_state_dict(state, strict=True)
+        for module, clone in modules:
+            with self.subTest(module=type(module).__name__):
+                state = module.state_dict()
+                self.assertEqual(
+                    tuple(state),
+                    tuple(clone.state_dict()),
+                )
+                self.assertFalse(
+                    any("sampler" in name for name, _ in module.named_modules())
+                )
+                self.assertTrue(state)
+                clone.load_state_dict(state, strict=True)
 
 
 class BilinearSamplerOnnxTests(unittest.TestCase):

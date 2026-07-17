@@ -1,0 +1,194 @@
+*** Begin Patch
+*** Update File: src/validation/validate_multitask.py
+@@
+ def _code_metadata() -> dict[str, object]:
+     root = Path(__file__).resolve().parents[2]
+@@
+         values[key] = (
+             output.decode().strip()
+             if key == "revision"
+             else hashlib.sha256(output).hexdigest()
+         )
++    values["source_sha256"] = _source_tree_sha256(root / "src")
+     return values
++
++
++def _source_tree_sha256(source_root: Path) -> str:
++    """Hash Python source contents, including files untracked by Git."""
++    digest = hashlib.sha256()
++    for path in sorted(source_root.rglob("*.py")):
++        relative = path.relative_to(source_root).as_posix()
++        digest.update(relative.encode())
++        digest.update(b"\0")
++        digest.update(path.read_bytes())
++        digest.update(b"\0")
++    return digest.hexdigest()
+@@
+-    config = {
++    code = _code_metadata()
++    source_sha256 = code.get("source_sha256")
++    if not isinstance(source_sha256, str):
++        raise RuntimeError("Validator source hash is unavailable")
++    config = {
+         "backend": backend,
+@@
+         "subset_manifest": (
+             str((subset_manifest or write_subset_manifest).resolve())
+             if subset_manifest is not None or write_subset_manifest is not None
+             else None
+         ),
++        "validator_source_sha256": source_sha256,
+@@
+-        "code": _code_metadata(),
++        "code": code,
+*** Update File: src/validation/compare_multitask.py
+@@
+ COMPATIBLE_CONFIG_KEYS = (
+     "backend",
++    "validator_source_sha256",
+     "height",
+@@
+ def _mapping(value: object, context: str) -> Mapping[str, object]:
+@@
+     return cast("Mapping[str, object]", value)
++
++
++def _require_equal_pair_payload(
++    key: str,
++    baseline: Mapping[str, object],
++    candidate: Mapping[str, object],
++    *,
++    prefix: str,
++) -> None:
++    """Reject comparisons whose evaluator inputs are not exactly paired."""
++    for field in ("targets", "evaluation_size", "original_size"):
++        if field not in baseline or field not in candidate:
++            raise ValueError(f"{prefix} pair has no {field}: {key}")
++        if baseline[field] != candidate[field]:
++            raise ValueError(f"{prefix} pair {field} differs: {key}")
+@@
+     for key in baseline_records:
+         if baseline_records[key].get("task") != candidate_records[key].get(
+             "task"
+         ):
+             raise ValueError(f"Prediction pair task differs: {key}")
++        _require_equal_pair_payload(
++            key,
++            baseline_records[key],
++            candidate_records[key],
++            prefix="Prediction",
++        )
+         baseline_identity, _ = _record_cluster_identity(
+@@
+         for key in baseline_cross_records:
+             if baseline_cross_records[key].get("task") != (
+                 candidate_cross_records[key].get("task")
+             ):
+                 raise ValueError(f"Cross-pose prediction task differs: {key}")
++            _require_equal_pair_payload(
++                key,
++                baseline_cross_records[key],
++                candidate_cross_records[key],
++                prefix="Cross-pose prediction",
++            )
+@@
+-        "version": 3,
++        "version": 4,
+*** Update File: tests/test_validation_campaign.py
+@@
+ from validation.validate_multitask import (
+     _distributed_context,
+     _merge_shards,
+     _merge_subset_manifests,
++    _source_tree_sha256,
+     _with_process_group_cleanup,
+ )
+@@
++    def test_source_tree_hash_includes_untracked_python_contents(self) -> None:
++        with tempfile.TemporaryDirectory() as directory:
++            root = Path(directory)
++            (root / "a.py").write_text("value = 1\n", encoding="utf-8")
++            (root / "ignored.txt").write_text("one\n", encoding="utf-8")
++            baseline = _source_tree_sha256(root)
++            (root / "ignored.txt").write_text("two\n", encoding="utf-8")
++            self.assertEqual(baseline, _source_tree_sha256(root))
++            (root / "a.py").write_text("value = 2\n", encoding="utf-8")
++            self.assertNotEqual(baseline, _source_tree_sha256(root))
++
+     def test_compatibility_rejects_dataset_change(self) -> None:
+@@
++    def test_compatibility_rejects_validator_source_change(self) -> None:
++        keys = (
++            "backend",
++            "height",
++            "width",
++            "confidence",
++            "field_normalization",
++            "robot_visibility_alphas",
++            "max_batches",
++            "tasks",
++            "subset_manifest",
++        )
++        baseline_config = dict.fromkeys(keys)
++        candidate_config = dict(baseline_config)
++        baseline_config["validator_source_sha256"] = "a" * 64
++        candidate_config["validator_source_sha256"] = "b" * 64
++        metadata = {"dataset_fingerprints": {}}
++        with self.assertRaisesRegex(ValueError, "validator_source_sha256"):
++            compatibility_report(
++                baseline_config,
++                candidate_config,
++                metadata,
++                metadata,
++            )
++
+@@
+                                 {
+                                     **record,
+                                     "image_key": key,
+                                     "task": task,
+                                     "path": path,
++                                    "evaluation_size": [448, 544],
++                                    "original_size": [448, 544],
+                                 }
+@@
+                                 {
+                                     "task": cross_task,
+                                     "image_key": f"{cross_task}:paired",
++                                    "evaluation_size": [448, 544],
++                                    "original_size": [448, 544],
+                                     "predictions": {
+@@
+             with self.assertRaisesRegex(
+                 ValueError,
+                 "Prediction pair canonical image differs",
+             ):
+                 compare(
+                     baseline_dir,
+                     candidate_dir,
+                     iterations=100,
+                     seed=17,
+                 )
++            candidate_rows[0]["path"] = paths[0]
++            candidate_rows[0]["targets"] = {"boxes_xyxy": []}
++            with gzip.open(
++                candidate_predictions,
++                "wt",
++                encoding="utf-8",
++            ) as file:
++                for row in candidate_rows:
++                    file.write(json.dumps(row) + "\n")
++            with self.assertRaisesRegex(
++                ValueError,
++                "Prediction pair targets differs",
++            ):
++                compare(
++                    baseline_dir,
++                    candidate_dir,
++                    iterations=100,
++                    seed=17,
++                )
+@@
+-        self.assertEqual(report["version"], 3)
++        self.assertEqual(report["version"], 4)
+*** End Patch
