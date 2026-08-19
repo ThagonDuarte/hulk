@@ -15,14 +15,21 @@ use color_eyre::{
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use tempfile::NamedTempFile;
+#[cfg(test)]
+use types::pose_detection::{FieldFeatureLabel, RobotKeypoints};
 use types::{
     object_detection::{Object, RobocupObjectLabel, YOLOObjectLabel},
-    pose_detection::Pose,
+    pose_detection::{FieldFeatureDetection, Pose, RobotPoseDetection},
 };
 
 pub const CACHE_VERSION: u32 = 2;
 pub const PREDICTION_CHUNK_SIZE: usize = 128;
 const RECORDING_FINGERPRINT_VERSION: u32 = 1;
+// The original identity captured neither supplemental output; v2 added field features and v3
+// adds robot poses.
+const MODEL_RUN_PAYLOAD_VERSION: u32 = 3;
+const FIELD_FEATURE_CACHE_VERSION: u32 = 1;
+const ROBOT_POSE_CACHE_VERSION: u32 = 1;
 
 const MAX_CACHE_FILE_BYTES: u64 = 256 * 1024 * 1024;
 const MAX_PREDICTIONS_PER_FRAME: usize = 300;
@@ -39,6 +46,8 @@ const RUN_METADATA_LOCK_FILE: &str = ".run-metadata.lock";
 const RUN_KEY_REMAPPINGS_FILE: &str = "run-key-remappings.bin";
 const RUN_KEY_REMAPPINGS_LOCK_FILE: &str = ".run-key-remappings.lock";
 const BOOKMARKS_FILE: &str = "bookmarks.bin";
+const FIELD_FEATURE_CHUNK_PREFIX: &str = "field-features-";
+const ROBOT_POSE_CHUNK_PREFIX: &str = "robot-poses-";
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RecordingFingerprint {
@@ -79,6 +88,12 @@ impl RecordingFingerprint {
         let bytes =
             bincode::serialize(self).wrap_err("failed to serialize recording fingerprint")?;
         Ok(blake3::hash(&bytes).to_hex().to_string())
+    }
+
+    fn matches_relocated(&self, other: &Self) -> bool {
+        self.size == other.size
+            && self.modified_unix_nanos == other.modified_unix_nanos
+            && self.format_version == other.format_version
     }
 }
 
@@ -302,6 +317,8 @@ enum PredictionStorage {
     Model {
         directory: PathBuf,
         frame_start: usize,
+        has_field_features: bool,
+        has_robot_poses: bool,
     },
 }
 
@@ -310,12 +327,16 @@ struct CachedPredictionChunk {
     index: usize,
     start_frame: usize,
     predictions: Vec<Option<Arc<Prediction>>>,
+    field_features: Vec<Option<Arc<Vec<FieldFeatureDetection>>>>,
+    robot_poses: Vec<Option<Arc<Vec<RobotPoseDetection>>>>,
 }
 
 #[derive(Clone, Debug)]
 pub struct LoadedPredictionChunk {
     pub start_frame: usize,
     pub predictions: Vec<Option<Arc<Prediction>>>,
+    pub field_features: Vec<Option<Arc<Vec<FieldFeatureDetection>>>>,
+    pub robot_poses: Vec<Option<Arc<Vec<RobotPoseDetection>>>>,
 }
 
 impl LoadedPredictionRun {
@@ -354,6 +375,8 @@ impl LoadedPredictionRun {
             Ok(LoadedPredictionChunk {
                 start_frame: chunk.start_frame,
                 predictions: chunk.predictions.clone(),
+                field_features: chunk.field_features.clone(),
+                robot_poses: chunk.robot_poses.clone(),
             })
         })
     }
@@ -388,6 +411,7 @@ impl LoadedPredictionRun {
             PredictionStorage::Model {
                 directory,
                 frame_start,
+                ..
             } => {
                 let relative = frame
                     .checked_sub(*frame_start)
@@ -543,6 +567,20 @@ struct PredictionChunk {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+struct SupplementalChunk<T> {
+    cache_version: u32,
+    start_frame: usize,
+    values: Vec<Vec<T>>,
+}
+
+#[derive(Serialize)]
+struct SupplementalChunkRef<'a, T> {
+    cache_version: u32,
+    start_frame: usize,
+    values: &'a [Vec<T>],
+}
+
+#[derive(Debug, Serialize, Deserialize)]
 struct LegacyModelRunManifest {
     run_key: String,
     label: String,
@@ -564,6 +602,8 @@ pub struct PredictionStore {
     manifest: ModelRunManifest,
     completed_count: usize,
     pending: Vec<Prediction>,
+    pending_field_features: Option<Vec<Vec<FieldFeatureDetection>>>,
+    pending_robot_poses: Option<Vec<Vec<RobotPoseDetection>>>,
 }
 
 impl PredictionStore {
@@ -604,6 +644,48 @@ impl PredictionStore {
                 return Err(error);
             }
         };
+        let pending_field_features = match load_contiguous_supplemental_outputs(
+            &run_directory,
+            &manifest,
+            FIELD_FEATURE_CHUNK_PREFIX,
+            FIELD_FEATURE_CACHE_VERSION,
+            loaded.completed_count,
+            loaded.pending.len(),
+            validate_field_features,
+        ) {
+            Ok(pending) => pending,
+            Err(error) => {
+                manifest.state = ModelRunState::Failed;
+                manifest.error = Some(format!("invalid field-feature cache: {error:#}"));
+                if let Err(persist_error) = write_bincode_atomic(&manifest_path, &manifest) {
+                    return Err(error.wrap_err(format!(
+                        "failed to persist invalid-cache state: {persist_error:#}"
+                    )));
+                }
+                return Err(error);
+            }
+        };
+        let pending_robot_poses = match load_contiguous_supplemental_outputs(
+            &run_directory,
+            &manifest,
+            ROBOT_POSE_CHUNK_PREFIX,
+            ROBOT_POSE_CACHE_VERSION,
+            loaded.completed_count,
+            loaded.pending.len(),
+            validate_robot_poses,
+        ) {
+            Ok(pending) => pending,
+            Err(error) => {
+                manifest.state = ModelRunState::Failed;
+                manifest.error = Some(format!("invalid robot-pose cache: {error:#}"));
+                if let Err(persist_error) = write_bincode_atomic(&manifest_path, &manifest) {
+                    return Err(error.wrap_err(format!(
+                        "failed to persist invalid-cache state: {persist_error:#}"
+                    )));
+                }
+                return Err(error);
+            }
+        };
         if manifest.completed_frame_count != loaded.completed_count {
             manifest.completed_frame_count = loaded.completed_count;
             write_bincode_atomic(&manifest_path, &manifest)?;
@@ -621,6 +703,8 @@ impl PredictionStore {
             manifest,
             completed_count: loaded.completed_count,
             pending: loaded.pending,
+            pending_field_features,
+            pending_robot_poses,
         })
     }
 
@@ -639,7 +723,17 @@ impl PredictionStore {
         self.persist_manifest()
     }
 
-    pub fn append(&mut self, prediction: Prediction) -> Result<()> {
+    #[cfg(test)]
+    fn append(&mut self, prediction: Prediction) -> Result<()> {
+        self.append_with_optional_outputs(prediction, None, None)
+    }
+
+    pub fn append_with_optional_outputs(
+        &mut self,
+        prediction: Prediction,
+        field_features: Option<Vec<FieldFeatureDetection>>,
+        robot_poses: Option<Vec<RobotPoseDetection>>,
+    ) -> Result<()> {
         let expected_frame = self
             .manifest
             .frame_start
@@ -653,15 +747,55 @@ impl PredictionStore {
             );
         }
         validate_prediction(&prediction)?;
+        if let Some(field_features) = &field_features {
+            validate_field_features(field_features)?;
+        }
+        if let Some(robot_poses) = &robot_poses {
+            validate_robot_poses(robot_poses)?;
+        }
         if self.completed_count >= self.manifest.target_frame_count()? {
             bail!("prediction exceeds the manifest frame count");
         }
+        match (&self.pending_field_features, &field_features) {
+            (Some(_), None) => {
+                bail!("field-feature output became unavailable while resuming the model run")
+            }
+            (None, Some(_)) if self.completed_count > 0 => {
+                bail!("existing model run does not contain field-feature outputs")
+            }
+            _ => {}
+        }
+        match (&self.pending_robot_poses, &robot_poses) {
+            (Some(_), None) => {
+                bail!("robot-pose output became unavailable while resuming the model run")
+            }
+            (None, Some(_)) if self.completed_count > 0 => {
+                bail!("existing model run does not contain robot-pose outputs")
+            }
+            _ => {}
+        }
 
         self.pending.push(prediction);
+        if let Some(field_features) = field_features {
+            self.pending_field_features
+                .get_or_insert_with(Vec::new)
+                .push(field_features);
+        }
+        if let Some(robot_poses) = robot_poses {
+            self.pending_robot_poses
+                .get_or_insert_with(Vec::new)
+                .push(robot_poses);
+        }
         self.completed_count += 1;
         if self.pending.len() == PREDICTION_CHUNK_SIZE {
             self.persist_pending()?;
             self.pending.clear();
+            if let Some(field_features) = &mut self.pending_field_features {
+                field_features.clear();
+            }
+            if let Some(robot_poses) = &mut self.pending_robot_poses {
+                robot_poses.clear();
+            }
         }
         Ok(())
     }
@@ -704,6 +838,36 @@ impl PredictionStore {
                 .wrap_err("prediction chunk frame overflow")?,
             predictions: &self.pending,
         };
+        if let Some(detections) = &self.pending_field_features {
+            if detections.len() != self.pending.len() {
+                bail!("field-feature cache is not aligned with pending predictions");
+            }
+            write_bincode_atomic(
+                &supplemental_chunk_path(
+                    &self.run_directory,
+                    FIELD_FEATURE_CHUNK_PREFIX,
+                    chunk_index,
+                ),
+                &SupplementalChunkRef {
+                    cache_version: FIELD_FEATURE_CACHE_VERSION,
+                    start_frame: chunk.start_frame,
+                    values: detections,
+                },
+            )?;
+        }
+        if let Some(robot_poses) = &self.pending_robot_poses {
+            if robot_poses.len() != self.pending.len() {
+                bail!("robot-pose cache is not aligned with pending predictions");
+            }
+            write_bincode_atomic(
+                &supplemental_chunk_path(&self.run_directory, ROBOT_POSE_CHUNK_PREFIX, chunk_index),
+                &SupplementalChunkRef {
+                    cache_version: ROBOT_POSE_CACHE_VERSION,
+                    start_frame: chunk.start_frame,
+                    values: robot_poses,
+                },
+            )?;
+        }
         write_bincode_atomic(&chunk_path(&self.run_directory, chunk_index), &chunk)?;
         self.manifest.completed_frame_count = self.completed_count;
         self.persist_manifest()
@@ -980,7 +1144,11 @@ pub fn delete_model_run(
     let _lock_file = lock_model_run(&root, run_key, true)?;
     let run_directory = root.join(run_key);
     let manifest: ModelRunManifest = read_bincode(&run_directory.join(MANIFEST_FILE))?;
-    if manifest.run_key != run_key || &manifest.recording_fingerprint != recording_fingerprint {
+    if manifest.run_key != run_key
+        || !manifest
+            .recording_fingerprint
+            .matches_relocated(recording_fingerprint)
+    {
         bail!("model run manifest does not match the requested recording and run key");
     }
 
@@ -1112,7 +1280,9 @@ fn migrate_legacy_model_run(
     let legacy: LegacyModelRunManifest = read_bincode(&directory.join(MANIFEST_FILE))?;
     if legacy.cache_version != 1
         || legacy.run_key != directory_key
-        || &legacy.recording_fingerprint != recording_fingerprint
+        || !legacy
+            .recording_fingerprint
+            .matches_relocated(recording_fingerprint)
         || legacy.total_frame_count != total_frame_count
     {
         return Ok(None);
@@ -1456,7 +1626,10 @@ fn load_model_run(
     if directory.file_name().and_then(|name| name.to_str()) != Some(&manifest.run_key) {
         bail!("model run directory name does not match its manifest key");
     }
-    if &manifest.recording_fingerprint != recording_fingerprint {
+    if !manifest
+        .recording_fingerprint
+        .matches_relocated(recording_fingerprint)
+    {
         return Ok(None);
     }
     if manifest.total_frame_count != total_frame_count {
@@ -1473,27 +1646,47 @@ fn load_model_run(
     let target_count = manifest.target_frame_count()?;
     let active = model_run_is_active(directory, &manifest.run_key)?;
     let inspection = if active {
-        Ok(())
+        Ok((
+            !supplemental_chunk_paths(directory, FIELD_FEATURE_CHUNK_PREFIX)?.is_empty(),
+            !supplemental_chunk_paths(directory, ROBOT_POSE_CHUNK_PREFIX)?.is_empty(),
+        ))
     } else {
-        inspect_model_chunks(directory, &manifest)
+        inspect_model_chunks(directory, &manifest)?;
+        inspect_optional_supplemental_chunks(
+            directory,
+            FIELD_FEATURE_CHUNK_PREFIX,
+            manifest.completed_frame_count,
+        )
+        .and_then(|has_field_features| {
+            inspect_optional_supplemental_chunks(
+                directory,
+                ROBOT_POSE_CHUNK_PREFIX,
+                manifest.completed_frame_count,
+            )
+            .map(|has_robot_poses| (has_field_features, has_robot_poses))
+        })
     };
-    let availability = match inspection {
-        Ok(()) => {
+    let (availability, has_field_features, has_robot_poses) = match inspection {
+        Ok((has_field_features, has_robot_poses)) => {
             if manifest.state == ModelRunState::Running && !active
                 || manifest.state == ModelRunState::Complete
                     && manifest.completed_frame_count != target_count
             {
                 manifest.state = ModelRunState::Incomplete;
             }
-            PredictionAvailability::contiguous(
-                manifest.frame_start,
-                manifest.completed_frame_count,
-            )?
+            (
+                PredictionAvailability::contiguous(
+                    manifest.frame_start,
+                    manifest.completed_frame_count,
+                )?,
+                has_field_features,
+                has_robot_poses,
+            )
         }
         Err(error) => {
             manifest.state = ModelRunState::Failed;
             manifest.error = Some(format!("invalid prediction cache: {error:#}"));
-            PredictionAvailability::default()
+            (PredictionAvailability::default(), false, false)
         }
     };
     let frame_start = manifest.frame_start;
@@ -1506,6 +1699,8 @@ fn load_model_run(
         storage: PredictionStorage::Model {
             directory: directory.to_path_buf(),
             frame_start,
+            has_field_features,
+            has_robot_poses,
         },
         cached_chunk: Arc::new(Mutex::new(None)),
         failed_chunks: Arc::new(Mutex::new(BTreeMap::new())),
@@ -1679,6 +1874,7 @@ fn model_run_key(
         recording_fingerprint,
         thresholds,
         CACHE_VERSION,
+        MODEL_RUN_PAYLOAD_VERSION,
         frame_start,
         frame_end,
         total_frame_count,
@@ -1870,6 +2066,140 @@ fn inspect_model_chunks(directory: &Path, manifest: &ModelRunManifest) -> Result
     Ok(())
 }
 
+fn inspect_optional_supplemental_chunks(
+    directory: &Path,
+    prefix: &str,
+    completed_frame_count: usize,
+) -> Result<bool> {
+    let chunk_paths = supplemental_chunk_paths(directory, prefix)?;
+    if chunk_paths.is_empty() {
+        return Ok(false);
+    }
+
+    let expected_chunks = completed_frame_count.div_ceil(PREDICTION_CHUNK_SIZE);
+    for index in 0..expected_chunks {
+        let path = chunk_paths.get(&index).wrap_err_with(|| {
+            format!(
+                "supplemental cache `{prefix}` is missing chunk {index} in {}",
+                directory.display()
+            )
+        })?;
+        let length = path
+            .metadata()
+            .wrap_err_with(|| format!("failed to inspect {}", path.display()))?
+            .len();
+        if length == 0 || length > MAX_CACHE_FILE_BYTES {
+            bail!(
+                "supplemental chunk {} has an invalid file size",
+                path.display()
+            );
+        }
+    }
+    if chunk_paths.keys().any(|index| *index > expected_chunks) {
+        bail!(
+            "supplemental cache `{prefix}` contains chunks beyond its prediction cache in {}",
+            directory.display()
+        );
+    }
+    Ok(true)
+}
+
+fn load_contiguous_supplemental_outputs<T: DeserializeOwned>(
+    directory: &Path,
+    manifest: &ModelRunManifest,
+    prefix: &str,
+    cache_version: u32,
+    completed_frame_count: usize,
+    pending_prediction_count: usize,
+    validate: fn(&[T]) -> Result<()>,
+) -> Result<Option<Vec<Vec<T>>>> {
+    let chunk_paths = supplemental_chunk_paths(directory, prefix)?;
+    if chunk_paths.is_empty() {
+        return Ok(None);
+    }
+
+    let chunk_count = completed_frame_count.div_ceil(PREDICTION_CHUNK_SIZE);
+    let mut pending = Vec::new();
+    for chunk_index in 0..chunk_count {
+        let path = chunk_paths.get(&chunk_index).wrap_err_with(|| {
+            format!(
+                "supplemental cache `{prefix}` is missing chunk {chunk_index} in {}",
+                directory.display()
+            )
+        })?;
+        let relative_start = chunk_index
+            .checked_mul(PREDICTION_CHUNK_SIZE)
+            .wrap_err("supplemental chunk index overflow")?;
+        let expected_start = manifest
+            .frame_start
+            .checked_add(relative_start)
+            .wrap_err("supplemental chunk start overflow")?;
+        let expected_length = (completed_frame_count - relative_start).min(PREDICTION_CHUNK_SIZE);
+        let values = load_supplemental_chunk(
+            path,
+            expected_start,
+            expected_length,
+            cache_version,
+            validate,
+        )?;
+        if chunk_index + 1 == chunk_count && pending_prediction_count > 0 {
+            if values.len() != pending_prediction_count {
+                bail!("pending supplemental outputs do not match pending predictions");
+            }
+            pending = values;
+        }
+    }
+    if chunk_paths.keys().any(|index| *index > chunk_count) {
+        bail!(
+            "supplemental cache `{prefix}` contains chunks beyond its prediction cache in {}",
+            directory.display()
+        );
+    }
+    Ok(Some(pending))
+}
+
+fn load_supplemental_chunk<T: DeserializeOwned>(
+    path: &Path,
+    expected_start: usize,
+    expected_length: usize,
+    cache_version: u32,
+    validate: fn(&[T]) -> Result<()>,
+) -> Result<Vec<Vec<T>>> {
+    let mut chunk: SupplementalChunk<T> = read_bincode(path)?;
+    if chunk.cache_version != cache_version
+        || chunk.start_frame != expected_start
+        || chunk.values.len() < expected_length
+        || chunk.values.len() > PREDICTION_CHUNK_SIZE
+    {
+        bail!("supplemental chunk {} is invalid", path.display());
+    }
+    chunk.values.truncate(expected_length);
+    for values in &chunk.values {
+        validate(values)?;
+    }
+    Ok(chunk.values)
+}
+
+fn supplemental_chunk_paths(directory: &Path, prefix: &str) -> Result<BTreeMap<usize, PathBuf>> {
+    let mut chunk_paths = BTreeMap::new();
+    for entry in fs::read_dir(directory)
+        .wrap_err_with(|| format!("failed to read {}", directory.display()))?
+    {
+        let entry = entry?;
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        let Some(index) = name
+            .strip_prefix(prefix)
+            .and_then(|name| name.strip_suffix(".bin"))
+            .and_then(|index| index.parse::<usize>().ok())
+        else {
+            continue;
+        };
+        chunk_paths.insert(index, entry.path());
+    }
+    Ok(chunk_paths)
+}
+
 fn load_contiguous_predictions(
     directory: &Path,
     manifest: &ModelRunManifest,
@@ -1977,6 +2307,43 @@ fn validate_prediction(prediction: &Prediction) -> Result<()> {
     Ok(())
 }
 
+fn validate_field_features(detections: &[FieldFeatureDetection]) -> Result<()> {
+    if detections.len() > MAX_PREDICTIONS_PER_FRAME {
+        bail!("field-feature prediction exceeds the model output capacity");
+    }
+    if detections.iter().any(|detection| {
+        !detection.point.x().is_finite()
+            || !detection.point.y().is_finite()
+            || !detection.confidence.is_finite()
+    }) {
+        bail!("field-feature prediction contains non-finite values");
+    }
+    Ok(())
+}
+
+fn validate_robot_poses(detections: &[RobotPoseDetection]) -> Result<()> {
+    if detections.len() > MAX_PREDICTIONS_PER_FRAME {
+        bail!("robot-pose prediction exceeds the model output capacity");
+    }
+    if detections.iter().any(|detection| {
+        let bounding_box = detection.object.bounding_box;
+        detection.object.label != RobocupObjectLabel::Robot
+            || !bounding_box.area.min.x().is_finite()
+            || !bounding_box.area.min.y().is_finite()
+            || !bounding_box.area.max.x().is_finite()
+            || !bounding_box.area.max.y().is_finite()
+            || !bounding_box.confidence.is_finite()
+            || detection.keypoints.as_array().iter().any(|keypoint| {
+                !keypoint.point.x().is_finite()
+                    || !keypoint.point.y().is_finite()
+                    || !keypoint.confidence.is_finite()
+            })
+    }) {
+        bail!("robot-pose prediction contains invalid values");
+    }
+    Ok(())
+}
+
 fn load_prediction_chunk(
     path: &Path,
     chunk_index: usize,
@@ -2018,6 +2385,8 @@ fn load_prediction_chunk(
             Ok(CachedPredictionChunk {
                 index: chunk_index,
                 start_frame: chunk.start_frame,
+                field_features: vec![None; chunk.predictions.len()],
+                robot_poses: vec![None; chunk.predictions.len()],
                 predictions: chunk
                     .predictions
                     .into_iter()
@@ -2025,7 +2394,12 @@ fn load_prediction_chunk(
                     .collect(),
             })
         }
-        PredictionStorage::Model { frame_start, .. } => {
+        PredictionStorage::Model {
+            directory,
+            frame_start,
+            has_field_features,
+            has_robot_poses,
+        } => {
             let chunk: PredictionChunk = read_bincode(path)?;
             let expected_start = frame_start
                 .checked_add(
@@ -2035,9 +2409,39 @@ fn load_prediction_chunk(
                 )
                 .wrap_err("prediction chunk frame overflow")?;
             validate_model_chunk(path, &chunk, expected_start, true)?;
+            let field_features = if *has_field_features {
+                load_supplemental_chunk(
+                    &supplemental_chunk_path(directory, FIELD_FEATURE_CHUNK_PREFIX, chunk_index),
+                    expected_start,
+                    chunk.predictions.len(),
+                    FIELD_FEATURE_CACHE_VERSION,
+                    validate_field_features,
+                )?
+                .into_iter()
+                .map(|detections| Some(Arc::new(detections)))
+                .collect()
+            } else {
+                vec![None; chunk.predictions.len()]
+            };
+            let robot_poses = if *has_robot_poses {
+                load_supplemental_chunk(
+                    &supplemental_chunk_path(directory, ROBOT_POSE_CHUNK_PREFIX, chunk_index),
+                    expected_start,
+                    chunk.predictions.len(),
+                    ROBOT_POSE_CACHE_VERSION,
+                    validate_robot_poses,
+                )?
+                .into_iter()
+                .map(|detections| Some(Arc::new(detections)))
+                .collect()
+            } else {
+                vec![None; chunk.predictions.len()]
+            };
             Ok(CachedPredictionChunk {
                 index: chunk_index,
                 start_frame: chunk.start_frame,
+                field_features,
+                robot_poses,
                 predictions: chunk
                     .predictions
                     .into_iter()
@@ -2075,6 +2479,10 @@ fn chunk_path(directory: &Path, chunk_index: usize) -> PathBuf {
     directory.join(format!("chunk-{chunk_index:08}.bin"))
 }
 
+fn supplemental_chunk_path(directory: &Path, prefix: &str, chunk_index: usize) -> PathBuf {
+    directory.join(format!("{prefix}{chunk_index:08}.bin"))
+}
+
 fn baseline_chunk_path(directory: &Path, chunk_index: usize) -> PathBuf {
     directory.join(format!("chunk-{chunk_index:08}.bin"))
 }
@@ -2101,6 +2509,26 @@ mod tests {
             inference_duration_nanos: Some(1),
             postprocessing_duration_nanos: Some(2),
             non_maximum_suppression_duration_nanos: Some(3),
+        }
+    }
+
+    fn robot_pose(confidence: f32) -> RobotPoseDetection {
+        let mut values = [0.0; 42];
+        for (index, keypoint) in values.chunks_exact_mut(3).enumerate() {
+            keypoint[0] = index as f32;
+            keypoint[1] = index as f32 + 0.5;
+            keypoint[2] = 0.9;
+        }
+        RobotPoseDetection {
+            object: Object::<RobocupObjectLabel>::from([
+                0.0,
+                0.0,
+                20.0,
+                30.0,
+                confidence,
+                RobocupObjectLabel::Robot as usize as f32,
+            ]),
+            keypoints: RobotKeypoints::from(&values),
         }
     }
 
@@ -2204,6 +2632,175 @@ mod tests {
     }
 
     #[test]
+    fn optional_outputs_round_trip_and_distinguish_empty_from_unavailable() {
+        let cache = tempfile::tempdir().unwrap();
+        let mut store = PredictionStore::open(cache.path(), manifest(2)).unwrap();
+        store
+            .append_with_optional_outputs(
+                prediction(0),
+                Some(vec![FieldFeatureDetection {
+                    point: Default::default(),
+                    confidence: 0.75,
+                    label: FieldFeatureLabel::TSpot,
+                }]),
+                Some(vec![robot_pose(0.8)]),
+            )
+            .unwrap();
+        store
+            .append_with_optional_outputs(prediction(1), Some(Vec::new()), Some(Vec::new()))
+            .unwrap();
+        store.finish().unwrap();
+        drop(store);
+
+        let loaded = load_all_runs(cache.path(), &fingerprint(), 2).unwrap();
+        let model = loaded
+            .iter()
+            .find(|run| run.source == PredictionSource::Model)
+            .unwrap();
+        let chunk = model.prediction_chunk(0).unwrap();
+        let first = chunk.field_features[0].as_ref().unwrap();
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].label, FieldFeatureLabel::TSpot);
+        assert_eq!(first[0].confidence, 0.75);
+        assert!(chunk.field_features[1].as_ref().unwrap().is_empty());
+        let first = chunk.robot_poses[0].as_ref().unwrap();
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].object.label, RobocupObjectLabel::Robot);
+        assert_eq!(first[0].object.bounding_box.confidence, 0.8);
+        assert!(chunk.robot_poses[1].as_ref().unwrap().is_empty());
+
+        let cache = tempfile::tempdir().unwrap();
+        let mut store = PredictionStore::open(cache.path(), manifest(1)).unwrap();
+        store.append(prediction(0)).unwrap();
+        store.finish().unwrap();
+        drop(store);
+        let loaded = load_all_runs(cache.path(), &fingerprint(), 1).unwrap();
+        let model = loaded
+            .iter()
+            .find(|run| run.source == PredictionSource::Model)
+            .unwrap();
+        let chunk = model.prediction_chunk(0).unwrap();
+        assert!(chunk.field_features[0].is_none());
+        assert!(chunk.robot_poses[0].is_none());
+    }
+
+    #[test]
+    fn optional_outputs_resume_with_prediction_chunks() {
+        let cache = tempfile::tempdir().unwrap();
+        let mut store = PredictionStore::open(cache.path(), manifest(130)).unwrap();
+        for frame_index in 0..129 {
+            store
+                .append_with_optional_outputs(
+                    prediction(frame_index),
+                    Some(Vec::new()),
+                    Some(Vec::new()),
+                )
+                .unwrap();
+        }
+        drop(store);
+
+        let mut resumed = PredictionStore::open(cache.path(), manifest(130)).unwrap();
+        assert_eq!(resumed.completed_count(), 128);
+        for frame_index in 128..130 {
+            resumed
+                .append_with_optional_outputs(
+                    prediction(frame_index),
+                    Some(Vec::new()),
+                    Some(Vec::new()),
+                )
+                .unwrap();
+        }
+        resumed.finish().unwrap();
+        drop(resumed);
+
+        let loaded = load_all_runs(cache.path(), &fingerprint(), 130).unwrap();
+        let model = loaded
+            .iter()
+            .find(|run| run.source == PredictionSource::Model)
+            .unwrap();
+        let final_chunk = model.prediction_chunk(129).unwrap();
+        assert_eq!(final_chunk.start_frame, PREDICTION_CHUNK_SIZE);
+        assert_eq!(final_chunk.field_features.len(), 2);
+        assert!(
+            final_chunk
+                .field_features
+                .iter()
+                .all(|features| features.as_ref().unwrap().is_empty())
+        );
+        assert_eq!(final_chunk.robot_poses.len(), 2);
+        assert!(
+            final_chunk
+                .robot_poses
+                .iter()
+                .all(|poses| poses.as_ref().unwrap().is_empty())
+        );
+    }
+
+    #[test]
+    fn relocated_model_run_is_loaded_and_can_be_deleted() {
+        let cache = tempfile::tempdir().unwrap();
+        let local_fingerprint = fingerprint();
+        let remote_fingerprint = RecordingFingerprint {
+            canonical_path: PathBuf::from("/remote/fake-recording.mcap"),
+            ..local_fingerprint.clone()
+        };
+        let proposed = ModelRunManifest::new(
+            "remote",
+            PathBuf::from("/remote/model.onnx"),
+            [7; 32],
+            remote_fingerprint,
+            DetectionThresholds::default(),
+            1,
+            0..=0,
+        )
+        .unwrap();
+        let run_key = proposed.run_key.clone();
+        let mut store = PredictionStore::open(cache.path(), proposed).unwrap();
+        store.append(prediction(0)).unwrap();
+        store.finish().unwrap();
+        drop(store);
+
+        let loaded = load_all_runs(cache.path(), &local_fingerprint, 1).unwrap();
+        assert!(loaded.iter().any(|run| run.key == run_key));
+
+        delete_model_run(cache.path(), &local_fingerprint, &run_key).unwrap();
+        assert!(
+            !cache
+                .path()
+                .join(MODEL_RUNS_DIRECTORY)
+                .join(run_key)
+                .exists()
+        );
+    }
+
+    #[test]
+    fn relocated_model_run_with_different_metadata_is_ignored() {
+        let cache = tempfile::tempdir().unwrap();
+        let local_fingerprint = fingerprint();
+        let remote_fingerprint = RecordingFingerprint {
+            canonical_path: PathBuf::from("/remote/fake-recording.mcap"),
+            size: local_fingerprint.size + 1,
+            ..local_fingerprint.clone()
+        };
+        let proposed = ModelRunManifest::new(
+            "different recording",
+            PathBuf::from("/remote/model.onnx"),
+            [7; 32],
+            remote_fingerprint,
+            DetectionThresholds::default(),
+            1,
+            0..=0,
+        )
+        .unwrap();
+        let run_key = proposed.run_key.clone();
+        drop(PredictionStore::open(cache.path(), proposed).unwrap());
+
+        let loaded = load_all_runs(cache.path(), &local_fingerprint, 1).unwrap();
+        assert!(loaded.iter().all(|run| run.key != run_key));
+        assert!(delete_model_run(cache.path(), &local_fingerprint, &run_key).is_err());
+    }
+
+    #[test]
     fn run_ui_metadata_round_trips() {
         let cache = tempfile::tempdir().unwrap();
         let metadata = BTreeMap::from([
@@ -2275,6 +2872,78 @@ mod tests {
         assert_eq!((first.frame_start, first.frame_end), (10, 20));
         assert_eq!(first.target_frame_count().unwrap(), 11);
         assert_ne!(first.run_key, second.run_key);
+    }
+
+    #[test]
+    fn prior_optional_output_run_keys_remain_loadable() {
+        let cache = tempfile::tempdir().unwrap();
+        let proposed = manifest(1);
+        let legacy_identity = bincode::serialize(&(
+            &proposed.canonical_model_path,
+            &proposed.model_hash,
+            &proposed.recording_fingerprint,
+            proposed.thresholds,
+            CACHE_VERSION,
+            proposed.frame_start,
+            proposed.frame_end,
+            proposed.total_frame_count,
+        ))
+        .unwrap();
+        let legacy_digest = blake3::hash(&legacy_identity).to_hex().to_string();
+        let legacy_run_key = format!("model-{}", &legacy_digest[..16]);
+        let field_feature_identity = bincode::serialize(&(
+            &proposed.canonical_model_path,
+            &proposed.model_hash,
+            &proposed.recording_fingerprint,
+            proposed.thresholds,
+            CACHE_VERSION,
+            2_u32,
+            proposed.frame_start,
+            proposed.frame_end,
+            proposed.total_frame_count,
+        ))
+        .unwrap();
+        let field_feature_digest = blake3::hash(&field_feature_identity).to_hex().to_string();
+        let field_feature_run_key = format!("model-{}", &field_feature_digest[..16]);
+        assert_ne!(proposed.run_key, legacy_run_key);
+        assert_ne!(proposed.run_key, field_feature_run_key);
+        assert_ne!(legacy_run_key, field_feature_run_key);
+
+        let mut legacy_manifest = proposed.clone();
+        legacy_manifest.run_key.clone_from(&legacy_run_key);
+        let mut store = PredictionStore::open(cache.path(), legacy_manifest).unwrap();
+        store.append(prediction(0)).unwrap();
+        store.finish().unwrap();
+        drop(store);
+
+        let mut field_feature_manifest = proposed;
+        field_feature_manifest
+            .run_key
+            .clone_from(&field_feature_run_key);
+        let mut store = PredictionStore::open(cache.path(), field_feature_manifest).unwrap();
+        store
+            .append_with_optional_outputs(prediction(0), Some(Vec::new()), None)
+            .unwrap();
+        store.finish().unwrap();
+        drop(store);
+
+        let runs = load_all_runs(cache.path(), &fingerprint(), 1).unwrap();
+        let legacy = runs.iter().find(|run| run.key == legacy_run_key).unwrap();
+        let legacy_chunk = legacy.prediction_chunk(0).unwrap();
+        assert!(legacy_chunk.field_features[0].is_none());
+        assert!(legacy_chunk.robot_poses[0].is_none());
+        let field_feature = runs
+            .iter()
+            .find(|run| run.key == field_feature_run_key)
+            .unwrap();
+        let field_feature_chunk = field_feature.prediction_chunk(0).unwrap();
+        assert!(
+            field_feature_chunk.field_features[0]
+                .as_ref()
+                .unwrap()
+                .is_empty()
+        );
+        assert!(field_feature_chunk.robot_poses[0].is_none());
     }
 
     #[test]

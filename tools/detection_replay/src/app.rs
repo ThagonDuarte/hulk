@@ -20,7 +20,10 @@ use eframe::{
 use egui_dock::{DockArea, DockState, Node, Split, TabViewer};
 use types::{
     object_detection::{Object, RobocupObjectLabel, YOLOObjectLabel},
-    pose_detection::{Keypoint, POSE_SKELETON_EDGES, Pose},
+    pose_detection::{
+        FieldFeatureDetection, FieldFeatureLabel, Keypoint, POSE_SKELETON_EDGES, Pose,
+        ROBOT_POSE_SKELETON_EDGES, RobotPoseDetection,
+    },
 };
 
 use crate::timeline::TimelineState;
@@ -147,7 +150,7 @@ struct ReplayApp {
     decoded_frames: BTreeMap<usize, ColorImage>,
     loader: FrameLoader,
     prediction_loader: PredictionLoader,
-    loaded_prediction_chunks: BTreeMap<(String, usize), Vec<Option<Arc<Prediction>>>>,
+    loaded_prediction_chunks: BTreeMap<(String, usize), Vec<Option<LoadedFramePrediction>>>,
     frame_errors: BTreeMap<usize, String>,
     is_playing: bool,
     loop_playback: bool,
@@ -155,7 +158,9 @@ struct ReplayApp {
     playback_accumulator: f64,
     last_playback_update: Instant,
     confidence_filter: f32,
-    show_poses: bool,
+    show_person_poses: bool,
+    show_robot_poses: bool,
+    show_field_features: bool,
     keypoint_confidence_filter: f32,
     camera_zoom: f32,
     camera_pan: Vec2,
@@ -188,10 +193,17 @@ enum RunAction {
 }
 
 enum PredictionDisplay {
-    Ready(Arc<Prediction>),
+    Ready(LoadedFramePrediction),
     Loading,
     Unavailable,
     Error,
+}
+
+#[derive(Clone)]
+struct LoadedFramePrediction {
+    prediction: Arc<Prediction>,
+    field_features: Option<Arc<Vec<FieldFeatureDetection>>>,
+    robot_poses: Option<Arc<Vec<RobotPoseDetection>>>,
 }
 
 impl ReplayApp {
@@ -271,7 +283,9 @@ impl ReplayApp {
             playback_accumulator: 0.0,
             last_playback_update: Instant::now(),
             confidence_filter: 0.5,
-            show_poses: false,
+            show_person_poses: false,
+            show_robot_poses: true,
+            show_field_features: true,
             keypoint_confidence_filter: 0.5,
             camera_zoom: 1.0,
             camera_pan: Vec2::ZERO,
@@ -332,7 +346,29 @@ impl ReplayApp {
             match result.chunk {
                 Ok(chunk) => {
                     self.prediction_errors.remove(&key);
-                    self.loaded_prediction_chunks.insert(key, chunk.predictions);
+                    if chunk.predictions.len() != chunk.field_features.len()
+                        || chunk.predictions.len() != chunk.robot_poses.len()
+                    {
+                        self.prediction_errors.insert(
+                            key,
+                            "prediction and optional-output chunks are not aligned".to_string(),
+                        );
+                        continue;
+                    }
+                    let predictions = chunk
+                        .predictions
+                        .into_iter()
+                        .zip(chunk.field_features)
+                        .zip(chunk.robot_poses)
+                        .map(|((prediction, field_features), robot_poses)| {
+                            prediction.map(|prediction| LoadedFramePrediction {
+                                prediction,
+                                field_features,
+                                robot_poses,
+                            })
+                        })
+                        .collect();
+                    self.loaded_prediction_chunks.insert(key, predictions);
                 }
                 Err(error) => {
                     self.prediction_errors.insert(
@@ -587,9 +623,11 @@ impl ReplayApp {
         ui.add(
             egui::Slider::new(&mut self.confidence_filter, 0.0..=1.0).text("display confidence"),
         );
-        ui.checkbox(&mut self.show_poses, "Show poses");
+        ui.checkbox(&mut self.show_field_features, "Show field features");
+        ui.checkbox(&mut self.show_robot_poses, "Show robot poses");
+        ui.checkbox(&mut self.show_person_poses, "Show person poses");
         ui.add_enabled(
-            self.show_poses,
+            self.show_person_poses || self.show_robot_poses,
             egui::Slider::new(&mut self.keypoint_confidence_filter, 0.0..=1.0)
                 .text("keypoint confidence"),
         );
@@ -952,7 +990,8 @@ impl ReplayApp {
             Color32::WHITE,
         );
         match prediction {
-            PredictionDisplay::Ready(prediction) => {
+            PredictionDisplay::Ready(loaded) => {
+                let prediction = &loaded.prediction;
                 draw_objects(
                     ui,
                     viewport,
@@ -961,7 +1000,32 @@ impl ReplayApp {
                     &prediction.objects,
                     self.confidence_filter,
                 );
-                if self.show_poses
+                if self.show_field_features
+                    && let Some(field_features) = &loaded.field_features
+                {
+                    draw_field_features(
+                        ui,
+                        viewport,
+                        image_rect,
+                        image_size,
+                        field_features,
+                        self.confidence_filter,
+                    );
+                }
+                if self.show_robot_poses
+                    && let Some(robot_poses) = &loaded.robot_poses
+                {
+                    draw_robot_poses(
+                        ui,
+                        viewport,
+                        image_rect,
+                        image_size,
+                        robot_poses,
+                        self.confidence_filter,
+                        self.keypoint_confidence_filter,
+                    );
+                }
+                if self.show_person_poses
                     && let Some(poses) = &prediction.poses
                 {
                     draw_poses(
@@ -993,8 +1057,8 @@ impl ReplayApp {
                     .iter()
                     .filter(|object| object.bounding_box.confidence >= self.confidence_filter)
                     .count();
-                let pose_status = prediction.poses.as_ref().map_or_else(
-                    || "poses unavailable".to_string(),
+                let person_pose_status = prediction.poses.as_ref().map_or_else(
+                    || "person poses unavailable".to_string(),
                     |poses| {
                         let count = poses
                             .iter()
@@ -1002,11 +1066,33 @@ impl ReplayApp {
                                 pose.object.bounding_box.confidence >= self.confidence_filter
                             })
                             .count();
-                        format!("{count} poses")
+                        format!("{count} person poses")
+                    },
+                );
+                let field_feature_status = loaded.field_features.as_ref().map_or_else(
+                    || "field features unavailable".to_string(),
+                    |field_features| {
+                        let count = field_features
+                            .iter()
+                            .filter(|feature| feature.confidence >= self.confidence_filter)
+                            .count();
+                        format!("{count} field features")
+                    },
+                );
+                let robot_pose_status = loaded.robot_poses.as_ref().map_or_else(
+                    || "robot poses unavailable".to_string(),
+                    |robot_poses| {
+                        let count = robot_poses
+                            .iter()
+                            .filter(|pose| {
+                                pose.object.bounding_box.confidence >= self.confidence_filter
+                            })
+                            .count();
+                        format!("{count} robot poses")
                     },
                 );
                 ui.label(format!(
-                    "{object_count} detections, {pose_status}, {timing}"
+                    "{object_count} detections, {field_feature_status}, {robot_pose_status}, {person_pose_status}, {timing}"
                 ));
             }
             PredictionDisplay::Loading => {
@@ -1489,6 +1575,107 @@ fn draw_objects(
     }
 }
 
+fn draw_field_features(
+    ui: &Ui,
+    clip: Rect,
+    image_rect: Rect,
+    image_size: Vec2,
+    field_features: &[FieldFeatureDetection],
+    confidence_filter: f32,
+) {
+    let scale = vec2(
+        image_rect.width() / image_size.x.max(1.0),
+        image_rect.height() / image_size.y.max(1.0),
+    );
+    let painter = ui.painter_at(clip);
+    for feature in field_features
+        .iter()
+        .filter(|feature| feature.confidence >= confidence_filter)
+    {
+        let point = image_rect.min + vec2(feature.point.x() * scale.x, feature.point.y() * scale.y);
+        let (label, color) = field_feature_style(feature.label);
+        painter.circle_stroke(point, 6.0, Stroke::new(2.0, color));
+        painter.line_segment(
+            [point - vec2(8.0, 0.0), point + vec2(8.0, 0.0)],
+            Stroke::new(2.0, color),
+        );
+        painter.line_segment(
+            [point - vec2(0.0, 8.0), point + vec2(0.0, 8.0)],
+            Stroke::new(2.0, color),
+        );
+
+        let text = format!("{label} {:.0}%", feature.confidence * 100.0);
+        let position = point + vec2(10.0, -8.0);
+        let galley = painter.layout_no_wrap(text, FontId::proportional(12.0), Color32::WHITE);
+        painter.rect_filled(
+            Rect::from_min_size(position - vec2(2.0, 1.0), galley.size() + vec2(4.0, 2.0)),
+            2.0,
+            color.gamma_multiply(0.8),
+        );
+        painter.galley(position, galley, Color32::WHITE);
+    }
+}
+
+fn draw_robot_poses(
+    ui: &Ui,
+    clip: Rect,
+    image_rect: Rect,
+    image_size: Vec2,
+    poses: &[RobotPoseDetection],
+    pose_confidence_filter: f32,
+    keypoint_confidence_filter: f32,
+) {
+    let scale = vec2(
+        image_rect.width() / image_size.x.max(1.0),
+        image_rect.height() / image_size.y.max(1.0),
+    );
+    let painter = ui.painter_at(clip);
+    let color = label_color(RobocupObjectLabel::Robot);
+    for pose in poses
+        .iter()
+        .filter(|pose| pose.object.bounding_box.confidence >= pose_confidence_filter)
+    {
+        let keypoints = pose.keypoints.as_array();
+        for (start, end) in ROBOT_POSE_SKELETON_EDGES {
+            if keypoints[start].confidence < keypoint_confidence_filter
+                || keypoints[end].confidence < keypoint_confidence_filter
+            {
+                continue;
+            }
+            painter.line_segment(
+                [
+                    pose_point(image_rect, scale, keypoints[start]),
+                    pose_point(image_rect, scale, keypoints[end]),
+                ],
+                Stroke::new(2.0, color.gamma_multiply(0.85)),
+            );
+        }
+        for keypoint in keypoints {
+            if keypoint.confidence >= keypoint_confidence_filter {
+                painter.circle_filled(pose_point(image_rect, scale, keypoint), 3.0, color);
+            }
+        }
+
+        let bounding_box = pose.object.bounding_box;
+        let min = image_rect.min
+            + vec2(
+                bounding_box.area.min.x() * scale.x,
+                bounding_box.area.min.y() * scale.y,
+            );
+        let max = image_rect.min
+            + vec2(
+                bounding_box.area.max.x() * scale.x,
+                bounding_box.area.max.y() * scale.y,
+            );
+        painter.rect_stroke(
+            Rect::from_min_max(min, max).intersect(clip),
+            egui::CornerRadius::same(3),
+            Stroke::new(2.0, color),
+            StrokeKind::Outside,
+        );
+    }
+}
+
 fn draw_poses(
     ui: &Ui,
     clip: Rect,
@@ -1565,6 +1752,19 @@ fn label_color(label: RobocupObjectLabel) -> Color32 {
         RobocupObjectLabel::Robot => Color32::from_rgb(255, 89, 123),
         RobocupObjectLabel::TSpot => Color32::from_rgb(179, 136, 255),
         RobocupObjectLabel::XSpot => Color32::from_rgb(93, 230, 129),
+        RobocupObjectLabel::Person => Color32::from_rgb(74, 144, 226),
+    }
+}
+
+fn field_feature_style(label: FieldFeatureLabel) -> (&'static str, Color32) {
+    match label {
+        FieldFeatureLabel::GoalPost => ("GoalPost", label_color(RobocupObjectLabel::GoalPost)),
+        FieldFeatureLabel::LSpot => ("LSpot", label_color(RobocupObjectLabel::LSpot)),
+        FieldFeatureLabel::TSpot => ("TSpot", label_color(RobocupObjectLabel::TSpot)),
+        FieldFeatureLabel::PenaltySpot => {
+            ("PenaltySpot", label_color(RobocupObjectLabel::PenaltySpot))
+        }
+        FieldFeatureLabel::XSpot => ("XSpot", label_color(RobocupObjectLabel::XSpot)),
     }
 }
 
