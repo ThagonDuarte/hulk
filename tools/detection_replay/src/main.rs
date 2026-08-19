@@ -1,7 +1,8 @@
-use std::{io::Write, path::PathBuf, str::FromStr, time::Duration};
+use std::{path::PathBuf, str::FromStr, time::Duration};
 
 use clap::{Parser, Subcommand};
 use color_eyre::{Result, eyre::Context};
+use detection::{ExecutionProvider, ExecutionProviderOptions};
 use detection_replay::{DetectionThresholds, ModelRunConfig, Recording, run_model};
 use tracing_subscriber::EnvFilter;
 
@@ -36,6 +37,12 @@ enum Command {
         confidence: f32,
         #[arg(long, default_value_t = 0.4)]
         iou: f32,
+        /// ONNX Runtime execution provider.
+        #[arg(long, value_enum, default_value = "cuda")]
+        provider: ProviderArgument,
+        /// GPU device index used by TensorRT or CUDA.
+        #[arg(long, default_value_t = 0, value_name = "INDEX")]
+        gpu: u32,
         /// Stop after this many frames in the selected range. Useful for provider smoke tests.
         #[arg(long)]
         limit: Option<usize>,
@@ -50,6 +57,26 @@ enum Command {
         #[command(flatten)]
         frames: FrameRangeArguments,
     },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+enum ProviderArgument {
+    Automatic,
+    #[value(name = "tensorrt")]
+    TensorRt,
+    Cuda,
+    Cpu,
+}
+
+impl ProviderArgument {
+    fn execution_provider(self) -> ExecutionProvider {
+        match self {
+            Self::Automatic => ExecutionProvider::Automatic,
+            Self::TensorRt => ExecutionProvider::TensorRt,
+            Self::Cuda => ExecutionProvider::Cuda,
+            Self::Cpu => ExecutionProvider::Cpu,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, clap::Args)]
@@ -143,6 +170,8 @@ fn main() -> Result<()> {
             cache_dir,
             confidence,
             iou,
+            provider,
+            gpu,
             limit,
             frames,
         } => {
@@ -168,6 +197,10 @@ fn main() -> Result<()> {
                 for model in model {
                     let mut config = ModelRunConfig::new(model.label.clone(), model.path);
                     config.thresholds = thresholds;
+                    config.provider_options = ExecutionProviderOptions {
+                        provider: provider.execution_provider(),
+                        device_id: gpu,
+                    };
                     config.frame_limit = limit;
                     config.start_frame = start_frame;
                     config.end_frame = Some(end_frame);
@@ -195,7 +228,7 @@ fn main() -> Result<()> {
                 Ok(())
             });
             runtime.shutdown_timeout(Duration::from_secs(2));
-            exit_after_webgpu(prerender_result)?;
+            prerender_result?;
         }
         Command::View {
             recording,
@@ -229,26 +262,4 @@ fn resolve_recording(path: PathBuf) -> PathBuf {
 
 fn default_cache_dir(recording: &std::path::Path) -> PathBuf {
     recording.with_extension("detection-replay-cache")
-}
-
-fn exit_after_webgpu(result: Result<()>) -> Result<()> {
-    #[cfg(target_os = "linux")]
-    {
-        let status = match result {
-            Ok(()) => 0,
-            Err(error) => {
-                eprintln!("Error: {error:?}");
-                1
-            }
-        };
-        // ORT 1.22's WebGPU artifact double-releases its Dawn instance from an
-        // atexit handler. All cache files are synced before reaching this point.
-        let _ = std::io::stdout().flush();
-        let _ = std::io::stderr().flush();
-        // SAFETY: all application-owned output and cache files were flushed above.
-        unsafe { libc::_exit(status) }
-    }
-
-    #[cfg(not(target_os = "linux"))]
-    result
 }

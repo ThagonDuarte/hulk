@@ -14,11 +14,10 @@ bincode = { workspace = true }
 blake3 = { workspace = true }
 clap = { workspace = true, features = ["derive"] }
 color-eyre = { workspace = true }
-detection = { workspace = true, features = ["bundled-webgpu"] }
+detection = { workspace = true, default-features = false, features = ["nvidia"] }
 eframe = { workspace = true }
 egui_dock = { workspace = true }
 image = { workspace = true }
-libc = { workspace = true }
 mcap = { workspace = true }
 ort = { workspace = true }
 ros-z = { workspace = true }

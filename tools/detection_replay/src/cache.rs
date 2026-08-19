@@ -182,23 +182,13 @@ impl ModelRunManifest {
         total_frame_count: usize,
         frame_range: RangeInclusive<usize>,
     ) -> Result<Self> {
-        let label = label.into();
         let thresholds = thresholds.validate()?;
         let frame_start = *frame_range.start();
         let frame_end = *frame_range.end();
         validate_frame_range(frame_start, frame_end, total_frame_count)?;
-        let run_key = model_run_key(
-            &canonical_model_path,
-            &model_hash,
-            &recording_fingerprint,
-            thresholds,
-            frame_start,
-            frame_end,
-            total_frame_count,
-        )?;
-        Ok(Self {
-            run_key,
-            label,
+        let mut manifest = Self {
+            run_key: String::new(),
+            label: label.into(),
             canonical_model_path,
             model_hash,
             recording_fingerprint,
@@ -211,7 +201,15 @@ impl ModelRunManifest {
             state: ModelRunState::Running,
             error: None,
             provider_note: None,
-        })
+        };
+        manifest.run_key = model_run_key(&manifest)?;
+        Ok(manifest)
+    }
+
+    pub fn with_provider_identity(mut self, provider_note: impl Into<String>) -> Result<Self> {
+        self.provider_note = Some(provider_note.into());
+        self.run_key = model_run_key(&self)?;
+        Ok(self)
     }
 
     pub fn target_frame_count(&self) -> Result<usize> {
@@ -1858,27 +1856,38 @@ fn lock_file(path: &Path, nonblocking: bool) -> Result<File> {
     Ok(file)
 }
 
-fn model_run_key(
-    canonical_model_path: &Path,
-    model_hash: &[u8; 32],
-    recording_fingerprint: &RecordingFingerprint,
-    thresholds: DetectionThresholds,
-    frame_start: usize,
-    frame_end: usize,
-    total_frame_count: usize,
-) -> Result<String> {
-    validate_frame_range(frame_start, frame_end, total_frame_count)?;
-    let identity = bincode::serialize(&(
-        canonical_model_path,
-        model_hash,
-        recording_fingerprint,
-        thresholds,
-        CACHE_VERSION,
-        MODEL_RUN_PAYLOAD_VERSION,
-        frame_start,
-        frame_end,
-        total_frame_count,
-    ))
+fn model_run_key(manifest: &ModelRunManifest) -> Result<String> {
+    validate_frame_range(
+        manifest.frame_start,
+        manifest.frame_end,
+        manifest.total_frame_count,
+    )?;
+    let identity = match manifest.provider_note.as_deref() {
+        Some(provider_note) => bincode::serialize(&(
+            &manifest.canonical_model_path,
+            &manifest.model_hash,
+            &manifest.recording_fingerprint,
+            manifest.thresholds,
+            CACHE_VERSION,
+            MODEL_RUN_PAYLOAD_VERSION,
+            manifest.frame_start,
+            manifest.frame_end,
+            manifest.total_frame_count,
+            "execution-provider-v1",
+            provider_note,
+        )),
+        None => bincode::serialize(&(
+            &manifest.canonical_model_path,
+            &manifest.model_hash,
+            &manifest.recording_fingerprint,
+            manifest.thresholds,
+            CACHE_VERSION,
+            MODEL_RUN_PAYLOAD_VERSION,
+            manifest.frame_start,
+            manifest.frame_end,
+            manifest.total_frame_count,
+        )),
+    }
     .wrap_err("failed to serialize model run identity")?;
     let digest = blake3::hash(&identity).to_hex().to_string();
     Ok(format!("model-{}", &digest[..16]))
@@ -2543,6 +2552,29 @@ mod tests {
             0..=total - 1,
         )
         .unwrap()
+    }
+
+    #[test]
+    fn provider_and_device_are_part_of_run_identity() {
+        let create = |provider_note: &str| {
+            ModelRunManifest::new(
+                "model",
+                PathBuf::from("/tmp/model.onnx"),
+                [7; 32],
+                fingerprint(),
+                DetectionThresholds::default(),
+                10,
+                0..=9,
+            )
+            .unwrap()
+            .with_provider_identity(provider_note)
+            .unwrap()
+        };
+
+        let cuda_zero = create("CUDA device 0");
+        let cuda_one = create("CUDA device 1");
+        assert_ne!(cuda_zero.run_key, cuda_one.run_key);
+        assert_eq!(cuda_zero.provider_note.as_deref(), Some("CUDA device 0"));
     }
 
     #[test]

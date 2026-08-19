@@ -12,6 +12,7 @@ use color_eyre::{
     Result,
     eyre::{Context as _, ContextCompat, Report, bail, eyre},
 };
+use detection::{ExecutionProvider, ExecutionProviderOptions};
 use ros_z::prelude::*;
 use ros2::sensor_msgs::image::Image;
 use tokio::task::JoinHandle;
@@ -30,8 +31,6 @@ use crate::{
     recording::{OriginalFrame, Recording},
 };
 
-const PROVIDER_NOTE: &str =
-    "detection provider order: WebGPU, then ONNX Runtime implicit CPU fallback";
 static NEXT_NAMESPACE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Debug)]
@@ -39,6 +38,7 @@ pub struct ModelRunConfig {
     pub label: String,
     pub model_path: PathBuf,
     pub thresholds: DetectionThresholds,
+    pub provider_options: ExecutionProviderOptions,
     pub frame_limit: Option<usize>,
     pub start_frame: usize,
     pub end_frame: Option<usize>,
@@ -54,6 +54,10 @@ impl ModelRunConfig {
             label: label.into(),
             model_path: model_path.into(),
             thresholds: DetectionThresholds::default(),
+            provider_options: ExecutionProviderOptions {
+                provider: ExecutionProvider::Cuda,
+                device_id: 0,
+            },
             frame_limit: None,
             start_frame: 0,
             end_frame: None,
@@ -82,6 +86,7 @@ where
 {
     let cache_directory = recording.cache_directory();
     let (canonical_model_path, model_hash) = hash_model(&config.model_path)?;
+    let provider_note = provider_note(config.provider_options);
     let frame_end = config
         .end_frame
         .unwrap_or_else(|| recording.frame_count().saturating_sub(1));
@@ -93,7 +98,8 @@ where
         config.thresholds,
         recording.frame_count(),
         config.start_frame..=frame_end,
-    )?;
+    )?
+    .with_provider_identity(provider_note.clone())?;
     let frame_count = proposed.target_frame_count()?;
     // Migrate matching legacy cache keys before creating a potentially colliding v2 run.
     recording.load_runs()?;
@@ -109,7 +115,7 @@ where
     });
 
     if store.completed_count() < target_frames {
-        store.begin(PROVIDER_NOTE)?;
+        store.begin(provider_note)?;
         if let Err(error) = execute_run(
             recording,
             cache_directory,
@@ -170,7 +176,7 @@ where
     let mut detector_task =
         AbortOnDropTask::new(tokio::spawn(detection::run_boxed_with_model_info(
             Arc::clone(&context),
-            detection::ExecutionProviderPolicy::WebGpuRequired,
+            config.provider_options,
             model_info_sender,
         )));
 
@@ -591,6 +597,28 @@ fn duration_nanos(duration: Duration) -> u64 {
     duration.as_nanos().min(u128::from(u64::MAX)) as u64
 }
 
+fn provider_note(options: ExecutionProviderOptions) -> String {
+    match options.provider {
+        ExecutionProvider::Automatic => format!(
+            "detection provider order: TensorRT, CUDA, then ONNX Runtime implicit CPU fallback; GPU device {}",
+            options.device_id
+        ),
+        ExecutionProvider::TensorRt => format!(
+            "detection provider order: TensorRT, CUDA, then ONNX Runtime implicit CPU fallback; GPU device {}",
+            options.device_id
+        ),
+        ExecutionProvider::Cuda => format!(
+            "detection provider order: CUDA, then ONNX Runtime implicit CPU fallback; GPU device {}",
+            options.device_id
+        ),
+        ExecutionProvider::WebGpu => format!(
+            "detection provider order: WebGPU, then ONNX Runtime implicit CPU fallback; GPU device {}",
+            options.device_id
+        ),
+        ExecutionProvider::Cpu => "detection provider: ONNX Runtime CPU".to_string(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -600,7 +628,27 @@ mod tests {
         let config = ModelRunConfig::new("model", "model.onnx");
         assert_eq!(config.thresholds.minimum_candidate_confidence, 0.05);
         assert_eq!(config.thresholds.maximum_intersection_over_union, 0.4);
+        assert_eq!(config.provider_options.provider, ExecutionProvider::Cuda);
+        assert_eq!(config.provider_options.device_id, 0);
         assert_eq!(config.cleanup_warning_after, Duration::from_secs(5));
+    }
+
+    #[test]
+    fn provider_notes_describe_provider_and_device() {
+        assert_eq!(
+            provider_note(ExecutionProviderOptions {
+                provider: ExecutionProvider::Cuda,
+                device_id: 1,
+            }),
+            "detection provider order: CUDA, then ONNX Runtime implicit CPU fallback; GPU device 1"
+        );
+        assert_eq!(
+            provider_note(ExecutionProviderOptions {
+                provider: ExecutionProvider::Cpu,
+                device_id: 7,
+            }),
+            "detection provider: ONNX Runtime CPU"
+        );
     }
 
     #[test]

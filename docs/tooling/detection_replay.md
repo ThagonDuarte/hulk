@@ -1,6 +1,6 @@
 # Detection Replay
 
-`detection-replay` prerenders object detections from ROS-Z MCAP recordings and compares models on a synchronized image feed. Inference uses the production detection implementation through `run_boxed_with_model_info` with WebGPU required; viewing only reads cached predictions.
+`detection-replay` prerenders object detections from ROS-Z MCAP recordings and compares models on a synchronized image feed. Inference uses the production detection implementation through `run_boxed_with_model_info`; viewing only reads cached predictions. The repository wrapper builds and runs the tool in release mode.
 
 ## Recording index
 
@@ -24,12 +24,13 @@ Run models sequentially so their GPU timings and predictions do not interfere:
 ./detection-replay prerender /path/to/recording.mcap \
   --model baseline=/path/to/baseline.onnx \
   --model candidate=/path/to/candidate.onnx \
+  --provider cuda --gpu 1 \
   --start-frame 5000 --end-frame 5500
 ```
 
 Each input frame is published only after the preceding result has been received. Predictions are matched by the image header timestamp and written in atomic chunks. Repeating the command resumes at the first uncached frame.
 
-Use `--limit 10` for a short provider/model compatibility check. The default confidence threshold is `0.05` and the default NMS IoU is `0.4`; use `--confidence` and `--iou` to change them. Thresholds and the model hash are part of the cache identity.
+Use `--limit 10` for a short provider/model compatibility check. CUDA is the default provider. Select `automatic`, `tensorrt`, `cuda`, or `cpu` with `--provider`; `--gpu` selects the physical device index for NVIDIA providers. `tensorrt` retains CUDA as an operator fallback, while `automatic` follows the available production order TensorRT, CUDA, then CPU in this NVIDIA build. The default confidence threshold is `0.05` and the default NMS IoU is `0.4`; use `--confidence` and `--iou` to change them. Thresholds, model hash, provider, and device are part of the cache identity, so switching provider cannot silently mix results or timing measurements in one run.
 
 Models must accept `raw_bytes_input` as a rank-three `uint8` tensor with shape `[height / 2, width / 2, 6]`. Its contiguous bytes are the full-resolution NV12 Y plane followed by the half-height interleaved UV plane; image width and height must be multiples of 32.
 
@@ -41,7 +42,7 @@ Models must accept `raw_bytes_input` as a rank-three `uint8` tensor with shape `
 
 `field_feature_output` is also optional and must be `float32 [1, 300, 4]`. Each row is `[x, y, confidence, class_index]` in full-image pixel coordinates. Class indices are GoalPost, LSpot, TSpot, PenaltySpot, and XSpot. Replay stores the timestamp-matched field-feature points separately from the object and pose chunks so caches created before field-feature capture remain readable.
 
-The desktop replay build bundles the x86-64 ONNX Runtime 1.22 WebGPU distribution and Dawn. The wrapper prevents a CPU-only system runtime discovered through `pkg-config` from overriding it. Operators unsupported by WebGPU may still use ORT's CPU fallback. Robot builds dynamically load the runtime image and retain the provider order TensorRT, CUDA, WebGPU, then implicit CPU; WebGPU registration succeeds there only when that runtime image provides it.
+The desktop replay build uses the x86-64 ONNX Runtime 1.22 CUDA distribution. The wrapper prevents a CPU-only system runtime discovered through `pkg-config` from overriding it and adds CUDA 12 user-space libraries from the multi-task YOLO virtual environment to the loader path when they are available. Operators unsupported by the selected NVIDIA provider may still use ORT's CPU fallback. Robot builds dynamically load their runtime image and retain the default provider order compiled into that deployment. Provider and device selection are generic startup options in the detection node; replay-specific CLI parsing, CUDA library discovery, and defaults remain confined to this tool.
 
 ## Viewing
 
@@ -77,6 +78,7 @@ Use a short range before prerendering an entire recording:
 ./detection-replay index /path/to/recording.mcap --start-frame 100 --end-frame 109
 ./detection-replay prerender /path/to/recording.mcap \
   --model test=etc/neural_networks/model.onnx \
+  --provider cuda --gpu 0 \
   --start-frame 100 --end-frame 109 --limit 10
 ```
 

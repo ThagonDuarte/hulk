@@ -3260,7 +3260,6 @@ dependencies = [
  "eframe",
  "egui_dock",
  "image",
- "libc",
  "mcap",
  "ort",
  "ros-z",

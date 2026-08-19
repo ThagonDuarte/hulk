@@ -1,7 +1,19 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# ort-sys otherwise prefers a system CPU-only ONNX Runtime over its WebGPU build.
+# ort-sys otherwise prefers a system CPU-only ONNX Runtime over its CUDA build.
 THIS_DIRECTORY="$(dirname "$(readlink -f "$0")")"
-exec env LIBONNXRUNTIME_NO_PKG_CONFIG=1 cargo run \
+
+# The ML environment already supplies the CUDA 12 user-space libraries needed by
+# ONNX Runtime. Keep this desktop-only discovery out of the robotics runtime.
+shopt -s nullglob
+CUDA_LIBRARY_DIRECTORIES=(
+  "${THIS_DIRECTORY}"/tools/machine-learning/multi-task-yolo/.venv/lib/python*/site-packages/nvidia/*/lib
+)
+if (( ${#CUDA_LIBRARY_DIRECTORIES[@]} )); then
+  CUDA_LIBRARY_PATH="$(IFS=:; printf '%s' "${CUDA_LIBRARY_DIRECTORIES[*]}")"
+  export LD_LIBRARY_PATH="${CUDA_LIBRARY_PATH}${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
+fi
+
+exec env LIBONNXRUNTIME_NO_PKG_CONFIG=1 cargo run --release \
   --manifest-path="${THIS_DIRECTORY}/tools/detection_replay/Cargo.toml" -- "$@"
