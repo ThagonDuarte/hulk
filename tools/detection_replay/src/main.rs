@@ -2,7 +2,7 @@ use std::{path::PathBuf, str::FromStr, time::Duration};
 
 use clap::{Parser, Subcommand};
 use color_eyre::{Result, eyre::Context};
-use detection::{ExecutionProvider, ExecutionProviderOptions};
+use detection::ExecutionProvider;
 use detection_replay::{DetectionThresholds, ModelRunConfig, Recording, run_model};
 use tracing_subscriber::EnvFilter;
 
@@ -77,6 +77,10 @@ impl ProviderArgument {
             Self::Cpu => ExecutionProvider::Cpu,
         }
     }
+
+    fn uses_nvidia(self) -> bool {
+        !matches!(self, Self::Cpu)
+    }
 }
 
 #[derive(Clone, Copy, Debug, clap::Args)]
@@ -131,12 +135,14 @@ impl FromStr for ModelArgument {
 }
 
 fn main() -> Result<()> {
+    let arguments = Arguments::parse();
+    configure_gpu_visibility(&arguments.command);
     color_eyre::install()?;
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::from_default_env())
         .init();
 
-    match Arguments::parse().command {
+    match arguments.command {
         Command::Index {
             recording,
             cache_dir,
@@ -197,10 +203,8 @@ fn main() -> Result<()> {
                 for model in model {
                     let mut config = ModelRunConfig::new(model.label.clone(), model.path);
                     config.thresholds = thresholds;
-                    config.provider_options = ExecutionProviderOptions {
-                        provider: provider.execution_provider(),
-                        device_id: gpu,
-                    };
+                    config.provider = provider.execution_provider();
+                    config.gpu_device_id = gpu;
                     config.frame_limit = limit;
                     config.start_frame = start_frame;
                     config.end_frame = Some(end_frame);
@@ -244,6 +248,19 @@ fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+fn configure_gpu_visibility(command: &Command) {
+    let Command::Prerender { provider, gpu, .. } = command else {
+        return;
+    };
+    if !provider.uses_nvidia() {
+        return;
+    }
+
+    // SAFETY: this runs at process startup, before ONNX Runtime initialization or
+    // creation of the Tokio worker threads that may load CUDA.
+    unsafe { std::env::set_var("CUDA_VISIBLE_DEVICES", gpu.to_string()) };
 }
 
 fn report_recording_warning(recording: &Recording) {

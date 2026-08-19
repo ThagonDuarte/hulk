@@ -48,13 +48,6 @@ pub enum ExecutionProvider {
     Cpu,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-/// Startup-only configuration for the detection inference session.
-pub struct ExecutionProviderOptions {
-    pub provider: ExecutionProvider,
-    pub device_id: u32,
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 /// Capabilities reported after the ONNX session has been created.
 pub struct DetectionModelInfo {
@@ -114,15 +107,7 @@ struct ModelOutputs<'a> {
 }
 
 pub fn run_boxed(ctx: Arc<Context>) -> Pin<Box<dyn Future<Output = Result<()>> + Send>> {
-    run_boxed_with_provider_options(ctx, ExecutionProviderOptions::default())
-}
-
-/// Runs detection with explicit inference-session startup options.
-pub fn run_boxed_with_provider_options(
-    ctx: Arc<Context>,
-    provider_options: ExecutionProviderOptions,
-) -> Pin<Box<dyn Future<Output = Result<()>> + Send>> {
-    Box::pin(run(ctx, provider_options, None))
+    Box::pin(run(ctx, ExecutionProvider::Automatic, None))
 }
 
 /// Runs detection and reports model capabilities once session creation succeeds.
@@ -130,15 +115,15 @@ pub fn run_boxed_with_provider_options(
 /// The one-shot notification does not indicate that ROS-Z publishers and subscribers are ready.
 pub fn run_boxed_with_model_info(
     ctx: Arc<Context>,
-    provider_options: ExecutionProviderOptions,
+    provider: ExecutionProvider,
     model_info_sender: oneshot::Sender<DetectionModelInfo>,
 ) -> Pin<Box<dyn Future<Output = Result<()>> + Send>> {
-    Box::pin(run(ctx, provider_options, Some(model_info_sender)))
+    Box::pin(run(ctx, provider, Some(model_info_sender)))
 }
 
 async fn run(
     ctx: Arc<Context>,
-    provider_options: ExecutionProviderOptions,
+    provider: ExecutionProvider,
     model_info_sender: Option<oneshot::Sender<DetectionModelInfo>>,
 ) -> Result<()> {
     let node = ctx.create_node("detection").build().await?;
@@ -181,8 +166,7 @@ async fn run(
         .neural_networks_folder
         .join(&parameters.model_name);
 
-    let execution_providers =
-        execution_providers(&parameters.neural_networks_folder, provider_options)?;
+    let execution_providers = execution_providers(&parameters.neural_networks_folder, provider)?;
 
     let mut session = block_in_place(|| {
         Session::builder()?
@@ -353,26 +337,24 @@ fn model_info_from_output_names<'a>(
 
 fn execution_providers(
     _neural_networks_folder: &Path,
-    options: ExecutionProviderOptions,
+    provider: ExecutionProvider,
 ) -> Result<Vec<ExecutionProviderDispatch>> {
     #[allow(unused_mut)]
     let mut providers = Vec::new();
-    let device_id = i32::try_from(options.device_id)
-        .map_err(|_| eyre!("GPU device ID {} exceeds i32::MAX", options.device_id))?;
 
     #[cfg(feature = "nvidia")]
     if matches!(
-        options.provider,
+        provider,
         ExecutionProvider::Automatic | ExecutionProvider::TensorRt
     ) {
         let tensor_rt = TensorRTExecutionProvider::default()
-            .with_device_id(device_id)
+            .with_device_id(0)
             .with_fp16(true)
             .with_engine_cache(true)
             .with_engine_cache_path(_neural_networks_folder.display());
         log_provider_availability(&tensor_rt);
         let tensor_rt = tensor_rt.build();
-        providers.push(if options.provider == ExecutionProvider::TensorRt {
+        providers.push(if provider == ExecutionProvider::TensorRt {
             tensor_rt.error_on_failure()
         } else {
             tensor_rt
@@ -381,13 +363,13 @@ fn execution_providers(
 
     #[cfg(feature = "nvidia")]
     if matches!(
-        options.provider,
+        provider,
         ExecutionProvider::Automatic | ExecutionProvider::TensorRt | ExecutionProvider::Cuda
     ) {
-        let cuda = CUDAExecutionProvider::default().with_device_id(device_id);
+        let cuda = CUDAExecutionProvider::default().with_device_id(0);
         log_provider_availability(&cuda);
         let cuda = cuda.build();
-        providers.push(if options.provider == ExecutionProvider::Cuda {
+        providers.push(if provider == ExecutionProvider::Cuda {
             cuda.error_on_failure()
         } else {
             cuda
@@ -396,13 +378,13 @@ fn execution_providers(
 
     #[cfg(feature = "webgpu-provider")]
     if matches!(
-        options.provider,
+        provider,
         ExecutionProvider::Automatic | ExecutionProvider::WebGpu
     ) {
-        let webgpu = WebGPUExecutionProvider::default().with_device_id(device_id);
+        let webgpu = WebGPUExecutionProvider::default().with_device_id(0);
         log_provider_availability(&webgpu);
         let webgpu = webgpu.build();
-        let webgpu = if options.provider == ExecutionProvider::WebGpu {
+        let webgpu = if provider == ExecutionProvider::WebGpu {
             webgpu.error_on_failure()
         } else {
             webgpu
@@ -412,14 +394,14 @@ fn execution_providers(
 
     #[cfg(not(feature = "nvidia"))]
     if matches!(
-        options.provider,
+        provider,
         ExecutionProvider::TensorRt | ExecutionProvider::Cuda
     ) {
         bail!("the requested NVIDIA provider is not compiled into detection");
     }
 
     #[cfg(not(feature = "webgpu-provider"))]
-    if options.provider == ExecutionProvider::WebGpu {
+    if provider == ExecutionProvider::WebGpu {
         bail!("WebGPU was requested but detection was built without its WebGPU feature");
     }
 
@@ -713,14 +695,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn default_provider_options_preserve_production_behavior() {
-        assert_eq!(
-            ExecutionProviderOptions::default(),
-            ExecutionProviderOptions {
-                provider: ExecutionProvider::Automatic,
-                device_id: 0,
-            }
-        );
+    fn default_provider_preserves_production_behavior() {
+        assert_eq!(ExecutionProvider::default(), ExecutionProvider::Automatic);
     }
 
     #[test]
