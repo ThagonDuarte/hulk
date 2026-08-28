@@ -1,7 +1,7 @@
 {
   enable: true,
   neural_networks_folder: "etc/neural_networks",
-  model_name: "yolo26m-seg=f11+yolo26m~cheek+yolo26m-pose~badge.onnx",
+  model_name: "yolo26x-pose=f17+yolo26x~necklace+yolo26x-pose+yolo26x-pose~bargain.onnx",
   object_detection_parameters: {
     maximum_intersection_over_union: 0.4,
     minimum_candidate_confidence: 0.05,
