@@ -32,6 +32,24 @@ class RenderOnnxPredictionsTest(TestCase):
 
         self.assertEqual(provider, "CUDAExecutionProvider")
 
+    def test_label_bounds_avoid_an_occupied_label(self) -> None:
+        first = render_onnx_predictions.label_bounds(
+            box=(20, 0, 100, 80),
+            label_size=(60, 16),
+            image_size=(96, 120),
+            occupied=(),
+        )
+        second = render_onnx_predictions.label_bounds(
+            box=(24, 0, 104, 80),
+            label_size=(60, 16),
+            image_size=(96, 120),
+            occupied=(first,),
+        )
+
+        self.assertFalse(
+            render_onnx_predictions.rectangles_overlap(first, second)
+        )
+
     def test_non_maximum_suppression_retains_best_overlap(self) -> None:
         predictions = [
             Prediction(

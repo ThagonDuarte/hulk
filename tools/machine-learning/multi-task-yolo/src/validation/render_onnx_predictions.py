@@ -365,11 +365,70 @@ def class_name(
     return str(class_index)
 
 
+def rectangles_overlap(
+    first: tuple[int, int, int, int],
+    second: tuple[int, int, int, int],
+) -> bool:
+    return not (
+        first[2] <= second[0]
+        or second[2] <= first[0]
+        or first[3] <= second[1]
+        or second[3] <= first[1]
+    )
+
+
+def label_bounds(
+    *,
+    box: tuple[int, int, int, int],
+    label_size: tuple[int, int],
+    image_size: tuple[int, int],
+    occupied: Sequence[tuple[int, int, int, int]],
+) -> tuple[int, int, int, int]:
+    x1, y1, x2, y2 = box
+    label_width, label_height = label_size
+    image_height, image_width = image_size
+    maximum_x = max(0, image_width - label_width)
+    maximum_y = max(0, image_height - label_height)
+
+    x_candidates = (
+        x1,
+        x2 - label_width,
+        (x1 + x2 - label_width) // 2,
+    )
+    y_candidates = (
+        y1 - label_height,
+        y1,
+        y1 + label_height,
+        y1 + 2 * label_height,
+        y2 - label_height,
+        y2,
+    )
+    candidates = []
+    for candidate_y in y_candidates:
+        for candidate_x in x_candidates:
+            candidate_x = max(0, min(candidate_x, maximum_x))
+            candidate_y = max(0, min(candidate_y, maximum_y))
+            candidate = (
+                candidate_x,
+                candidate_y,
+                candidate_x + label_width,
+                candidate_y + label_height,
+            )
+            if candidate not in candidates:
+                candidates.append(candidate)
+
+    for candidate in candidates:
+        if not any(rectangles_overlap(candidate, other) for other in occupied):
+            return candidate
+    return candidates[0]
+
+
 def draw_prediction_label(
     image: np.ndarray,
     prediction: Prediction,
     names: Mapping[int, str] | Sequence[str],
     color: tuple[int, int, int],
+    occupied_labels: list[tuple[int, int, int, int]],
 ) -> None:
     height, width = image.shape[:2]
     x1, y1, x2, y2 = clipped_box(prediction.box_xyxy, width, height)
@@ -386,12 +445,13 @@ def draw_prediction_label(
     text_width, text_height = text_size
     label_width = text_width + LABEL_PAD_X * 2
     label_height = text_height + baseline + LABEL_PAD_Y * 2
-    label_x1 = max(0, min(x1, width - label_width))
-    label_y1 = y1 - label_height
-    if label_y1 < 0:
-        label_y1 = min(y1, height - label_height)
-    label_x2 = label_x1 + label_width
-    label_y2 = label_y1 + label_height
+    label_x1, label_y1, label_x2, label_y2 = label_bounds(
+        box=(x1, y1, x2, y2),
+        label_size=(label_width, label_height),
+        image_size=(height, width),
+        occupied=occupied_labels,
+    )
+    occupied_labels.append((label_x1, label_y1, label_x2, label_y2))
 
     region = image[label_y1:label_y2, label_x1:label_x2]
     overlay = np.full_like(region, color)
@@ -461,6 +521,7 @@ def render_onnx_predictions(
     keypoint_confidence_threshold: float,
 ) -> np.ndarray:
     rendered = image.copy()
+    occupied_labels: list[tuple[int, int, int, int]] = []
     for prediction in sorted(objects, key=prediction_area, reverse=True):
         color = model_class_color(ModelHead.OBJECT, prediction.cls)
         draw_bounding_box(rendered, prediction.box_xyxy, color)
@@ -470,6 +531,7 @@ def render_onnx_predictions(
                 prediction,
                 OBJECT_CLASS_NAMES,
                 color,
+                occupied_labels,
             )
 
     draw_pose_predictions(
@@ -479,6 +541,7 @@ def render_onnx_predictions(
         names=PERSON_POSE_CLASS_NAMES,
         skeleton=COCO_SKELETON,
         draw_labels=draw_labels,
+        occupied_labels=occupied_labels,
         keypoint_confidence_threshold=keypoint_confidence_threshold,
     )
     draw_pose_predictions(
@@ -488,6 +551,7 @@ def render_onnx_predictions(
         names=ROBOT_POSE_CLASS_NAMES,
         skeleton=ROBOT_SKELETON,
         draw_labels=draw_labels,
+        occupied_labels=occupied_labels,
         keypoint_confidence_threshold=keypoint_confidence_threshold,
     )
     return rendered
@@ -501,6 +565,7 @@ def draw_pose_predictions(
     names: tuple[str, ...],
     skeleton: tuple[tuple[int, int], ...],
     draw_labels: bool,
+    occupied_labels: list[tuple[int, int, int, int]],
     keypoint_confidence_threshold: float,
 ) -> None:
     color = model_class_color(head)
@@ -513,7 +578,13 @@ def draw_pose_predictions(
             confidence_threshold=keypoint_confidence_threshold,
         )
         if draw_labels:
-            draw_prediction_label(image, prediction, names, color)
+            draw_prediction_label(
+                image,
+                prediction,
+                names,
+                color,
+                occupied_labels,
+            )
 
 
 def extract_predictions(
