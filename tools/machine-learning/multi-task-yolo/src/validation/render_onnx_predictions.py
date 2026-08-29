@@ -588,17 +588,28 @@ def create_session(
     intra_threads: int,
     execution_provider: str,
 ) -> ort.InferenceSession:
+    if execution_provider != "CPUExecutionProvider" and hasattr(
+        ort, "preload_dlls"
+    ):
+        ort.preload_dlls()
     options = ort.SessionOptions()
     options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
     options.intra_op_num_threads = intra_threads
     providers = [execution_provider]
     if execution_provider != "CPUExecutionProvider":
         providers.append("CPUExecutionProvider")
-    return ort.InferenceSession(
+    session = ort.InferenceSession(
         model_path,
         sess_options=options,
         providers=providers,
     )
+    if execution_provider not in session.get_providers():
+        active = ", ".join(session.get_providers())
+        raise click.ClickException(  # noqa: TRY003
+            f"Requested provider {execution_provider} did not activate. "
+            f"Active providers: {active}",
+        )
+    return session
 
 
 def validate_config(

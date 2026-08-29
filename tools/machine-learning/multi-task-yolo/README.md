@@ -148,6 +148,8 @@ uv run -m validation.render_onnx_predictions \
 The default `--provider auto` selects TensorRT, CUDA, or CPU in that order.
 Use `--provider cuda` when a batch must run on an NVIDIA GPU without silently
 falling back to CPU setup.
+Install ONNX Runtime's `cuda` and `cudnn` extras when the CUDA libraries are not
+provided system-wide.
 By default, the renderer also removes person poses whose bounding boxes overlap
 a robot pose by more than `0.8` IoU. Change the cutoff with
 `--person-robot-overlap-iou`, or disable the filter with
