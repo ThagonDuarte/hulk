@@ -67,11 +67,11 @@ CLASS_COLORS_BGR = (
     (102, 187, 106),
     (255, 138, 101),
 )
-LABEL_MIN_FONT_SCALE = 0.42
-LABEL_MAX_FONT_SCALE = 0.62
-LABEL_FONT_BOX_WIDTH_RATIO = 170
-LABEL_PAD_X = 5
-LABEL_PAD_Y = 4
+LABEL_MIN_FONT_SCALE = 0.32
+LABEL_MAX_FONT_SCALE = 0.46
+LABEL_FONT_BOX_WIDTH_RATIO = 220
+LABEL_PAD_X = 4
+LABEL_PAD_Y = 3
 LABEL_BACKGROUND_ALPHA = 0.65
 
 
@@ -100,6 +100,7 @@ class RenderConfig:
     device: str
     batch: int
     num_images: int
+    draw_labels: bool
 
 
 class ModelPathNotFoundError(click.ClickException):
@@ -701,6 +702,7 @@ def render_predictions(
     *,
     names: Mapping[int, str] | Sequence[str] | None,
     task_type: TaskType,
+    draw_labels: bool = True,
 ) -> np.ndarray:
     rendered = ensure_bgr_image(image)
     ordered_predictions = sorted(
@@ -722,10 +724,21 @@ def render_predictions(
         for prediction in ordered_predictions:
             draw_pose(rendered, prediction, class_color(prediction.cls))
 
+        if draw_labels:
+            for prediction in ordered_predictions:
+                draw_box_label(
+                    rendered,
+                    prediction,
+                    names,
+                    class_color(prediction.cls),
+                )
+        return rendered
+
     for prediction in ordered_predictions:
         color = class_color(prediction.cls)
         draw_rounded_box(rendered, prediction.box_xyxy, color)
-        draw_box_label(rendered, prediction, names, color)
+        if draw_labels:
+            draw_box_label(rendered, prediction, names, color)
 
     return rendered
 
@@ -764,13 +777,16 @@ def draw_pose(
     image: np.ndarray,
     prediction: Prediction,
     color: tuple[int, int, int],
+    *,
+    skeleton: Sequence[tuple[int, int]] = COCO_SKELETON,
+    confidence_threshold: float = 0.25,
 ) -> None:
     keypoints = prediction.keypoints
     if keypoints is None or len(keypoints) == 0:
         return
 
-    visible = keypoint_visibility(keypoints)
-    for start, end in COCO_SKELETON:
+    visible = keypoint_visibility(keypoints, confidence_threshold)
+    for start, end in skeleton:
         if start >= len(keypoints) or end >= len(keypoints):
             continue
         if not visible[start] or not visible[end]:
@@ -805,9 +821,12 @@ def draw_pose(
         )
 
 
-def keypoint_visibility(keypoints: np.ndarray) -> np.ndarray:
+def keypoint_visibility(
+    keypoints: np.ndarray,
+    confidence_threshold: float = 0.25,
+) -> np.ndarray:
     if keypoints.shape[1] >= 3:
-        return keypoints[:, 2] > 0.25
+        return keypoints[:, 2] > confidence_threshold
     return (keypoints[:, 0] > 0) & (keypoints[:, 1] > 0)
 
 
@@ -1237,6 +1256,7 @@ def render_hydra_model(
             filtered,
             names=result_names(result, model),
             task_type=task_type,
+            draw_labels=config.draw_labels,
         )
         output_path = (
             model_output_dir
@@ -1323,6 +1343,7 @@ def render_hydra_source_model(
             filtered,
             names=result_names(result, model),
             task_type=task_type,
+            draw_labels=config.draw_labels,
         )
         output_path = (
             model_output_dir
@@ -1532,6 +1553,13 @@ def validate_cli_config(
     show_default=True,
     help="Number of images to label. -1 labels all selected images.",
 )
+@click.option(
+    "--labels/--no-labels",
+    "draw_labels",
+    default=True,
+    show_default=True,
+    help="Draw class and confidence labels.",
+)
 def main(
     *,
     hydra_model_names: tuple[HydraModelName, ...],
@@ -1550,6 +1578,7 @@ def main(
     device: str,
     batch: int,
     num_images: int,
+    draw_labels: bool,
 ) -> None:
     validate_cli_config(
         data=data,
@@ -1559,6 +1588,7 @@ def main(
         imgsz=imgsz,
         batch=batch,
         num_images=num_images,
+        draw_labels=draw_labels,
     )
     effective_iou_threshold = (
         None

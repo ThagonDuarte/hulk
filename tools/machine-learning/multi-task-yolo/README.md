@@ -23,6 +23,8 @@ This project uses `uv run ...` for all commands.
 - `src/model/hydra.py`: Hydra model assembly (shared backbone + per-task heads).
 - `src/model/train.py`: Click CLI for single-task YOLO tuning/training.
 - `src/validation/validator.py`: validation pipeline for original models and Hydra heads.
+- `src/validation/render_predictions.py`: render PyTorch Hydra head predictions.
+- `src/validation/render_onnx_predictions.py`: render combined three-head ONNX predictions.
 - `src/validation/compare_results.py`: compare two saved validation runs.
 - `src/validation/predictor.py`: local smoke predictor/visualizer for detection + pose.
 - `src/utils/export_yolo_to_onnx.py`: export a single YOLO checkpoint with NV12 preprocessing.
@@ -47,6 +49,9 @@ uv run -m validation.validator --help
 
 # Compare two validation runs
 uv run -m validation.compare_results --help
+
+# Render exported three-head ONNX predictions
+uv run -m validation.render_onnx_predictions --help
 
 # Single-task ONNX export help
 uv run -m utils.export_yolo_to_onnx --help
@@ -120,6 +125,33 @@ Validation outputs are saved under `runs/val/...` and include:
 - `metrics.json`
 - `metadata.json`
 - `config.json`
+
+## Render three-head ONNX predictions
+
+`src/validation/render_onnx_predictions.py` renders object boxes, COCO person
+poses, and 14-keypoint robot poses onto a shared source image. It applies
+confidence filtering and non-maximum suppression independently to each head.
+Pose heads draw keypoints and skeletons without pose bounding boxes.
+
+The renderer assigns a distinct color to every object class and pose task in
+the three-head model. Labels are compact by default. Pass `--no-labels` to
+keep only object boxes and pose keypoints and skeletons.
+
+```bash
+uv run -m validation.render_onnx_predictions \
+  path/to/model.onnx \
+  path/to/source-images \
+  runs/rendered-onnx \
+  --num-images 100
+```
+
+The default `--provider auto` selects TensorRT, CUDA, or CPU in that order.
+Use `--provider cuda` when a batch must run on an NVIDIA GPU without silently
+falling back to CPU setup.
+By default, the renderer also removes person poses whose bounding boxes overlap
+a robot pose by more than `0.8` IoU. Change the cutoff with
+`--person-robot-overlap-iou`, or disable the filter with
+`--keep-overlapping-person-poses`.
 
 ## Compare validation runs (`src/validation/compare_results.py`)
 
