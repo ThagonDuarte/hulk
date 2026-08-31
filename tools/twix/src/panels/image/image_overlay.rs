@@ -3,16 +3,16 @@ use std::{sync::Arc, time::Duration};
 use color_eyre::{Report, eyre::Context as _};
 use coordinate_systems::Pixel;
 use eframe::egui::{
-    Align2, Color32, CornerRadius, DragValue, FontId, Painter, PopupCloseBehavior, Pos2, Rect,
-    Stroke, Ui,
+    Align2, Color32, CornerRadius, DragValue, FontId, Mesh, Painter, PopupCloseBehavior, Pos2,
+    Rect, Shape, Stroke, StrokeKind, Ui, Vec2,
     containers::menu::{MenuButton, MenuConfig},
     pos2, vec2,
 };
-use linear_algebra::{Point2, point};
+use linear_algebra::Point2;
 use ros_z::{Message, time::Time};
 use ros_z_debug::{RetentionPolicy, SampleRecord, TopicObservation};
 use serde_json::{Value, json};
-use types::time_wrapper::TimeWrapper;
+use types::{bounding_box::BoundingBox, time_wrapper::TimeWrapper};
 
 use crate::repaint::{ObservationContext, ObservationRepaint, RepaintOnUpdates};
 
@@ -24,6 +24,19 @@ use super::overlays::{
 
 const OVERLAY_RETENTION_WINDOW: Duration = Duration::from_secs(2);
 const DEFAULT_CONFIDENCE_THRESHOLD: f32 = 0.5;
+const DETECTION_BOX_CORNER_RADIUS: f32 = 7.0;
+const DETECTION_BOX_OPACITY: f32 = 0.85;
+const DETECTION_STROKE_WIDTH: f32 = 1.0;
+const DETECTION_LABEL_PADDING: Vec2 = vec2(4.0, 2.0);
+const DETECTION_LABEL_FONT_SIZE: f32 = 12.0;
+const DETECTION_LABEL_BOLD_OFFSET: f32 = 0.6;
+const MAXIMUM_INSIDE_LABEL_FRACTION: f32 = 0.5;
+
+#[derive(Clone, Copy)]
+enum DetectionLabelCorner {
+    TopLeft,
+    BottomLeft,
+}
 
 pub(super) struct ImageOverlays {
     line_detection: OverlaySlot<LineDetectionOverlay>,
@@ -429,13 +442,95 @@ impl ImageOverlayPainter {
         );
     }
 
-    pub(super) fn rect_stroke(&self, min: Point2<Pixel>, max: Point2<Pixel>, stroke: Stroke) {
-        let top_right = point![max.x(), min.y()];
-        let bottom_left = point![min.x(), max.y()];
-        self.line_segment(min, top_right, stroke);
-        self.line_segment(top_right, max, stroke);
-        self.line_segment(max, bottom_left, stroke);
-        self.line_segment(bottom_left, min, stroke);
+    pub(super) fn detection_line_segment(
+        &self,
+        start: Point2<Pixel>,
+        end: Point2<Pixel>,
+        color: Color32,
+    ) {
+        self.line_segment(start, end, Stroke::new(DETECTION_STROKE_WIDTH, color));
+    }
+
+    pub(super) fn detection_box(
+        &self,
+        bounding_box: BoundingBox,
+        class_label: String,
+        class_color: Color32,
+    ) {
+        let rect = Rect::from_min_max(
+            self.position(bounding_box.area.min),
+            self.position(bounding_box.area.max),
+        );
+        if !rect.is_positive() {
+            return;
+        }
+
+        let translucent_color = class_color.gamma_multiply(DETECTION_BOX_OPACITY);
+        self.painter.rect_stroke(
+            rect,
+            CornerRadius::same(DETECTION_BOX_CORNER_RADIUS as u8),
+            self.stroke(Stroke::new(DETECTION_STROKE_WIDTH, translucent_color)),
+            StrokeKind::Inside,
+        );
+        let confidence_rect = self.detection_label(
+            rect,
+            DetectionLabelCorner::TopLeft,
+            format!("{:.2}", bounding_box.confidence),
+            translucent_color,
+            class_color,
+            None,
+        );
+        self.detection_label(
+            rect,
+            DetectionLabelCorner::BottomLeft,
+            class_label,
+            translucent_color,
+            class_color,
+            confidence_rect,
+        );
+    }
+
+    fn detection_label(
+        &self,
+        bounding_box_rect: Rect,
+        corner: DetectionLabelCorner,
+        text: String,
+        background_color: Color32,
+        class_color: Color32,
+        occupied_inside_rect: Option<Rect>,
+    ) -> Option<Rect> {
+        let text_color = contrast_text_color(class_color);
+        let galley = self.painter.layout_no_wrap(
+            text,
+            FontId::proportional(DETECTION_LABEL_FONT_SIZE),
+            text_color,
+        );
+        let label_size =
+            galley.size() + 2.0 * DETECTION_LABEL_PADDING + vec2(DETECTION_LABEL_BOLD_OFFSET, 0.0);
+        let (label_rect, is_inside) =
+            detection_label_rect(bounding_box_rect, label_size, corner, occupied_inside_rect);
+        if !is_inside {
+            let fill_points = outside_bounding_box_corner_fill(bounding_box_rect, corner);
+            self.painter.add(Shape::mesh(colored_polygon_mesh(
+                &fill_points,
+                background_color,
+            )));
+        }
+        self.painter.rect_filled(
+            label_rect,
+            detection_label_corner_radius(corner, is_inside),
+            background_color,
+        );
+        let clipped_painter = self.painter.with_clip_rect(label_rect);
+        let text_position = label_rect.min + DETECTION_LABEL_PADDING;
+        clipped_painter.galley(text_position, galley.clone(), text_color);
+        clipped_painter.galley(
+            text_position + vec2(DETECTION_LABEL_BOLD_OFFSET, 0.0),
+            galley,
+            text_color,
+        );
+
+        is_inside.then_some(label_rect)
     }
 
     pub(super) fn circle_filled(&self, center: Point2<Pixel>, radius: f32, fill_color: Color32) {
@@ -530,6 +625,111 @@ impl ImageOverlayPainter {
     }
 }
 
+fn detection_label_rect(
+    bounding_box_rect: Rect,
+    label_size: Vec2,
+    corner: DetectionLabelCorner,
+    occupied_inside_rect: Option<Rect>,
+) -> (Rect, bool) {
+    let inside_min = match corner {
+        DetectionLabelCorner::TopLeft => bounding_box_rect.left_top(),
+        DetectionLabelCorner::BottomLeft => pos2(
+            bounding_box_rect.left(),
+            bounding_box_rect.bottom() - label_size.y,
+        ),
+    };
+    let inside_rect = Rect::from_min_size(inside_min, label_size);
+    let fits_inside = label_size.x <= bounding_box_rect.width() * MAXIMUM_INSIDE_LABEL_FRACTION
+        && label_size.y <= bounding_box_rect.height() * MAXIMUM_INSIDE_LABEL_FRACTION
+        && bounding_box_rect.contains_rect(inside_rect)
+        && occupied_inside_rect
+            .is_none_or(|occupied| !occupied.intersect(inside_rect).is_positive());
+    if fits_inside {
+        return (inside_rect, true);
+    }
+
+    let outside_min = match corner {
+        DetectionLabelCorner::TopLeft => pos2(
+            bounding_box_rect.left(),
+            bounding_box_rect.top() - label_size.y,
+        ),
+        DetectionLabelCorner::BottomLeft => {
+            pos2(bounding_box_rect.left(), bounding_box_rect.bottom())
+        }
+    };
+    (Rect::from_min_size(outside_min, label_size), false)
+}
+
+fn detection_label_corner_radius(corner: DetectionLabelCorner, is_inside: bool) -> CornerRadius {
+    let radius = DETECTION_BOX_CORNER_RADIUS as u8;
+    match corner {
+        DetectionLabelCorner::TopLeft => CornerRadius {
+            nw: radius,
+            ne: 0,
+            sw: 0,
+            se: if is_inside { radius } else { 0 },
+        },
+        DetectionLabelCorner::BottomLeft => CornerRadius {
+            nw: 0,
+            ne: if is_inside { radius } else { 0 },
+            sw: radius,
+            se: 0,
+        },
+    }
+}
+
+fn outside_bounding_box_corner_fill(
+    bounding_box_rect: Rect,
+    corner: DetectionLabelCorner,
+) -> Vec<Pos2> {
+    const ARC_SEGMENTS: usize = 4;
+    let radius = DETECTION_BOX_CORNER_RADIUS
+        .min(bounding_box_rect.width() * 0.5)
+        .min(bounding_box_rect.height() * 0.5);
+    let (outer_corner, arc_center, start_angle, end_angle) = match corner {
+        DetectionLabelCorner::TopLeft => (
+            bounding_box_rect.left_top(),
+            bounding_box_rect.left_top() + vec2(radius, radius),
+            -std::f32::consts::FRAC_PI_2,
+            -std::f32::consts::PI,
+        ),
+        DetectionLabelCorner::BottomLeft => (
+            bounding_box_rect.left_bottom(),
+            bounding_box_rect.left_bottom() + vec2(radius, -radius),
+            std::f32::consts::FRAC_PI_2,
+            std::f32::consts::PI,
+        ),
+    };
+    let mut points = Vec::with_capacity(ARC_SEGMENTS + 2);
+    points.push(outer_corner);
+    for index in 0..=ARC_SEGMENTS {
+        let angle = start_angle + (end_angle - start_angle) * index as f32 / ARC_SEGMENTS as f32;
+        points.push(arc_center + vec2(angle.cos() * radius, angle.sin() * radius));
+    }
+    points
+}
+
+fn colored_polygon_mesh(points: &[Pos2], color: Color32) -> Mesh {
+    let mut mesh = Mesh::default();
+    for &point in points {
+        mesh.colored_vertex(point, color);
+    }
+    for index in 1..points.len().saturating_sub(1) {
+        mesh.add_triangle(0, index as u32, index as u32 + 1);
+    }
+    mesh
+}
+
+fn contrast_text_color(background_color: Color32) -> Color32 {
+    let [red, green, blue, _] = background_color.to_srgba_unmultiplied();
+    let luminance = 0.299 * red as f32 + 0.587 * green as f32 + 0.114 * blue as f32;
+    if luminance > 150.0 {
+        Color32::BLACK
+    } else {
+        Color32::WHITE
+    }
+}
+
 pub(super) struct ImageBadgeLine {
     label: &'static str,
     value: String,
@@ -591,6 +791,174 @@ mod tests {
         assert_eq!(
             overlay_menu_config().close_behavior,
             PopupCloseBehavior::CloseOnClickOutside
+        );
+    }
+
+    #[test]
+    fn inside_detection_labels_are_attached_to_their_bounding_box_corners() {
+        let bounding_box_rect = Rect::from_min_max(pos2(10.0, 20.0), pos2(110.0, 120.0));
+
+        let (top_left, top_left_is_inside) = detection_label_rect(
+            bounding_box_rect,
+            vec2(30.0, 12.0),
+            DetectionLabelCorner::TopLeft,
+            None,
+        );
+        let (bottom_left, bottom_left_is_inside) = detection_label_rect(
+            bounding_box_rect,
+            vec2(40.0, 12.0),
+            DetectionLabelCorner::BottomLeft,
+            Some(top_left),
+        );
+
+        assert!(top_left_is_inside);
+        assert!(bounding_box_rect.contains_rect(top_left));
+        assert_eq!(top_left.left(), bounding_box_rect.left());
+        assert_eq!(top_left.top(), bounding_box_rect.top());
+        assert!(bottom_left_is_inside);
+        assert!(bounding_box_rect.contains_rect(bottom_left));
+        assert_eq!(bottom_left.left(), bounding_box_rect.left());
+        assert_eq!(bottom_left.bottom(), bounding_box_rect.bottom());
+    }
+
+    #[test]
+    fn attached_labels_round_the_outer_and_inner_corners() {
+        assert_eq!(
+            detection_label_corner_radius(DetectionLabelCorner::TopLeft, true),
+            CornerRadius {
+                nw: 7,
+                ne: 0,
+                sw: 0,
+                se: 7,
+            }
+        );
+        assert_eq!(
+            detection_label_corner_radius(DetectionLabelCorner::BottomLeft, true),
+            CornerRadius {
+                nw: 0,
+                ne: 7,
+                sw: 7,
+                se: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn labels_that_do_not_fit_are_placed_outside_the_bounding_box() {
+        let bounding_box_rect = Rect::from_min_max(pos2(10.0, 20.0), pos2(50.0, 50.0));
+
+        let (confidence, confidence_is_inside) = detection_label_rect(
+            bounding_box_rect,
+            vec2(60.0, 12.0),
+            DetectionLabelCorner::TopLeft,
+            None,
+        );
+        let (class, class_is_inside) = detection_label_rect(
+            bounding_box_rect,
+            vec2(60.0, 12.0),
+            DetectionLabelCorner::BottomLeft,
+            None,
+        );
+
+        assert!(!confidence_is_inside);
+        assert_eq!(confidence.left(), bounding_box_rect.left());
+        assert_eq!(confidence.bottom(), bounding_box_rect.top());
+        assert!(!class_is_inside);
+        assert_eq!(class.left(), bounding_box_rect.left());
+        assert_eq!(class.top(), bounding_box_rect.bottom());
+    }
+
+    #[test]
+    fn outside_labels_fill_only_the_outside_of_the_rounded_box_corner() {
+        let bounding_box_rect = Rect::from_min_max(pos2(10.0, 20.0), pos2(110.0, 120.0));
+        let top_fill =
+            outside_bounding_box_corner_fill(bounding_box_rect, DetectionLabelCorner::TopLeft);
+        let bottom_fill =
+            outside_bounding_box_corner_fill(bounding_box_rect, DetectionLabelCorner::BottomLeft);
+
+        assert_eq!(top_fill[0], bounding_box_rect.left_top());
+        assert!(top_fill[1].distance(pos2(17.0, 20.0)) < 0.001);
+        assert!(top_fill.last().unwrap().distance(pos2(10.0, 27.0)) < 0.001);
+        assert_eq!(bottom_fill[0], bounding_box_rect.left_bottom());
+        assert!(bottom_fill[1].distance(pos2(17.0, 120.0)) < 0.001);
+        assert!(bottom_fill.last().unwrap().distance(pos2(10.0, 113.0)) < 0.001);
+        assert_eq!(
+            detection_label_corner_radius(DetectionLabelCorner::TopLeft, false),
+            CornerRadius {
+                nw: 7,
+                ne: 0,
+                sw: 0,
+                se: 0,
+            }
+        );
+        assert_eq!(
+            detection_label_corner_radius(DetectionLabelCorner::BottomLeft, false),
+            CornerRadius {
+                nw: 0,
+                ne: 0,
+                sw: 7,
+                se: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn labels_over_half_of_either_box_dimension_are_placed_outside() {
+        let bounding_box_rect = Rect::from_min_max(pos2(10.0, 20.0), pos2(110.0, 120.0));
+        let (_, wide_label_is_inside) = detection_label_rect(
+            bounding_box_rect,
+            vec2(51.0, 12.0),
+            DetectionLabelCorner::TopLeft,
+            None,
+        );
+        let (_, tall_label_is_inside) = detection_label_rect(
+            bounding_box_rect,
+            vec2(12.0, 51.0),
+            DetectionLabelCorner::BottomLeft,
+            None,
+        );
+
+        assert!(!wide_label_is_inside);
+        assert!(!tall_label_is_inside);
+    }
+
+    #[test]
+    fn labels_at_half_of_both_box_dimensions_can_stay_inside() {
+        let bounding_box_rect = Rect::from_min_max(pos2(10.0, 20.0), pos2(110.0, 120.0));
+        let (_, is_inside) = detection_label_rect(
+            bounding_box_rect,
+            vec2(50.0, 50.0),
+            DetectionLabelCorner::TopLeft,
+            None,
+        );
+
+        assert!(is_inside);
+    }
+
+    #[test]
+    fn occupied_inside_space_moves_the_label_outside() {
+        let bounding_box_rect = Rect::from_min_max(pos2(10.0, 20.0), pos2(110.0, 120.0));
+        let occupied = Rect::from_min_max(pos2(20.0, 90.0), pos2(30.0, 100.0));
+        let (class, class_is_inside) = detection_label_rect(
+            bounding_box_rect,
+            vec2(40.0, 40.0),
+            DetectionLabelCorner::BottomLeft,
+            Some(occupied),
+        );
+
+        assert!(!class_is_inside);
+        assert_eq!(class.top(), bounding_box_rect.bottom());
+    }
+
+    #[test]
+    fn detection_label_text_contrasts_with_class_colors() {
+        assert_eq!(
+            contrast_text_color(Color32::from_rgb(255, 140, 56)),
+            Color32::BLACK
+        );
+        assert_eq!(
+            contrast_text_color(Color32::from_rgb(67, 112, 255)),
+            Color32::WHITE
         );
     }
 }

@@ -1,5 +1,4 @@
 use color_eyre::Report;
-use eframe::egui::Color32;
 use ros_z::time::Time;
 use types::{pose_detection::RobotPoseDetection, time_wrapper::TimeWrapper};
 
@@ -10,6 +9,7 @@ use super::{
         ConfidenceThresholdDefinition, ImageOverlay, ImageOverlayPainter, OverlayObservation,
     },
     pose::{PoseConfidenceThresholds, PoseStyle, paint_pose},
+    prediction_colors,
 };
 
 const ROBOT_SKELETON_KEYPOINT_LINE_MAPPING: [(usize, usize); 14] = [
@@ -28,11 +28,6 @@ const ROBOT_SKELETON_KEYPOINT_LINE_MAPPING: [(usize, usize); 14] = [
     (11, 12),
     (12, 13),
 ];
-const ROBOT_POSE_STYLE: PoseStyle = PoseStyle {
-    skeleton: Color32::from_rgb(185, 120, 230),
-    keypoint: Color32::from_rgb(220, 170, 255),
-    bounding_box: Color32::from_rgb(145, 70, 195),
-};
 const ROBOT_POSE_CONFIDENCE_THRESHOLDS: [ConfidenceThresholdDefinition; 2] = [
     ConfidenceThresholdDefinition::new(
         "Bounding box confidence",
@@ -82,7 +77,11 @@ impl ImageOverlay for RobotPoseDetectionOverlay {
                     bounding_box: confidence_thresholds[0],
                     keypoint: confidence_thresholds[1],
                 },
-                ROBOT_POSE_STYLE,
+                PoseStyle {
+                    skeleton: prediction_colors::ROBOT_POSE,
+                    keypoint: prediction_colors::ROBOT_POSE,
+                    bounding_box: prediction_colors::ROBOT_POSE,
+                },
             );
         }
     }

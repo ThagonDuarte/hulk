@@ -1,5 +1,4 @@
-use eframe::egui::{Align2, Color32, Stroke};
-use linear_algebra::point;
+use eframe::egui::{Align2, Color32};
 use types::{bounding_box::BoundingBox, pose_detection::Keypoint};
 
 use super::super::image_overlay::ImageOverlayPainter;
@@ -37,10 +36,10 @@ pub(super) fn paint_pose<const NUMBER_OF_KEYPOINTS: usize>(
             continue;
         }
 
-        painter.line_segment(
+        painter.detection_line_segment(
             keypoints[start].point,
             keypoints[end].point,
-            Stroke::new(2.0, style.skeleton),
+            style.skeleton,
         );
     }
 
@@ -58,21 +57,5 @@ pub(super) fn paint_pose<const NUMBER_OF_KEYPOINTS: usize>(
         );
     }
 
-    painter.rect_stroke(
-        bounding_box.area.min,
-        bounding_box.area.max,
-        Stroke::new(2.0, style.bounding_box),
-    );
-    painter.floating_text(
-        point![bounding_box.area.max.x(), bounding_box.area.min.y()],
-        Align2::RIGHT_TOP,
-        format!("{:.2}", bounding_box.confidence),
-        Color32::WHITE,
-    );
-    painter.floating_text(
-        point![bounding_box.area.min.x(), bounding_box.area.max.y()],
-        Align2::LEFT_BOTTOM,
-        label,
-        Color32::WHITE,
-    );
+    painter.detection_box(bounding_box, label, style.bounding_box);
 }

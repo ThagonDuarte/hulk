@@ -1,5 +1,4 @@
 use color_eyre::Report;
-use eframe::egui::{Align2, Color32, Stroke};
 use ros_z::time::Time;
 use types::{
     object_detection::{Object, RobocupObjectLabel},
@@ -11,6 +10,7 @@ use crate::repaint::ObservationContext;
 use super::super::image_overlay::{
     ConfidenceThresholdDefinition, ImageOverlay, ImageOverlayPainter, OverlayObservation,
 };
+use super::prediction_colors;
 
 const OBJECT_CONFIDENCE_THRESHOLDS: [ConfidenceThresholdDefinition; 1] =
     [ConfidenceThresholdDefinition::new(
@@ -50,7 +50,6 @@ impl ImageOverlay for ObjectDetectionOverlay {
             painter,
             &object_detections.value.inner,
             confidence_thresholds[0],
-            Color32::LIGHT_RED,
         );
     }
 
@@ -63,29 +62,16 @@ fn paint_bounding_boxes(
     painter: &ImageOverlayPainter,
     detections: &[Object<RobocupObjectLabel>],
     confidence_threshold: f32,
-    line_color: Color32,
 ) {
     for detection in detections {
         let bounding_box = detection.bounding_box;
         if bounding_box.confidence < confidence_threshold {
             continue;
         }
-        painter.rect_stroke(
-            bounding_box.area.min,
-            bounding_box.area.max,
-            Stroke::new(1.0, line_color),
-        );
-        painter.floating_text(
-            bounding_box.area.min,
-            Align2::RIGHT_BOTTOM,
-            format!("{:.2}", bounding_box.confidence),
-            Color32::WHITE,
-        );
-        painter.floating_text(
-            bounding_box.area.max,
-            Align2::RIGHT_TOP,
+        painter.detection_box(
+            bounding_box,
             detection.label.into(),
-            Color32::WHITE,
+            prediction_colors::robocup_object(detection.label),
         );
     }
 }

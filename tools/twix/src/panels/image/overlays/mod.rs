@@ -5,6 +5,7 @@ mod line_detection;
 mod object_detection;
 mod pose;
 mod pose_detection;
+mod prediction_colors;
 mod robot_pose_detection;
 
 pub(super) use ball_detection::BallDetectionOverlay;

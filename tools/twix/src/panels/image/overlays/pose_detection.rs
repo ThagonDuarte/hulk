@@ -1,5 +1,4 @@
 use color_eyre::Report;
-use eframe::egui::Color32;
 use ros_z::time::Time;
 use types::{
     object_detection::YOLOObjectLabel,
@@ -13,6 +12,7 @@ use super::super::image_overlay::{
     ConfidenceThresholdDefinition, ImageOverlay, ImageOverlayPainter, OverlayObservation,
 };
 use super::pose::{PoseConfidenceThresholds, PoseStyle, paint_pose};
+use super::prediction_colors;
 
 const POSE_SKELETON_KEYPOINT_LINE_MAPPING: [(usize, usize); 16] = [
     (0, 1),
@@ -100,9 +100,9 @@ fn paint_poses(
                 keypoint: keypoint_confidence_threshold,
             },
             PoseStyle {
-                skeleton: Color32::LIGHT_BLUE.gamma_multiply(0.4),
-                keypoint: Color32::BLUE,
-                bounding_box: Color32::DARK_BLUE.gamma_multiply(0.8),
+                skeleton: prediction_colors::PERSON_POSE,
+                keypoint: prediction_colors::PERSON_POSE,
+                bounding_box: prediction_colors::PERSON_POSE,
             },
         );
     }
