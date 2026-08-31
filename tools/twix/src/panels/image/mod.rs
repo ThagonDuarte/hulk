@@ -471,9 +471,20 @@ mod tests {
                     "ball_detection": {"active": false},
                     "horizon": {"active": false},
                     "field_border": {"active": false},
-                    "object_detection": {"active": false},
-                    "pose_detection": {"active": false},
-                    "robot_pose_detection": {"active": false},
+                    "object_detection": {
+                        "active": false,
+                        "confidence_threshold": 0.5,
+                    },
+                    "pose_detection": {
+                        "active": false,
+                        "bounding_box_confidence_threshold": 0.5,
+                        "keypoint_confidence_threshold": 0.5,
+                    },
+                    "robot_pose_detection": {
+                        "active": false,
+                        "bounding_box_confidence_threshold": 0.5,
+                        "keypoint_confidence_threshold": 0.5,
+                    },
                 },
             })
         );

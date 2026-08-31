@@ -8,7 +8,15 @@ use types::{
 
 use crate::repaint::ObservationContext;
 
-use super::super::image_overlay::{ImageOverlay, ImageOverlayPainter, OverlayObservation};
+use super::super::image_overlay::{
+    ConfidenceThresholdDefinition, ImageOverlay, ImageOverlayPainter, OverlayObservation,
+};
+
+const OBJECT_CONFIDENCE_THRESHOLDS: [ConfidenceThresholdDefinition; 1] =
+    [ConfidenceThresholdDefinition::new(
+        "Confidence",
+        "confidence_threshold",
+    )];
 
 pub(in crate::panels::image) struct ObjectDetectionOverlay {
     object_detections: OverlayObservation<TimeWrapper<Vec<Object<RobocupObjectLabel>>>>,
@@ -17,6 +25,8 @@ pub(in crate::panels::image) struct ObjectDetectionOverlay {
 impl ImageOverlay for ObjectDetectionOverlay {
     const NAME: &'static str = "Object Detection";
     const STORAGE_KEY: &'static str = "object_detection";
+    const CONFIDENCE_THRESHOLDS: &'static [ConfidenceThresholdDefinition] =
+        &OBJECT_CONFIDENCE_THRESHOLDS;
 
     fn new<C>(context: &C) -> Result<Self, Report>
     where
@@ -27,11 +37,21 @@ impl ImageOverlay for ObjectDetectionOverlay {
         })
     }
 
-    fn paint(&self, painter: &ImageOverlayPainter, image_time: Time) {
+    fn paint(
+        &self,
+        painter: &ImageOverlayPainter,
+        image_time: Time,
+        confidence_thresholds: &[f32],
+    ) {
         let Some(object_detections) = self.object_detections.at_time(image_time) else {
             return;
         };
-        paint_bounding_boxes(painter, &object_detections.value.inner, Color32::LIGHT_RED);
+        paint_bounding_boxes(
+            painter,
+            &object_detections.value.inner,
+            confidence_thresholds[0],
+            Color32::LIGHT_RED,
+        );
     }
 
     fn latest_time(&self) -> Option<Time> {
@@ -42,10 +62,14 @@ impl ImageOverlay for ObjectDetectionOverlay {
 fn paint_bounding_boxes(
     painter: &ImageOverlayPainter,
     detections: &[Object<RobocupObjectLabel>],
+    confidence_threshold: f32,
     line_color: Color32,
 ) {
     for detection in detections {
         let bounding_box = detection.bounding_box;
+        if bounding_box.confidence < confidence_threshold {
+            continue;
+        }
         painter.rect_stroke(
             bounding_box.area.min,
             bounding_box.area.max,

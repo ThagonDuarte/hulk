@@ -4,13 +4,17 @@ use types::{bounding_box::BoundingBox, pose_detection::Keypoint};
 
 use super::super::image_overlay::ImageOverlayPainter;
 
-pub(super) const KEYPOINT_CONFIDENCE_THRESHOLD: f32 = 0.8;
-
 #[derive(Clone, Copy)]
 pub(super) struct PoseStyle {
     pub(super) skeleton: Color32,
     pub(super) keypoint: Color32,
     pub(super) bounding_box: Color32,
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct PoseConfidenceThresholds {
+    pub(super) bounding_box: f32,
+    pub(super) keypoint: f32,
 }
 
 pub(super) fn paint_pose<const NUMBER_OF_KEYPOINTS: usize>(
@@ -19,11 +23,16 @@ pub(super) fn paint_pose<const NUMBER_OF_KEYPOINTS: usize>(
     label: String,
     keypoints: &[Keypoint; NUMBER_OF_KEYPOINTS],
     skeleton: &[(usize, usize)],
+    confidence_thresholds: PoseConfidenceThresholds,
     style: PoseStyle,
 ) {
+    if bounding_box.confidence < confidence_thresholds.bounding_box {
+        return;
+    }
+
     for &(start, end) in skeleton {
-        if keypoints[start].confidence < KEYPOINT_CONFIDENCE_THRESHOLD
-            || keypoints[end].confidence < KEYPOINT_CONFIDENCE_THRESHOLD
+        if keypoints[start].confidence < confidence_thresholds.keypoint
+            || keypoints[end].confidence < confidence_thresholds.keypoint
         {
             continue;
         }
@@ -36,7 +45,7 @@ pub(super) fn paint_pose<const NUMBER_OF_KEYPOINTS: usize>(
     }
 
     for keypoint in keypoints {
-        if keypoint.confidence < KEYPOINT_CONFIDENCE_THRESHOLD {
+        if keypoint.confidence < confidence_thresholds.keypoint {
             continue;
         }
 

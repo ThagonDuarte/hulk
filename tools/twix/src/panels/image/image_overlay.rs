@@ -3,7 +3,7 @@ use std::{sync::Arc, time::Duration};
 use color_eyre::{Report, eyre::Context as _};
 use coordinate_systems::Pixel;
 use eframe::egui::{
-    Align2, Color32, CornerRadius, FontId, Painter, Pos2, Rect, Stroke, Ui, pos2, vec2,
+    Align2, Color32, CornerRadius, DragValue, FontId, Painter, Pos2, Rect, Stroke, Ui, pos2, vec2,
 };
 use linear_algebra::{Point2, point};
 use ros_z::{Message, time::Time};
@@ -20,6 +20,7 @@ use super::overlays::{
 };
 
 const OVERLAY_RETENTION_WINDOW: Duration = Duration::from_secs(2);
+const DEFAULT_CONFIDENCE_THRESHOLD: f32 = 0.5;
 
 pub(super) struct ImageOverlays {
     line_detection: OverlaySlot<LineDetectionOverlay>,
@@ -135,6 +136,7 @@ struct OverlaySlot<T> {
     active: bool,
     overlay: Option<T>,
     error: Option<String>,
+    confidence_thresholds: Vec<f32>,
 }
 
 impl<T> OverlaySlot<T>
@@ -146,11 +148,23 @@ where
         C: ObservationContext,
     {
         let mut slot = Self::inactive();
-        slot.active = value
-            .and_then(|value| value.get(T::STORAGE_KEY))
+        let overlay_value = value.and_then(|value| value.get(T::STORAGE_KEY));
+        slot.active = overlay_value
             .and_then(|value| value.get("active"))
             .and_then(Value::as_bool)
             .unwrap_or(false);
+        for (threshold, definition) in slot
+            .confidence_thresholds
+            .iter_mut()
+            .zip(T::CONFIDENCE_THRESHOLDS)
+        {
+            *threshold = overlay_value
+                .and_then(|value| value.get(definition.storage_key))
+                .and_then(Value::as_f64)
+                .map(|value| value as f32)
+                .unwrap_or(DEFAULT_CONFIDENCE_THRESHOLD)
+                .clamp(0.0, 1.0);
+        }
         if slot.active {
             slot.recreate(context);
         }
@@ -162,6 +176,10 @@ where
             active: false,
             overlay: None,
             error: None,
+            confidence_thresholds: vec![
+                DEFAULT_CONFIDENCE_THRESHOLD;
+                T::CONFIDENCE_THRESHOLDS.len()
+            ],
         }
     }
 
@@ -177,6 +195,25 @@ where
                 self.overlay = None;
                 self.error = None;
             }
+        }
+        if self.active && !T::CONFIDENCE_THRESHOLDS.is_empty() {
+            ui.indent(T::STORAGE_KEY, |ui| {
+                for (threshold, definition) in self
+                    .confidence_thresholds
+                    .iter_mut()
+                    .zip(T::CONFIDENCE_THRESHOLDS)
+                {
+                    ui.horizontal(|ui| {
+                        ui.label(definition.label);
+                        ui.add(
+                            DragValue::new(threshold)
+                                .range(0.0..=1.0)
+                                .speed(0.01)
+                                .fixed_decimals(2),
+                        );
+                    });
+                }
+            });
         }
         if let Some(error) = &self.error {
             ui.colored_label(ui.visuals().error_fg_color, error);
@@ -201,7 +238,7 @@ where
 
     fn paint(&self, painter: &ImageOverlayPainter, image_time: Time) {
         if let Some(overlay) = &self.overlay {
-            overlay.paint(painter, image_time);
+            overlay.paint(painter, image_time, &self.confidence_thresholds);
         }
     }
 
@@ -210,19 +247,40 @@ where
     }
 
     fn save(&self) -> Value {
-        json!({"active": self.active})
+        let mut value = serde_json::Map::new();
+        value.insert("active".to_string(), json!(self.active));
+        for (threshold, definition) in self
+            .confidence_thresholds
+            .iter()
+            .zip(T::CONFIDENCE_THRESHOLDS)
+        {
+            value.insert(definition.storage_key.to_string(), json!(threshold));
+        }
+        Value::Object(value)
+    }
+}
+
+pub(super) struct ConfidenceThresholdDefinition {
+    label: &'static str,
+    storage_key: &'static str,
+}
+
+impl ConfidenceThresholdDefinition {
+    pub(super) const fn new(label: &'static str, storage_key: &'static str) -> Self {
+        Self { label, storage_key }
     }
 }
 
 pub(super) trait ImageOverlay: Sized {
     const NAME: &'static str;
     const STORAGE_KEY: &'static str;
+    const CONFIDENCE_THRESHOLDS: &'static [ConfidenceThresholdDefinition] = &[];
 
     fn new<C>(context: &C) -> Result<Self, Report>
     where
         C: ObservationContext;
 
-    fn paint(&self, painter: &ImageOverlayPainter, image_time: Time);
+    fn paint(&self, painter: &ImageOverlayPainter, image_time: Time, confidence_thresholds: &[f32]);
 
     fn latest_time(&self) -> Option<Time> {
         None
@@ -502,5 +560,20 @@ mod tests {
 
         overlays.robot_pose_detection.active = true;
         assert!(overlays.has_active_detection_overlays());
+    }
+
+    #[test]
+    fn detection_overlays_have_five_default_confidence_thresholds() {
+        let overlays = ImageOverlays::default();
+        let thresholds = overlays
+            .object_detection
+            .confidence_thresholds
+            .iter()
+            .chain(&overlays.pose_detection.confidence_thresholds)
+            .chain(&overlays.robot_pose_detection.confidence_thresholds)
+            .copied()
+            .collect::<Vec<_>>();
+
+        assert_eq!(thresholds, vec![0.5; 5]);
     }
 }

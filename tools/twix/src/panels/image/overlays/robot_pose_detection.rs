@@ -6,8 +6,10 @@ use types::{pose_detection::RobotPoseDetection, time_wrapper::TimeWrapper};
 use crate::repaint::ObservationContext;
 
 use super::{
-    super::image_overlay::{ImageOverlay, ImageOverlayPainter, OverlayObservation},
-    pose::{PoseStyle, paint_pose},
+    super::image_overlay::{
+        ConfidenceThresholdDefinition, ImageOverlay, ImageOverlayPainter, OverlayObservation,
+    },
+    pose::{PoseConfidenceThresholds, PoseStyle, paint_pose},
 };
 
 const ROBOT_SKELETON_KEYPOINT_LINE_MAPPING: [(usize, usize); 14] = [
@@ -31,6 +33,13 @@ const ROBOT_POSE_STYLE: PoseStyle = PoseStyle {
     keypoint: Color32::from_rgb(220, 170, 255),
     bounding_box: Color32::from_rgb(145, 70, 195),
 };
+const ROBOT_POSE_CONFIDENCE_THRESHOLDS: [ConfidenceThresholdDefinition; 2] = [
+    ConfidenceThresholdDefinition::new(
+        "Bounding box confidence",
+        "bounding_box_confidence_threshold",
+    ),
+    ConfidenceThresholdDefinition::new("Keypoint confidence", "keypoint_confidence_threshold"),
+];
 
 pub(in crate::panels::image) struct RobotPoseDetectionOverlay {
     poses: OverlayObservation<TimeWrapper<Vec<RobotPoseDetection>>>,
@@ -39,6 +48,8 @@ pub(in crate::panels::image) struct RobotPoseDetectionOverlay {
 impl ImageOverlay for RobotPoseDetectionOverlay {
     const NAME: &'static str = "Robot Pose Detection";
     const STORAGE_KEY: &'static str = "robot_pose_detection";
+    const CONFIDENCE_THRESHOLDS: &'static [ConfidenceThresholdDefinition] =
+        &ROBOT_POSE_CONFIDENCE_THRESHOLDS;
 
     fn new<C>(context: &C) -> Result<Self, Report>
     where
@@ -49,7 +60,12 @@ impl ImageOverlay for RobotPoseDetectionOverlay {
         })
     }
 
-    fn paint(&self, painter: &ImageOverlayPainter, image_time: Time) {
+    fn paint(
+        &self,
+        painter: &ImageOverlayPainter,
+        image_time: Time,
+        confidence_thresholds: &[f32],
+    ) {
         let Some(poses) = self.poses.at_time(image_time) else {
             return;
         };
@@ -62,6 +78,10 @@ impl ImageOverlay for RobotPoseDetectionOverlay {
                 pose.object.label.into(),
                 &keypoints,
                 &ROBOT_SKELETON_KEYPOINT_LINE_MAPPING,
+                PoseConfidenceThresholds {
+                    bounding_box: confidence_thresholds[0],
+                    keypoint: confidence_thresholds[1],
+                },
                 ROBOT_POSE_STYLE,
             );
         }
