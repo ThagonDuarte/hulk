@@ -4,8 +4,8 @@ use color_eyre::{Report, eyre::Context as _};
 use eframe::egui::{ColorImage, Context, TextureHandle, TextureOptions, Ui, load::SizedTexture};
 use hulk_widgets::CompletionEdit;
 use image::RgbImage;
-use ros_z::{Message, entity::EndpointKind, pubsub::PublicationId, time::Time};
-use ros_z_debug::{RetentionPolicy, SampleRecord, TopicObservation, TopicObservationStatus};
+use ros_z::{Message, entity::EndpointKind, time::Time};
+use ros_z_debug::{RetentionPolicy, SampleRecord, TopicObservation};
 use ros2::sensor_msgs::image::Image as RosImage;
 use serde_json::{Value, json};
 use thiserror::Error;
@@ -15,7 +15,6 @@ use crate::{
     graph::TopicCompletionQuery,
     panel::{Panel, PanelCreationContext, PanelUiContext},
     repaint::{ObservationContext, ObservationRepaint, RepaintOnUpdates},
-    status::format_topic_observation_status,
 };
 
 use self::image_overlay::{ImageOverlayPainter, ImageOverlays};
@@ -67,15 +66,6 @@ struct ObservedImage {
     observation: TopicObservation<RosImage>,
     _repaint: ObservationRepaint,
     render_cache: RenderedImageCache,
-}
-
-struct RenderedMetadata {
-    resolved_topic: String,
-    type_name: String,
-    source_time: String,
-    transport_time: String,
-    publication_id: String,
-    image_time: String,
 }
 
 impl Panel for ImagePanel {
@@ -139,7 +129,6 @@ impl Panel for ImagePanel {
                     ui.colored_label(ui.visuals().error_fg_color, error);
                 }
                 ObservationState::Observing(observed) => {
-                    Self::render_status(ui, observed.observation.status());
                     let preferred_image_time = self.overlays.preferred_image_time();
                     observed.render_cache.refresh(
                         &context.egui_context,
@@ -147,12 +136,10 @@ impl Panel for ImagePanel {
                         preferred_image_time,
                     );
 
-                    let Some(metadata) = observed.render_cache.metadata() else {
+                    if !observed.render_cache.has_sample() {
                         ui.label("Waiting for first sample.");
                         return;
-                    };
-                    Self::render_metadata(ui, metadata);
-                    ui.separator();
+                    }
 
                     if let Some(error) = observed.render_cache.error() {
                         ui.colored_label(ui.visuals().error_fg_color, error);
@@ -231,40 +218,10 @@ impl ImagePanel {
         self.topic = next_topic;
         self.recreate_observation(context);
     }
-
-    fn render_metadata(ui: &mut Ui, metadata: &RenderedMetadata) {
-        ui.horizontal_wrapped(|ui| {
-            ui.label("topic:");
-            ui.monospace(&metadata.resolved_topic);
-            ui.separator();
-            ui.label("type:");
-            ui.monospace(&metadata.type_name);
-            ui.separator();
-            ui.label("source:");
-            ui.monospace(&metadata.source_time);
-            ui.separator();
-            ui.label("transport:");
-            ui.monospace(&metadata.transport_time);
-            ui.separator();
-            ui.label("publication:");
-            ui.monospace(&metadata.publication_id);
-            ui.separator();
-            ui.label("image:");
-            ui.monospace(&metadata.image_time);
-        });
-    }
-
-    fn render_status(ui: &mut Ui, status: TopicObservationStatus) {
-        ui.horizontal_wrapped(|ui| {
-            ui.label("status:");
-            ui.monospace(format_topic_observation_status(status));
-        });
-    }
 }
 
 struct RenderedImageCache {
     sample: Option<Arc<SampleRecord<RosImage>>>,
-    metadata: Option<RenderedMetadata>,
     texture: Option<TextureHandle>,
     dimensions: Option<[usize; 2]>,
     error: Option<String>,
@@ -279,7 +236,6 @@ impl RenderedImageCache {
     fn new(texture_name: impl Into<String>) -> Self {
         Self {
             sample: None,
-            metadata: None,
             texture: None,
             dimensions: None,
             error: None,
@@ -309,7 +265,6 @@ impl RenderedImageCache {
         }
 
         self.sample = sample;
-        self.metadata = None;
         self.texture = None;
         self.dimensions = None;
         self.error = None;
@@ -318,7 +273,6 @@ impl RenderedImageCache {
             return;
         };
 
-        self.metadata = Some(RenderedMetadata::from(record.as_ref()));
         match decode_color_image(&record.value) {
             Ok(image) => {
                 self.dimensions = Some(image.size);
@@ -334,8 +288,8 @@ impl RenderedImageCache {
         }
     }
 
-    fn metadata(&self) -> Option<&RenderedMetadata> {
-        self.metadata.as_ref()
+    fn has_sample(&self) -> bool {
+        self.sample.is_some()
     }
 
     fn texture(&self) -> Option<&TextureHandle> {
@@ -363,22 +317,6 @@ fn same_sample(
         (Some(current), Some(next)) => Arc::ptr_eq(current, next),
         (None, None) => true,
         _ => false,
-    }
-}
-
-impl From<&SampleRecord<RosImage>> for RenderedMetadata {
-    fn from(record: &SampleRecord<RosImage>) -> Self {
-        Self {
-            resolved_topic: record.metadata.resolved_topic.clone(),
-            type_name: record.metadata.type_info.name.to_string(),
-            source_time: format_time(record.source_time),
-            transport_time: record
-                .transport_time
-                .map(format_time)
-                .unwrap_or_else(|| "none".to_string()),
-            publication_id: format_publication_id(record.publication_id),
-            image_time: format_time(image_time(&record.value)),
-        }
     }
 }
 
@@ -416,21 +354,13 @@ fn create_observation(
     Ok((observation, repaint))
 }
 
-fn format_time(time: Time) -> String {
-    format!("{} ns", time.as_nanos())
-}
-
-fn format_publication_id(publication_id: PublicationId) -> String {
-    format!("{publication_id:#}")
-}
-
 #[cfg(test)]
 mod tests {
     use std::{sync::Arc, time::Duration};
 
     use eframe::egui::Color32;
     use eframe::egui::Context as EguiContext;
-    use ros_z::{EndpointGlobalId, context::ContextBuilder, pubsub::Received, time::Time};
+    use ros_z::context::ContextBuilder;
     use ros_z_debug::{TopicObserver, TopicObserverOptions};
     use ros2::{sensor_msgs::image::Image as RosImage, std_msgs::header::Header};
     use serde_json::json;
@@ -439,22 +369,9 @@ mod tests {
 
     use super::{
         DEFAULT_IMAGE_TOPIC, ImageDecodeError, ImageOverlays, ImagePanel, ObservationState,
-        RenderedImageCache, decode_color_image, format_publication_id,
+        RenderedImageCache, decode_color_image,
     };
     use crate::panel::Panel;
-
-    fn publication_id() -> ros_z::pubsub::PublicationId {
-        Received {
-            message: (),
-            transport_time: None,
-            source_time: Time::zero(),
-            sequence_number: 42,
-            source_global_id: EndpointGlobalId::from([
-                1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16,
-            ]),
-        }
-        .publication_id()
-    }
 
     fn rgb8_image(width: u32, height: u32, data: Vec<u8>) -> RosImage {
         RosImage {
@@ -491,14 +408,6 @@ mod tests {
                 height: 1
             }
         ));
-    }
-
-    #[test]
-    fn metadata_formats_compact_publication_id() {
-        assert_eq!(
-            format_publication_id(publication_id()),
-            "01020304…0d0e0f10#42"
-        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
