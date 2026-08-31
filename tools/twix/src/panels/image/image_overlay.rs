@@ -3,7 +3,10 @@ use std::{sync::Arc, time::Duration};
 use color_eyre::{Report, eyre::Context as _};
 use coordinate_systems::Pixel;
 use eframe::egui::{
-    Align2, Color32, CornerRadius, DragValue, FontId, Painter, Pos2, Rect, Stroke, Ui, pos2, vec2,
+    Align2, Color32, CornerRadius, DragValue, FontId, Painter, PopupCloseBehavior, Pos2, Rect,
+    Stroke, Ui,
+    containers::menu::{MenuButton, MenuConfig},
+    pos2, vec2,
 };
 use linear_algebra::{Point2, point};
 use ros_z::{Message, time::Time};
@@ -61,18 +64,20 @@ impl ImageOverlays {
     where
         C: ObservationContext,
     {
-        ui.menu_button("Overlays", |ui| {
-            self.line_detection.checkbox(ui, context);
-            self.ball_detection.checkbox(ui, context);
-            self.horizon.checkbox(ui, context);
-            self.field_border.checkbox(ui, context);
-            self.object_detection.checkbox(ui, context);
-            self.pose_detection.checkbox(ui, context);
-            self.robot_pose_detection.checkbox(ui, context);
-            self.detection_latency
-                .set_active(self.has_active_detection_overlays(), context);
-            self.detection_latency.show_error(ui);
-        });
+        MenuButton::new("Overlays")
+            .config(overlay_menu_config())
+            .ui(ui, |ui| {
+                self.line_detection.checkbox(ui, context);
+                self.ball_detection.checkbox(ui, context);
+                self.horizon.checkbox(ui, context);
+                self.field_border.checkbox(ui, context);
+                self.object_detection.checkbox(ui, context);
+                self.pose_detection.checkbox(ui, context);
+                self.robot_pose_detection.checkbox(ui, context);
+                self.detection_latency
+                    .set_active(self.has_active_detection_overlays(), context);
+                self.detection_latency.show_error(ui);
+            });
         self.detection_latency.refresh(ui.ctx());
     }
 
@@ -115,6 +120,10 @@ impl ImageOverlays {
             || self.pose_detection.active
             || self.robot_pose_detection.active
     }
+}
+
+fn overlay_menu_config() -> MenuConfig {
+    MenuConfig::new().close_behavior(PopupCloseBehavior::CloseOnClickOutside)
 }
 
 impl Default for ImageOverlays {
@@ -575,5 +584,13 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert_eq!(thresholds, vec![0.5; 5]);
+    }
+
+    #[test]
+    fn overlay_menu_stays_open_for_inside_clicks() {
+        assert_eq!(
+            overlay_menu_config().close_behavior,
+            PopupCloseBehavior::CloseOnClickOutside
+        );
     }
 }
