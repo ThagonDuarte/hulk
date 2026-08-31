@@ -2,7 +2,9 @@ use std::{sync::Arc, time::Duration};
 
 use color_eyre::{Report, eyre::Context as _};
 use coordinate_systems::Pixel;
-use eframe::egui::{Align2, Color32, FontId, Painter, Pos2, Rect, Stroke, Ui, pos2};
+use eframe::egui::{
+    Align2, Color32, CornerRadius, FontId, Painter, Pos2, Rect, Stroke, Ui, pos2, vec2,
+};
 use linear_algebra::{Point2, point};
 use ros_z::{Message, time::Time};
 use ros_z_debug::{RetentionPolicy, SampleRecord, TopicObservation};
@@ -11,6 +13,7 @@ use types::time_wrapper::TimeWrapper;
 
 use crate::repaint::{ObservationContext, ObservationRepaint, RepaintOnUpdates};
 
+use super::detection_latency::DetectionLatencyDiagnostic;
 use super::overlays::{
     BallDetectionOverlay, FieldBorderOverlay, HorizonOverlay, LineDetectionOverlay,
     ObjectDetectionOverlay, PoseDetectionOverlay, RobotPoseDetectionOverlay,
@@ -26,6 +29,7 @@ pub(super) struct ImageOverlays {
     object_detection: OverlaySlot<ObjectDetectionOverlay>,
     pose_detection: OverlaySlot<PoseDetectionOverlay>,
     robot_pose_detection: OverlaySlot<RobotPoseDetectionOverlay>,
+    detection_latency: DetectionLatencyDiagnostic,
 }
 
 impl ImageOverlays {
@@ -33,14 +37,22 @@ impl ImageOverlays {
     where
         C: ObservationContext,
     {
+        let object_detection = OverlaySlot::new(value, context);
+        let pose_detection = OverlaySlot::new(value, context);
+        let robot_pose_detection = OverlaySlot::new(value, context);
+        let detection_latency = DetectionLatencyDiagnostic::new(
+            object_detection.active || pose_detection.active || robot_pose_detection.active,
+            context,
+        );
         Self {
             line_detection: OverlaySlot::new(value, context),
             ball_detection: OverlaySlot::new(value, context),
             horizon: OverlaySlot::new(value, context),
             field_border: OverlaySlot::new(value, context),
-            object_detection: OverlaySlot::new(value, context),
-            pose_detection: OverlaySlot::new(value, context),
-            robot_pose_detection: OverlaySlot::new(value, context),
+            object_detection,
+            pose_detection,
+            robot_pose_detection,
+            detection_latency,
         }
     }
 
@@ -56,7 +68,11 @@ impl ImageOverlays {
             self.object_detection.checkbox(ui, context);
             self.pose_detection.checkbox(ui, context);
             self.robot_pose_detection.checkbox(ui, context);
+            self.detection_latency
+                .set_active(self.has_active_detection_overlays(), context);
+            self.detection_latency.show_error(ui);
         });
+        self.detection_latency.refresh(ui.ctx());
     }
 
     pub(super) fn paint(&self, painter: &ImageOverlayPainter, image_time: Time) {
@@ -67,6 +83,7 @@ impl ImageOverlays {
         self.object_detection.paint(painter, image_time);
         self.pose_detection.paint(painter, image_time);
         self.robot_pose_detection.paint(painter, image_time);
+        self.detection_latency.paint(painter);
     }
 
     pub(super) fn preferred_image_time(&self) -> Option<Time> {
@@ -91,6 +108,12 @@ impl ImageOverlays {
             RobotPoseDetectionOverlay::STORAGE_KEY: self.robot_pose_detection.save(),
         })
     }
+
+    fn has_active_detection_overlays(&self) -> bool {
+        self.object_detection.active
+            || self.pose_detection.active
+            || self.robot_pose_detection.active
+    }
 }
 
 impl Default for ImageOverlays {
@@ -103,6 +126,7 @@ impl Default for ImageOverlays {
             object_detection: OverlaySlot::inactive(),
             pose_detection: OverlaySlot::inactive(),
             robot_pose_detection: OverlaySlot::inactive(),
+            detection_latency: DetectionLatencyDiagnostic::inactive(),
         }
     }
 }
@@ -374,5 +398,109 @@ impl ImageOverlayPainter {
             FontId::default(),
             color,
         );
+    }
+
+    pub(super) fn badge(&self, lines: &[ImageBadgeLine]) {
+        const MARGIN: f32 = 8.0;
+        const PADDING: f32 = 7.0;
+        const COLUMN_GAP: f32 = 12.0;
+        const LINE_GAP: f32 = 3.0;
+
+        let font = FontId::monospace(12.0);
+        let label_color = Color32::from_gray(220);
+        let laid_out_lines = lines
+            .iter()
+            .map(|line| {
+                let label =
+                    self.painter
+                        .layout_no_wrap(line.label.to_string(), font.clone(), label_color);
+                let value =
+                    self.painter
+                        .layout_no_wrap(line.value.clone(), font.clone(), line.value_color);
+                let height = label.size().y.max(value.size().y);
+                (label, value, height)
+            })
+            .collect::<Vec<_>>();
+        let label_width = laid_out_lines
+            .iter()
+            .map(|(label, _, _)| label.size().x)
+            .fold(0.0, f32::max);
+        let value_width = laid_out_lines
+            .iter()
+            .map(|(_, value, _)| value.size().x)
+            .fold(0.0, f32::max);
+        let content_height = laid_out_lines
+            .iter()
+            .map(|(_, _, height)| *height)
+            .sum::<f32>()
+            + LINE_GAP * lines.len().saturating_sub(1) as f32;
+        let badge_size = vec2(
+            PADDING * 2.0 + label_width + COLUMN_GAP + value_width,
+            PADDING * 2.0 + content_height,
+        );
+        let badge_rect =
+            Rect::from_min_size(self.rect.left_top() + vec2(MARGIN, MARGIN), badge_size);
+        self.painter.rect_filled(
+            badge_rect,
+            CornerRadius::same(5),
+            Color32::from_black_alpha(205),
+        );
+
+        let mut y = badge_rect.top() + PADDING;
+        for (label, value, height) in laid_out_lines {
+            let label_position = pos2(
+                badge_rect.left() + PADDING,
+                y + (height - label.size().y) / 2.0,
+            );
+            let value_position = pos2(
+                badge_rect.left() + PADDING + label_width + COLUMN_GAP,
+                y + (height - value.size().y) / 2.0,
+            );
+            self.painter.galley(label_position, label, label_color);
+            self.painter.galley(value_position, value, Color32::WHITE);
+            y += height + LINE_GAP;
+        }
+    }
+}
+
+pub(super) struct ImageBadgeLine {
+    label: &'static str,
+    value: String,
+    value_color: Color32,
+}
+
+impl ImageBadgeLine {
+    pub(super) fn new(label: &'static str, value: impl Into<String>, value_color: Color32) -> Self {
+        Self {
+            label,
+            value: value.into(),
+            value_color,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_model_output_overlays_activate_detection_latency() {
+        let mut overlays = ImageOverlays::default();
+        assert!(!overlays.has_active_detection_overlays());
+
+        overlays.ball_detection.active = true;
+        overlays.line_detection.active = true;
+        assert!(!overlays.has_active_detection_overlays());
+
+        overlays.object_detection.active = true;
+        assert!(overlays.has_active_detection_overlays());
+        overlays.object_detection.active = false;
+
+        overlays.pose_detection.active = true;
+        assert!(overlays.has_active_detection_overlays());
+        overlays.pose_detection.active = false;
+
+        overlays.robot_pose_detection.active = true;
+        assert!(overlays.has_active_detection_overlays());
     }
 }

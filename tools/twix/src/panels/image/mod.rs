@@ -20,6 +20,7 @@ use crate::{
 
 use self::image_overlay::{ImageOverlayPainter, ImageOverlays};
 
+mod detection_latency;
 mod image_overlay;
 mod overlays;
 
