@@ -563,6 +563,7 @@ mod tests {
                     "field_border": {"active": false},
                     "object_detection": {"active": false},
                     "pose_detection": {"active": false},
+                    "robot_pose_detection": {"active": false},
                 },
             })
         );
