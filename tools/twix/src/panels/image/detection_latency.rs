@@ -11,6 +11,7 @@ use super::image_overlay::{ImageBadgeLine, ImageOverlayPainter, OverlayObservati
 const FRAME_BUDGET: Duration = Duration::from_nanos(1_000_000_000 / 60);
 const WARNING_THRESHOLD: Duration = Duration::from_millis(15);
 const STALE_AFTER: Duration = Duration::from_millis(500);
+const EMA_ALPHA: f64 = 0.1;
 
 const HEALTHY_COLOR: Color32 = Color32::from_rgb(80, 220, 120);
 const WARNING_COLOR: Color32 = Color32::from_rgb(255, 170, 40);
@@ -71,6 +72,17 @@ impl LatencySnapshot {
         now.saturating_duration_since(self.received_at) >= STALE_AFTER
     }
 
+    fn update_ema(self, latest: Self) -> Self {
+        Self {
+            raw_inference: exponential_moving_average(self.raw_inference, latest.raw_inference),
+            total_detection: exponential_moving_average(
+                self.total_detection,
+                latest.total_detection,
+            ),
+            received_at: latest.received_at,
+        }
+    }
+
     fn remaining_freshness(self, now: Instant) -> Option<Duration> {
         STALE_AFTER.checked_sub(now.saturating_duration_since(self.received_at))
     }
@@ -114,12 +126,16 @@ impl ActiveDiagnostic {
             return;
         };
 
-        self.snapshot = Some(LatencySnapshot::new(
+        let latest = LatencySnapshot::new(
             inference.value,
             post_processing.value,
             non_maximum_suppression.value,
             now,
-        ));
+        );
+        self.snapshot = Some(match self.snapshot {
+            Some(previous) => previous.update_ema(latest),
+            None => latest,
+        });
         self.latest_nms_publication = Some(non_maximum_suppression.publication_id);
     }
 }
@@ -207,19 +223,30 @@ impl DetectionLatencyDiagnostic {
         let raw_color = latency_color(snapshot.raw_inference, stale);
         let total_color = latency_color(snapshot.total_detection, stale);
         let raw_label = if stale {
-            "Raw inference latency (stale)"
+            "Raw inference latency (EMA, stale)"
         } else {
-            "Raw inference latency"
+            "Raw inference latency (EMA)"
+        };
+        let total_label = if stale {
+            "Total detection latency (EMA, stale)"
+        } else {
+            "Total detection latency (EMA)"
         };
         painter.badge(&[
             ImageBadgeLine::new(raw_label, format_latency(snapshot.raw_inference), raw_color),
             ImageBadgeLine::new(
-                "Total detection latency",
+                total_label,
                 format_latency(snapshot.total_detection),
                 total_color,
             ),
         ]);
     }
+}
+
+fn exponential_moving_average(previous: Duration, latest: Duration) -> Duration {
+    Duration::from_secs_f64(
+        previous.as_secs_f64() * (1.0 - EMA_ALPHA) + latest.as_secs_f64() * EMA_ALPHA,
+    )
 }
 
 fn latency_color(duration: Duration, stale: bool) -> Color32 {
@@ -279,6 +306,29 @@ mod tests {
 
         assert!(!snapshot.is_stale(received_at + STALE_AFTER - Duration::from_nanos(1)));
         assert!(snapshot.is_stale(received_at + STALE_AFTER));
+    }
+
+    #[test]
+    fn snapshot_uses_independent_exponential_moving_averages() {
+        let received_at = Instant::now();
+        let previous = LatencySnapshot::new(
+            Duration::from_millis(10),
+            Duration::from_millis(4),
+            Duration::from_millis(1),
+            received_at,
+        );
+        let latest = LatencySnapshot::new(
+            Duration::from_millis(20),
+            Duration::from_millis(8),
+            Duration::from_millis(2),
+            received_at + Duration::from_millis(10),
+        );
+
+        let smoothed = previous.update_ema(latest);
+
+        assert_eq!(smoothed.raw_inference, Duration::from_millis(11));
+        assert_eq!(smoothed.total_detection, Duration::from_micros(16_500));
+        assert_eq!(smoothed.received_at, latest.received_at);
     }
 
     #[test]
