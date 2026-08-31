@@ -155,7 +155,7 @@ async fn spawn_all(ctx: Arc<Context>, log_path: Option<PathBuf>) -> Result<Runni
     join_set.spawn(kinematics_provider::run_boxed(ctx.clone()));
     join_set.spawn(led_handler::run_boxed(ctx.clone()));
     join_set.spawn(localization_2d::run_boxed(ctx.clone()));
-    join_set.spawn(localization_3d::run_boxed(ctx.clone()));
+    // join_set.spawn(localization_3d::run_boxed(ctx.clone()));
     join_set.spawn(look_around::run_boxed(ctx.clone()));
     join_set.spawn(look_at::run_boxed(ctx.clone()));
     join_set.spawn(low_state_bridge::run_boxed(ctx.clone()));
@@ -174,7 +174,7 @@ async fn spawn_all(ctx: Arc<Context>, log_path: Option<PathBuf>) -> Result<Runni
     join_set.spawn(safe_pose_checker::run_boxed(ctx.clone()));
     join_set.spawn(search_suggestor::run_boxed(ctx.clone()));
     join_set.spawn(segment_filter::run_boxed(ctx.clone()));
-    join_set.spawn(stereo_visual_odometry::run_boxed(ctx.clone()));
+    // join_set.spawn(stereo_visual_odometry::run_boxed(ctx.clone()));
     join_set.spawn(support_foot_estimator::run_boxed(ctx.clone()));
     join_set.spawn(team_ball_receiver::run_boxed(ctx.clone()));
     join_set.spawn(time_to_reach_kick_position::run_boxed(ctx.clone()));
