@@ -840,6 +840,7 @@ fn object_label_color(label: RobocupObjectLabel) -> Color32 {
         RobocupObjectLabel::Ball => Color32::from_rgb(255, 145, 64),
         RobocupObjectLabel::GoalPost => Color32::from_rgb(245, 245, 245),
         RobocupObjectLabel::Robot => Color32::from_rgb(82, 170, 255),
+        RobocupObjectLabel::Person => Color32::from_rgb(74, 144, 226),
         RobocupObjectLabel::PenaltySpot => Color32::from_rgb(255, 230, 96),
         RobocupObjectLabel::LSpot | RobocupObjectLabel::TSpot | RobocupObjectLabel::XSpot => {
             Color32::from_rgb(120, 255, 170)
