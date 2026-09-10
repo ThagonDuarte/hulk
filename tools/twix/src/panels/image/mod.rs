@@ -529,6 +529,16 @@ mod tests {
                         "active": false,
                         "confidence_threshold": 0.5,
                     },
+                    "field_pose_detection": {
+                        "active": false,
+                        "bounding_box_confidence_threshold": 0.5,
+                        "keypoint_confidence_threshold": 0.8_f32,
+                    },
+                    "robot_pose_detection": {
+                        "active": false,
+                        "bounding_box_confidence_threshold": 0.5,
+                        "keypoint_confidence_threshold": 0.8_f32,
+                    },
                     "pose_detection": {
                         "active": false,
                         "bounding_box_confidence_threshold": 0.5,
