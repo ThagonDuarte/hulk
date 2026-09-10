@@ -1556,7 +1556,7 @@ fn draw_objects(
         painter.rect_stroke(
             rect,
             egui::CornerRadius::same(3),
-            Stroke::new(2.0, color),
+            Stroke::new(2.0_f32, color),
             StrokeKind::Outside,
         );
         let text = format!(
@@ -1594,14 +1594,14 @@ fn draw_field_features(
     {
         let point = image_rect.min + vec2(feature.point.x() * scale.x, feature.point.y() * scale.y);
         let (label, color) = field_feature_style(feature.label);
-        painter.circle_stroke(point, 6.0, Stroke::new(2.0, color));
+        painter.circle_stroke(point, 6.0, Stroke::new(2.0_f32, color));
         painter.line_segment(
             [point - vec2(8.0, 0.0), point + vec2(8.0, 0.0)],
-            Stroke::new(2.0, color),
+            Stroke::new(2.0_f32, color),
         );
         painter.line_segment(
             [point - vec2(0.0, 8.0), point + vec2(0.0, 8.0)],
-            Stroke::new(2.0, color),
+            Stroke::new(2.0_f32, color),
         );
 
         let text = format!("{label} {:.0}%", feature.confidence * 100.0);
@@ -1647,7 +1647,7 @@ fn draw_robot_poses(
                     pose_point(image_rect, scale, keypoints[start]),
                     pose_point(image_rect, scale, keypoints[end]),
                 ],
-                Stroke::new(2.0, color.gamma_multiply(0.85)),
+                Stroke::new(2.0_f32, color.gamma_multiply(0.85)),
             );
         }
         for keypoint in keypoints {
@@ -1670,7 +1670,7 @@ fn draw_robot_poses(
         painter.rect_stroke(
             Rect::from_min_max(min, max).intersect(clip),
             egui::CornerRadius::same(3),
-            Stroke::new(2.0, color),
+            Stroke::new(2.0_f32, color),
             StrokeKind::Outside,
         );
     }
@@ -1706,7 +1706,7 @@ fn draw_poses(
                     pose_point(image_rect, scale, keypoints[start]),
                     pose_point(image_rect, scale, keypoints[end]),
                 ],
-                Stroke::new(2.0, Color32::LIGHT_BLUE.gamma_multiply(0.8)),
+                Stroke::new(2.0_f32, Color32::LIGHT_BLUE.gamma_multiply(0.8)),
             );
         }
         for keypoint in keypoints {
@@ -1733,7 +1733,7 @@ fn draw_poses(
         painter.rect_stroke(
             Rect::from_min_max(min, max).intersect(clip),
             egui::CornerRadius::same(3),
-            Stroke::new(2.0, Color32::DARK_BLUE),
+            Stroke::new(2.0_f32, Color32::DARK_BLUE),
             StrokeKind::Outside,
         );
     }

@@ -154,7 +154,7 @@ pub fn show(
         if plot.left() <= x && x <= plot.right() {
             painter.line_segment(
                 [pos2(x, plot.top()), pos2(x, plot.bottom())],
-                Stroke::new(1.5, Color32::RED),
+                Stroke::new(1.5_f32, Color32::RED),
             );
             painter.text(
                 pos2(x + 3.0, plot.top() + 2.0),
@@ -194,13 +194,13 @@ pub fn show(
                 pos2(selected_x, plot.top()),
                 pos2(selected_x, plot.bottom()),
             ],
-            Stroke::new(2.0, Color32::GREEN),
+            Stroke::new(2.0_f32, Color32::GREEN),
         );
     }
     painter.rect_stroke(
         plot,
         0.0,
-        Stroke::new(1.0, ui.visuals().widgets.noninteractive.bg_stroke.color),
+        Stroke::new(1.0_f32, ui.visuals().widgets.noninteractive.bg_stroke.color),
         StrokeKind::Inside,
     );
 
@@ -365,7 +365,7 @@ fn paint_ticks(
         if plot.left() <= x && x <= plot.right() {
             ui.painter().line_segment(
                 [pos2(x, plot.top() + 19.0), pos2(x, plot.bottom())],
-                Stroke::new(1.0, ui.visuals().weak_text_color()),
+                Stroke::new(1.0_f32, ui.visuals().weak_text_color()),
             );
             ui.painter().text(
                 pos2(x, plot.top() + 2.0),

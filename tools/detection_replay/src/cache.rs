@@ -2523,7 +2523,7 @@ mod tests {
 
     fn robot_pose(confidence: f32) -> RobotPoseDetection {
         let mut values = [0.0; 42];
-        for (index, keypoint) in values.chunks_exact_mut(3).enumerate() {
+        for (index, keypoint) in values.as_chunks_mut::<3>().0.iter_mut().enumerate() {
             keypoint[0] = index as f32;
             keypoint[1] = index as f32 + 0.5;
             keypoint[2] = 0.9;
