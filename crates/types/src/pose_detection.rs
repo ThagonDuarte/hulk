@@ -6,7 +6,9 @@ use coordinate_systems::Pixel;
 use hsl_network_messages::Team;
 use linear_algebra::{Point2, point};
 
-use crate::object_detection::{LabelIndex, NUMBER_OF_VALUES_PER_OBJECT, Object, YOLOObjectLabel};
+use crate::object_detection::{
+    LabelIndex, NUMBER_OF_VALUES_PER_OBJECT, Object, RobocupObjectLabel, YOLOObjectLabel,
+};
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, ros_z::Message)]
 pub enum DetectionRegion {
@@ -147,6 +149,20 @@ impl<T> Pose<T> {
         Self { object, keypoints }
     }
 }
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, ros_z::Message)]
+pub struct RobocupPose<K> {
+    pub object: Object<RobocupObjectLabel>,
+    pub keypoints: K,
+}
+
+pub const NUMBER_OF_VALUES_PER_FIELD_POSE: usize = 9;
+pub const NUMBER_OF_VALUES_PER_ROBOT_POSE: usize = 48;
+
+pub type FieldPose = RobocupPose<[Keypoint; 1]>;
+/// DHRP order: nose, neck, right shoulder/elbow/wrist, left shoulder/elbow/wrist,
+/// right hip/knee/ankle, left hip/knee/ankle.
+pub type RobotPose = RobocupPose<[Keypoint; 14]>;
 
 impl<T> From<&[f32; 57]> for Pose<T>
 where

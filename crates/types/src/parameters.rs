@@ -349,6 +349,7 @@ pub struct DetectionParameters {
     pub model_name: String,
     pub object_detection_parameters: ObjectDetectionParameters,
     pub pose_detection_parameters: PoseDetectionParameters,
+    pub robot_pose_detection_parameters: PoseDetectionParameters,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize, ros_z::Message)]

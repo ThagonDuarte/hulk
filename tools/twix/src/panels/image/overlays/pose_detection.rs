@@ -1,6 +1,5 @@
 use color_eyre::Report;
-use eframe::egui::{Align2, Color32, Stroke};
-use linear_algebra::point;
+use eframe::egui::{Align2, Color32};
 use ros_z::time::Time;
 use types::{
     object_detection::YOLOObjectLabel,
@@ -10,7 +9,11 @@ use types::{
 
 use crate::repaint::ObservationContext;
 
-use super::super::image_overlay::{ImageOverlay, ImageOverlayPainter, OverlayObservation};
+use super::super::image_overlay::{
+    ConfidenceThresholdDefinition, ConfidenceThresholdKind, ConfidenceThresholds, ImageOverlay,
+    ImageOverlayPainter, OverlayObservation,
+};
+use super::prediction_colors;
 
 const POSE_SKELETON_KEYPOINT_LINE_MAPPING: [(usize, usize); 16] = [
     (0, 1),
@@ -30,7 +33,18 @@ const POSE_SKELETON_KEYPOINT_LINE_MAPPING: [(usize, usize); 16] = [
     (13, 15),
     (14, 16),
 ];
-const KEYPOINT_CONFIDENCE_THRESHOLD: f32 = 0.8;
+pub(super) const POSE_CONFIDENCE_THRESHOLDS: [ConfidenceThresholdDefinition; 2] = [
+    ConfidenceThresholdDefinition::new(
+        ConfidenceThresholdKind::BoundingBox,
+        "Bounding box confidence",
+        "bounding_box_confidence_threshold",
+    ),
+    ConfidenceThresholdDefinition::new(
+        ConfidenceThresholdKind::Keypoint,
+        "Keypoint confidence",
+        "keypoint_confidence_threshold",
+    ),
+];
 
 pub(in crate::panels::image) struct PoseDetectionOverlay {
     poses: OverlayObservation<TimeWrapper<Vec<Pose<YOLOObjectLabel>>>>,
@@ -39,6 +53,8 @@ pub(in crate::panels::image) struct PoseDetectionOverlay {
 impl ImageOverlay for PoseDetectionOverlay {
     const NAME: &'static str = "Pose Detection";
     const STORAGE_KEY: &'static str = "pose_detection";
+    const CONFIDENCE_THRESHOLDS: &'static [ConfidenceThresholdDefinition] =
+        &POSE_CONFIDENCE_THRESHOLDS;
 
     fn new<C>(context: &C) -> Result<Self, Report>
     where
@@ -49,11 +65,16 @@ impl ImageOverlay for PoseDetectionOverlay {
         })
     }
 
-    fn paint(&self, painter: &ImageOverlayPainter, image_time: Time) {
+    fn paint(
+        &self,
+        painter: &ImageOverlayPainter,
+        image_time: Time,
+        confidence_thresholds: &ConfidenceThresholds,
+    ) {
         let Some(poses) = self.poses.at_time(image_time) else {
             return;
         };
-        paint_poses(painter, &poses.value.inner);
+        paint_poses(painter, &poses.value.inner, confidence_thresholds);
     }
 
     fn latest_time(&self) -> Option<Time> {
@@ -61,55 +82,55 @@ impl ImageOverlay for PoseDetectionOverlay {
     }
 }
 
-fn paint_poses(painter: &ImageOverlayPainter, poses: &[Pose<YOLOObjectLabel>]) {
+fn paint_poses(
+    painter: &ImageOverlayPainter,
+    poses: &[Pose<YOLOObjectLabel>],
+    confidence_thresholds: &ConfidenceThresholds,
+) {
     for pose in poses {
-        let keypoints: [Keypoint; 17] = pose.keypoints.into();
-
-        for (idx1, idx2) in POSE_SKELETON_KEYPOINT_LINE_MAPPING {
-            if keypoints[idx1].confidence < KEYPOINT_CONFIDENCE_THRESHOLD
-                || keypoints[idx2].confidence < KEYPOINT_CONFIDENCE_THRESHOLD
-            {
-                continue;
-            }
-
-            painter.line_segment(
-                keypoints[idx1].point,
-                keypoints[idx2].point,
-                Stroke::new(2.0, Color32::LIGHT_BLUE.gamma_multiply(0.4)),
-            );
-        }
-
-        for keypoint in keypoints {
-            if keypoint.confidence < KEYPOINT_CONFIDENCE_THRESHOLD {
-                continue;
-            }
-
-            painter.circle_filled(keypoint.point, 1.0, Color32::BLUE);
-            painter.floating_text(
-                keypoint.point,
-                Align2::RIGHT_BOTTOM,
-                format!("{:.2}", keypoint.confidence),
-                Color32::WHITE,
-            );
-        }
-
-        let bounding_box = pose.object.bounding_box;
-        painter.rect_stroke(
-            bounding_box.area.min,
-            bounding_box.area.max,
-            Stroke::new(2.0, Color32::DARK_BLUE.gamma_multiply(0.8)),
+        paint_pose(
+            painter,
+            pose.object.bounding_box,
+            format!("{:?}", pose.object.label),
+            &pose.keypoints.as_array(),
+            &POSE_SKELETON_KEYPOINT_LINE_MAPPING,
+            prediction_colors::PERSON_POSE,
+            confidence_thresholds,
         );
+    }
+}
+
+pub(super) fn paint_pose(
+    painter: &ImageOverlayPainter,
+    bounding_box: types::bounding_box::BoundingBox,
+    label: String,
+    keypoints: &[Keypoint],
+    skeleton: &[(usize, usize)],
+    color: Color32,
+    confidence_thresholds: &ConfidenceThresholds,
+) {
+    if bounding_box.confidence < confidence_thresholds.bounding_box {
+        return;
+    }
+    for &(start, end) in skeleton {
+        if keypoints[start].confidence < confidence_thresholds.keypoint
+            || keypoints[end].confidence < confidence_thresholds.keypoint
+        {
+            continue;
+        }
+        painter.detection_line_segment(keypoints[start].point, keypoints[end].point, color);
+    }
+    for keypoint in keypoints {
+        if keypoint.confidence < confidence_thresholds.keypoint {
+            continue;
+        }
+        painter.circle_filled(keypoint.point, 1.0, color);
         painter.floating_text(
-            point![bounding_box.area.max.x(), bounding_box.area.min.y()],
-            Align2::RIGHT_TOP,
-            format!("{:.2}", bounding_box.confidence),
-            Color32::WHITE,
-        );
-        painter.floating_text(
-            point![bounding_box.area.min.x(), bounding_box.area.max.y()],
-            Align2::LEFT_BOTTOM,
-            format!("{:.2?}", pose.object.label),
+            keypoint.point,
+            Align2::RIGHT_BOTTOM,
+            format!("{:.2}", keypoint.confidence),
             Color32::WHITE,
         );
     }
+    painter.detection_box(bounding_box, label, color);
 }
