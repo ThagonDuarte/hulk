@@ -3243,6 +3243,7 @@ dependencies = [
  "ros-z-streams",
  "ros2",
  "serde",
+ "serde_json",
  "tokio",
  "tracing",
  "types",

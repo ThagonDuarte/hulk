@@ -1,4 +1,7 @@
-use std::{boxed::Box, future::Future, path::Path, pin::Pin, sync::Arc, time::Duration};
+use std::{
+    boxed::Box, collections::BTreeMap, future::Future, path::Path, pin::Pin, sync::Arc,
+    time::Duration,
+};
 
 use color_eyre::{Result, eyre::bail, eyre::eyre};
 use ndarray::{ArrayView2, ArrayView3, ArrayViewD, Axis};
@@ -16,6 +19,7 @@ use ort::{
 };
 use ros_z_streams::CreateAnnouncingPublisher;
 use ros2::sensor_msgs::image::Image;
+use serde::Deserialize;
 
 use ros_z::prelude::*;
 use tokio::{sync::oneshot, task::block_in_place, time::Instant};
@@ -31,6 +35,7 @@ use types::{
 };
 
 pub const NUMBER_OF_DETECTIONS: usize = 300;
+const NUMBER_OF_VALUES_PER_FIELD_FEATURE_POSE: usize = 9;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 /// Selects the ONNX Runtime execution provider used by detection.
@@ -63,6 +68,35 @@ enum TaskHead {
     PersonPose,
     RobotPose,
     FieldFeature,
+}
+
+#[derive(Clone, Debug)]
+enum LegacyPoseOutput {
+    Person,
+    FieldFeature { labels: [FieldFeatureLabel; 5] },
+}
+
+#[derive(Clone, Debug)]
+struct ModelOutputContract {
+    legacy_pose: Option<LegacyPoseOutput>,
+    has_person_pose: bool,
+    has_robot_pose: bool,
+    has_direct_field_features: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct HydraBranchesMetadata {
+    #[serde(default)]
+    pose_output: Option<HydraBranchMetadata>,
+}
+
+#[derive(Debug, Deserialize)]
+struct HydraBranchMetadata {
+    task: String,
+    #[serde(default)]
+    names: BTreeMap<usize, String>,
+    #[serde(default)]
+    kpt_shape: Option<Vec<usize>>,
 }
 
 struct DetectionOutput {
@@ -104,6 +138,7 @@ struct ModelOutputs<'a> {
     poses: Option<ArrayView2<'a, f32>>,
     robot_poses: Option<ArrayView2<'a, f32>>,
     field_features: Option<ArrayView2<'a, f32>>,
+    field_feature_poses: Option<ArrayView2<'a, f32>>,
 }
 
 pub fn run_boxed(ctx: Arc<Context>) -> Pin<Box<dyn Future<Output = Result<()>> + Send>> {
@@ -175,8 +210,8 @@ async fn run(
             .with_intra_threads(2)?
             .commit_from_file(model_path)
     })?;
-    let model_info =
-        model_info_from_output_names(session.outputs.iter().map(|output| &*output.name));
+    let model_contract = model_output_contract(&session)?;
+    let model_info = model_contract.model_info();
     if let Some(sender) = model_info_sender {
         let _ = sender.send(model_info);
     }
@@ -217,7 +252,7 @@ async fn run(
 
             let post_processing_start = Instant::now();
 
-            let outputs = extract_outputs(&outputs)?;
+            let outputs = extract_outputs(&outputs, &model_contract)?;
             let candidate_detections = extract_candidate_object_detections(
                 &outputs,
                 parameters
@@ -238,6 +273,7 @@ async fn run(
             )?;
             let detected_field_features = extract_field_feature_detections(
                 &outputs,
+                &model_contract,
                 parameters
                     .field_feature_detection_parameters
                     .minimum_candidate_confidence,
@@ -318,21 +354,103 @@ async fn run(
     }
 }
 
-fn model_info_from_output_names<'a>(
-    names: impl IntoIterator<Item = &'a str>,
-) -> DetectionModelInfo {
-    let mut model_info = DetectionModelInfo {
-        has_pose_output: false,
-        has_robot_pose_output: false,
-        has_field_feature_output: false,
-    };
-    for name in names {
-        model_info.has_pose_output |= name == TaskHead::LegacyPose.output_name()
-            || name == TaskHead::PersonPose.output_name();
-        model_info.has_robot_pose_output |= name == TaskHead::RobotPose.output_name();
-        model_info.has_field_feature_output |= name == TaskHead::FieldFeature.output_name();
+impl ModelOutputContract {
+    fn model_info(&self) -> DetectionModelInfo {
+        DetectionModelInfo {
+            has_pose_output: self.has_person_pose
+                || matches!(self.legacy_pose.as_ref(), Some(LegacyPoseOutput::Person)),
+            has_robot_pose_output: self.has_robot_pose,
+            has_field_feature_output: self.has_direct_field_features
+                || matches!(
+                    self.legacy_pose.as_ref(),
+                    Some(LegacyPoseOutput::FieldFeature { .. })
+                ),
+        }
     }
-    model_info
+}
+
+fn model_output_contract(session: &Session) -> Result<ModelOutputContract> {
+    let branches = session.metadata()?.custom("branches")?;
+    model_output_contract_from_metadata(
+        session.outputs.iter().map(|output| output.name.as_str()),
+        branches.as_deref(),
+    )
+}
+
+fn model_output_contract_from_metadata<'a>(
+    names: impl IntoIterator<Item = &'a str>,
+    branches: Option<&str>,
+) -> Result<ModelOutputContract> {
+    let names = names.into_iter().collect::<Vec<_>>();
+    let has_output = |name: &str| names.contains(&name);
+    let legacy_pose = if has_output(TaskHead::LegacyPose.output_name()) {
+        legacy_pose_output_from_metadata(branches)?
+    } else {
+        None
+    };
+
+    Ok(ModelOutputContract {
+        legacy_pose,
+        has_person_pose: has_output(TaskHead::PersonPose.output_name()),
+        has_robot_pose: has_output(TaskHead::RobotPose.output_name()),
+        has_direct_field_features: has_output(TaskHead::FieldFeature.output_name()),
+    })
+}
+
+fn legacy_pose_output_from_metadata(branches: Option<&str>) -> Result<Option<LegacyPoseOutput>> {
+    let Some(branches) = branches else {
+        return Ok(Some(LegacyPoseOutput::Person));
+    };
+    let branches: HydraBranchesMetadata = serde_json::from_str(branches)
+        .map_err(|error| eyre!(error).wrap_err("failed to parse ONNX `branches` model metadata"))?;
+    let Some(branch) = branches.pose_output else {
+        return Ok(Some(LegacyPoseOutput::Person));
+    };
+    if branch.task != "pose" {
+        bail!(
+            "`pose_output` metadata has task `{}`, expected `pose`",
+            branch.task
+        );
+    }
+
+    match branch.kpt_shape.as_deref() {
+        Some([1, 3]) => Ok(Some(LegacyPoseOutput::FieldFeature {
+            labels: field_feature_labels(&branch.names)?,
+        })),
+        Some([17, 3]) | None => Ok(Some(LegacyPoseOutput::Person)),
+        Some(shape) => bail!("unsupported `pose_output` keypoint shape {shape:?}"),
+    }
+}
+
+fn field_feature_labels(names: &BTreeMap<usize, String>) -> Result<[FieldFeatureLabel; 5]> {
+    let labels = names
+        .iter()
+        .enumerate()
+        .map(|(expected_index, (index, name))| {
+            if *index != expected_index {
+                bail!("field-pose class indices must be contiguous from zero");
+            }
+            match name.as_str() {
+                "GoalPost" => Ok(FieldFeatureLabel::GoalPost),
+                "LSpot" => Ok(FieldFeatureLabel::LSpot),
+                "PenaltySpot" => Ok(FieldFeatureLabel::PenaltySpot),
+                "TSpot" => Ok(FieldFeatureLabel::TSpot),
+                "XSpot" => Ok(FieldFeatureLabel::XSpot),
+                _ => bail!("unknown field-pose class `{name}`"),
+            }
+        })
+        .collect::<Result<Vec<_>>>()?;
+    for (index, label) in labels.iter().enumerate() {
+        if labels[..index].contains(label) {
+            bail!("field-pose metadata contains duplicate class `{label:?}`");
+        }
+    }
+    labels.try_into().map_err(|labels: Vec<_>| {
+        eyre!(
+            "field-pose metadata has {} classes, expected 5",
+            labels.len()
+        )
+    })
 }
 
 fn execution_providers(
@@ -442,13 +560,17 @@ fn check_image(image: &Image) -> Result<()> {
     Ok(())
 }
 
-fn extract_outputs<'a>(outputs: &'a SessionOutputs<'a>) -> Result<ModelOutputs<'a>> {
+fn extract_outputs<'a>(
+    outputs: &'a SessionOutputs<'a>,
+    contract: &ModelOutputContract,
+) -> Result<ModelOutputs<'a>> {
     model_outputs_from_arrays(
         extract_output(outputs, TaskHead::ObjectDetection)?,
         extract_output(outputs, TaskHead::LegacyPose)?,
         extract_output(outputs, TaskHead::PersonPose)?,
         extract_output(outputs, TaskHead::RobotPose)?,
         extract_output(outputs, TaskHead::FieldFeature)?,
+        contract,
     )
 }
 
@@ -475,6 +597,7 @@ fn model_outputs_from_arrays<'a>(
     person_poses_output: Option<ArrayViewD<'a, f32>>,
     robot_poses_output: Option<ArrayViewD<'a, f32>>,
     field_features_output: Option<ArrayViewD<'a, f32>>,
+    contract: &ModelOutputContract,
 ) -> Result<ModelOutputs<'a>> {
     let objects_output = objects_output.ok_or_else(|| {
         eyre!(
@@ -483,12 +606,29 @@ fn model_outputs_from_arrays<'a>(
         )
     })?;
     let objects = validate_and_reshape_output(TaskHead::ObjectDetection, objects_output)?;
-    let poses = if let Some(output) = person_poses_output {
-        Some(validate_and_reshape_output(TaskHead::PersonPose, output)?)
-    } else {
-        legacy_poses_output
-            .map(|output| validate_and_reshape_output(TaskHead::LegacyPose, output))
-            .transpose()?
+    let mut poses = person_poses_output
+        .map(|output| validate_and_reshape_output(TaskHead::PersonPose, output))
+        .transpose()?;
+    let mut field_feature_poses = None;
+    match (&contract.legacy_pose, legacy_poses_output) {
+        (Some(LegacyPoseOutput::Person), Some(output)) if poses.is_none() => {
+            poses = Some(validate_and_reshape_output(TaskHead::LegacyPose, output)?);
+        }
+        (Some(LegacyPoseOutput::FieldFeature { .. }), Some(output)) => {
+            field_feature_poses = Some(validate_and_reshape_named_output(
+                TaskHead::LegacyPose.output_name(),
+                &[
+                    1,
+                    NUMBER_OF_DETECTIONS,
+                    NUMBER_OF_VALUES_PER_FIELD_FEATURE_POSE,
+                ],
+                output,
+            )?);
+        }
+        (None, None) | (Some(LegacyPoseOutput::Person), Some(_)) => {}
+        (None, Some(_)) | (Some(_), None) => {
+            bail!("model output contract does not match `pose_output` availability")
+        }
     };
     let robot_poses = robot_poses_output
         .map(|output| validate_and_reshape_output(TaskHead::RobotPose, output))
@@ -502,6 +642,7 @@ fn model_outputs_from_arrays<'a>(
         poses,
         robot_poses,
         field_features,
+        field_feature_poses,
     })
 }
 
@@ -509,11 +650,19 @@ fn validate_and_reshape_output<'a>(
     task_head: TaskHead,
     output: ArrayViewD<'a, f32>,
 ) -> Result<ArrayView2<'a, f32>> {
-    if output.shape() != task_head.expected_shape() {
+    validate_and_reshape_named_output(task_head.output_name(), task_head.expected_shape(), output)
+}
+
+fn validate_and_reshape_named_output<'a>(
+    output_name: &str,
+    expected_shape: &[usize],
+    output: ArrayViewD<'a, f32>,
+) -> Result<ArrayView2<'a, f32>> {
+    if output.shape() != expected_shape {
         bail!(
             "{} not of expected shape. Expected: {:?}, got: {:?}",
-            task_head.output_name(),
-            task_head.expected_shape(),
+            output_name,
+            expected_shape,
             output.shape()
         )
     }
@@ -602,14 +751,13 @@ fn extract_robot_pose_detections(
 
 fn extract_field_feature_detections(
     outputs: &ModelOutputs,
+    contract: &ModelOutputContract,
     confidence_threshold: f32,
 ) -> Vec<FieldFeatureDetection> {
-    let Some(field_features) = &outputs.field_features else {
-        return Vec::new();
-    };
-
-    field_features
-        .axis_iter(Axis(0))
+    let mut detections = outputs
+        .field_features
+        .iter()
+        .flat_map(|field_features| field_features.axis_iter(Axis(0)))
         .filter_map(|row| {
             let confidence = row[2];
             (confidence.is_finite() && confidence >= confidence_threshold).then(|| {
@@ -620,7 +768,33 @@ fn extract_field_feature_detections(
                 }
             })
         })
-        .collect()
+        .collect::<Vec<_>>();
+
+    let Some(field_feature_poses) = &outputs.field_feature_poses else {
+        return detections;
+    };
+    let Some(LegacyPoseOutput::FieldFeature { labels }) = &contract.legacy_pose else {
+        return detections;
+    };
+    detections.extend(field_feature_poses.axis_iter(Axis(0)).filter_map(|row| {
+        let confidence = row[4];
+        let class = row[5];
+        if !confidence.is_finite()
+            || confidence < confidence_threshold
+            || !class.is_finite()
+            || class < 0.0
+            || class.fract() != 0.0
+        {
+            return None;
+        }
+        let label = labels.get(class as usize).copied()?;
+        Some(FieldFeatureDetection {
+            point: linear_algebra::point![row[6], row[7]],
+            confidence,
+            label,
+        })
+    }));
+    detections
 }
 
 trait HasBoundingBox {
@@ -694,6 +868,25 @@ mod tests {
 
     use super::*;
 
+    fn contract<'a>(names: impl IntoIterator<Item = &'a str>) -> ModelOutputContract {
+        model_output_contract_from_metadata(names, None).unwrap()
+    }
+
+    const FIELD_POSE_BRANCHES: &str = r#"{
+        "object_output": {"task": "detect", "names": {"0": "Ball"}},
+        "pose_output": {
+            "task": "pose",
+            "names": {
+                "0": "GoalPost",
+                "1": "LSpot",
+                "2": "PenaltySpot",
+                "3": "TSpot",
+                "4": "XSpot"
+            },
+            "kpt_shape": [1, 3]
+        }
+    }"#;
+
     #[test]
     fn default_provider_preserves_production_behavior() {
         assert_eq!(ExecutionProvider::default(), ExecutionProvider::Automatic);
@@ -702,9 +895,16 @@ mod tests {
     #[test]
     fn missing_pose_output_produces_no_pose_candidates() {
         let objects = Array3::zeros((1, NUMBER_OF_DETECTIONS, NUMBER_OF_VALUES_PER_OBJECT));
-        let outputs =
-            model_outputs_from_arrays(Some(objects.view().into_dyn()), None, None, None, None)
-                .unwrap();
+        let contract = contract(["object_output"]);
+        let outputs = model_outputs_from_arrays(
+            Some(objects.view().into_dyn()),
+            None,
+            None,
+            None,
+            None,
+            &contract,
+        )
+        .unwrap();
 
         let poses = extract_candidate_pose_detections(&outputs, 0.0).unwrap();
 
@@ -714,13 +914,13 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
-        assert!(extract_field_feature_detections(&outputs, 0.0).is_empty());
+        assert!(extract_field_feature_detections(&outputs, &contract, 0.0).is_empty());
     }
 
     #[test]
     fn model_info_distinguishes_pose_capability() {
         assert_eq!(
-            model_info_from_output_names(["object_output"]),
+            contract(["object_output"]).model_info(),
             DetectionModelInfo {
                 has_pose_output: false,
                 has_robot_pose_output: false,
@@ -728,7 +928,7 @@ mod tests {
             }
         );
         assert_eq!(
-            model_info_from_output_names(["object_output", "pose_output"]),
+            contract(["object_output", "pose_output"]).model_info(),
             DetectionModelInfo {
                 has_pose_output: true,
                 has_robot_pose_output: false,
@@ -736,7 +936,7 @@ mod tests {
             }
         );
         assert_eq!(
-            model_info_from_output_names(["object_output", "person_pose_output"]),
+            contract(["object_output", "person_pose_output"]).model_info(),
             DetectionModelInfo {
                 has_pose_output: true,
                 has_robot_pose_output: false,
@@ -744,7 +944,7 @@ mod tests {
             }
         );
         assert_eq!(
-            model_info_from_output_names(["object_output", "field_feature_output"]),
+            contract(["object_output", "field_feature_output"]).model_info(),
             DetectionModelInfo {
                 has_pose_output: false,
                 has_robot_pose_output: false,
@@ -752,18 +952,33 @@ mod tests {
             }
         );
         assert_eq!(
-            model_info_from_output_names(["object_output", "robot_pose_output"]),
+            contract(["object_output", "robot_pose_output"]).model_info(),
             DetectionModelInfo {
                 has_pose_output: false,
                 has_robot_pose_output: true,
                 has_field_feature_output: false,
             }
         );
+        assert_eq!(
+            model_output_contract_from_metadata(
+                ["object_output", "pose_output", "robot_pose_output"],
+                Some(FIELD_POSE_BRANCHES),
+            )
+            .unwrap()
+            .model_info(),
+            DetectionModelInfo {
+                has_pose_output: false,
+                has_robot_pose_output: true,
+                has_field_feature_output: true,
+            }
+        );
     }
 
     #[test]
     fn object_output_is_mandatory() {
-        let error = model_outputs_from_arrays(None, None, None, None, None).unwrap_err();
+        let error =
+            model_outputs_from_arrays(None, None, None, None, None, &contract(["object_output"]))
+                .unwrap_err();
 
         assert!(error.to_string().contains("`object_output` is missing"));
     }
@@ -773,9 +988,15 @@ mod tests {
         let objects =
             Array3::<f32>::zeros((1, NUMBER_OF_DETECTIONS - 1, NUMBER_OF_VALUES_PER_OBJECT));
 
-        let error =
-            model_outputs_from_arrays(Some(objects.view().into_dyn()), None, None, None, None)
-                .unwrap_err();
+        let error = model_outputs_from_arrays(
+            Some(objects.view().into_dyn()),
+            None,
+            None,
+            None,
+            None,
+            &contract(["object_output"]),
+        )
+        .unwrap_err();
 
         assert!(
             error
@@ -795,6 +1016,7 @@ mod tests {
             None,
             None,
             None,
+            &contract(["object_output", "pose_output"]),
         )
         .unwrap();
 
@@ -821,6 +1043,12 @@ mod tests {
             Some(poses.view().into_dyn()),
             Some(robot_poses.view().into_dyn()),
             Some(field_features.view().into_dyn()),
+            &contract([
+                "object_output",
+                "person_pose_output",
+                "robot_pose_output",
+                "field_feature_output",
+            ]),
         )
         .unwrap();
 
@@ -849,6 +1077,7 @@ mod tests {
             None,
             None,
             None,
+            &contract(["object_output", "pose_output"]),
         )
         .unwrap_err();
 
@@ -870,6 +1099,7 @@ mod tests {
         assert_eq!(TaskHead::PersonPose.expected_shape(), &[1, 300, 57]);
         assert_eq!(TaskHead::RobotPose.expected_shape(), &[1, 300, 48]);
         assert_eq!(TaskHead::FieldFeature.expected_shape(), &[1, 300, 4]);
+        assert_eq!(NUMBER_OF_VALUES_PER_FIELD_FEATURE_POSE, 9);
     }
 
     #[test]
@@ -887,6 +1117,7 @@ mod tests {
             poses: None,
             robot_poses: Some(robot_poses.view()),
             field_features: None,
+            field_feature_poses: None,
         };
 
         let detections = extract_robot_pose_detections(&outputs, 0.5).unwrap();
@@ -911,13 +1142,55 @@ mod tests {
             poses: Some(poses.view()),
             robot_poses: Some(robot_poses.view()),
             field_features: Some(field_features.view()),
+            field_feature_poses: None,
         };
 
-        let detections = extract_field_feature_detections(&outputs, 0.5);
+        let detections = extract_field_feature_detections(
+            &outputs,
+            &contract(["object_output", "field_feature_output"]),
+            0.5,
+        );
 
         assert_eq!(detections.len(), 1);
         assert_eq!(detections[0].confidence, 0.9);
         assert_eq!(detections[0].label, FieldFeatureLabel::TSpot);
+    }
+
+    #[test]
+    fn field_pose_output_routes_keypoint_and_metadata_class_order() {
+        let contract = model_output_contract_from_metadata(
+            ["object_output", "pose_output"],
+            Some(FIELD_POSE_BRANCHES),
+        )
+        .unwrap();
+        let objects = Array3::zeros((1, NUMBER_OF_DETECTIONS, NUMBER_OF_VALUES_PER_OBJECT));
+        let mut field_poses = Array3::zeros((
+            1,
+            NUMBER_OF_DETECTIONS,
+            NUMBER_OF_VALUES_PER_FIELD_FEATURE_POSE,
+        ));
+        field_poses[[0, 0, 4]] = 0.9;
+        field_poses[[0, 0, 5]] = 2.0;
+        field_poses[[0, 0, 6]] = 12.0;
+        field_poses[[0, 0, 7]] = 34.0;
+        field_poses[[0, 0, 8]] = 0.8;
+        let outputs = model_outputs_from_arrays(
+            Some(objects.view().into_dyn()),
+            Some(field_poses.view().into_dyn()),
+            None,
+            None,
+            None,
+            &contract,
+        )
+        .unwrap();
+
+        let detections = extract_field_feature_detections(&outputs, &contract, 0.5);
+
+        assert!(outputs.poses.is_none());
+        assert_eq!(detections.len(), 1);
+        assert_eq!(detections[0].point, linear_algebra::point![12.0, 34.0]);
+        assert_eq!(detections[0].confidence, 0.9);
+        assert_eq!(detections[0].label, FieldFeatureLabel::PenaltySpot);
     }
 
     #[test]
@@ -959,9 +1232,14 @@ mod tests {
             poses: Some(poses.view()),
             robot_poses: Some(robot_poses.view()),
             field_features: Some(field_features.view()),
+            field_feature_poses: None,
         };
 
-        let detections = extract_field_feature_detections(&outputs, 0.0);
+        let detections = extract_field_feature_detections(
+            &outputs,
+            &contract(["object_output", "field_feature_output"]),
+            0.0,
+        );
 
         assert_eq!(detections.len(), NUMBER_OF_DETECTIONS - 1);
     }
