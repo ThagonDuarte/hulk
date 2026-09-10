@@ -1,0 +1,47 @@
+use color_eyre::Report;
+use coordinate_systems::Pixel;
+use eframe::egui::{Color32, Stroke};
+use geometry::circle::Circle;
+use ros_z::time::Time;
+
+use crate::repaint::ObservationContext;
+
+use super::super::image_overlay::{
+    ConfidenceThresholds, ImageOverlay, ImageOverlayPainter, OverlayObservation,
+};
+
+pub(in crate::panels::image) struct FilteredBallsOverlay {
+    filtered_balls: OverlayObservation<Vec<Circle<Pixel>>>,
+}
+
+impl ImageOverlay for FilteredBallsOverlay {
+    const NAME: &'static str = "Filtered Balls";
+    // Retain the saved settings for the former filtered-ball overlay.
+    const STORAGE_KEY: &'static str = "ball_detection";
+
+    fn new<C>(context: &C) -> Result<Self, Report>
+    where
+        C: ObservationContext,
+    {
+        Ok(Self {
+            filtered_balls: OverlayObservation::new(
+                context,
+                "ball_filter/filtered_balls_in_image",
+            )?,
+        })
+    }
+
+    fn paint(
+        &self,
+        painter: &ImageOverlayPainter,
+        _image_time: Time,
+        _confidence_thresholds: &ConfidenceThresholds,
+    ) {
+        let Some(filtered_balls) = self.filtered_balls.latest() else {
+            return;
+        };
+        for circle in &filtered_balls.value {
+            painter.circle_stroke(circle.center, circle.radius, Stroke::new(3.0, Color32::RED));
+        }
+    }
+}

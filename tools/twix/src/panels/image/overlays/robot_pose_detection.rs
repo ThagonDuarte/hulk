@@ -7,7 +7,7 @@ use super::super::image_overlay::{
     OverlayObservation,
 };
 use super::{
-    pose_detection::{POSE_CONFIDENCE_THRESHOLDS, paint_pose},
+    pose_painter::{POSE_CONFIDENCE_THRESHOLDS, paint_pose},
     prediction_colors,
 };
 use crate::repaint::ObservationContext;

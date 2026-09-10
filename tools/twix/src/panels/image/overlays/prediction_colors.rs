@@ -9,7 +9,6 @@ const PENALTY_SPOT: Color32 = Color32::from_rgb(110, 40, 170);
 const ROBOT: Color32 = Color32::from_rgb(255, 225, 25);
 const T_SPOT: Color32 = Color32::from_rgb(40, 202, 255);
 const X_SPOT: Color32 = Color32::from_rgb(185, 35, 35);
-pub(super) const PERSON_POSE: Color32 = Color32::from_rgb(255, 100, 190);
 
 pub(super) const fn robocup_object(label: RobocupObjectLabel) -> Color32 {
     match label {

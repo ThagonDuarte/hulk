@@ -1,46 +1,83 @@
 use color_eyre::Report;
-use coordinate_systems::Pixel;
-use eframe::egui::{Color32, Stroke};
-use geometry::circle::Circle;
 use ros_z::time::Time;
+use types::{
+    object_detection::{Object, RobocupObjectLabel},
+    time_wrapper::TimeWrapper,
+};
 
 use crate::repaint::ObservationContext;
 
 use super::super::image_overlay::{
-    ConfidenceThresholds, ImageOverlay, ImageOverlayPainter, OverlayObservation,
+    ConfidenceThresholdDefinition, ConfidenceThresholdKind, ConfidenceThresholds, ImageOverlay,
+    ImageOverlayPainter, OverlayObservation,
 };
+use super::prediction_colors;
+
+const BALL_CONFIDENCE_THRESHOLDS: [ConfidenceThresholdDefinition; 1] =
+    [ConfidenceThresholdDefinition::new(
+        ConfidenceThresholdKind::BoundingBox,
+        "Confidence",
+        "confidence_threshold",
+    )];
 
 pub(in crate::panels::image) struct BallDetectionOverlay {
-    filtered_balls: OverlayObservation<Vec<Circle<Pixel>>>,
+    object_detections: OverlayObservation<TimeWrapper<Vec<Object<RobocupObjectLabel>>>>,
 }
 
 impl ImageOverlay for BallDetectionOverlay {
     const NAME: &'static str = "Ball Detection";
-    const STORAGE_KEY: &'static str = "ball_detection";
+    // Retain settings saved under the former Object Detection name.
+    const STORAGE_KEY: &'static str = "object_detection";
+    const CONFIDENCE_THRESHOLDS: &'static [ConfidenceThresholdDefinition] =
+        &BALL_CONFIDENCE_THRESHOLDS;
 
     fn new<C>(context: &C) -> Result<Self, Report>
     where
         C: ObservationContext,
     {
         Ok(Self {
-            filtered_balls: OverlayObservation::new(
-                context,
-                "ball_filter/filtered_balls_in_image",
-            )?,
+            object_detections: OverlayObservation::new(context, "detected_objects")?,
         })
     }
 
     fn paint(
         &self,
         painter: &ImageOverlayPainter,
-        _image_time: Time,
-        _confidence_thresholds: &ConfidenceThresholds,
+        image_time: Time,
+        confidence_thresholds: &ConfidenceThresholds,
     ) {
-        let Some(filtered_balls) = self.filtered_balls.latest() else {
+        let Some(object_detections) = self.object_detections.at_time(image_time) else {
             return;
         };
-        for circle in &filtered_balls.value {
-            painter.circle_stroke(circle.center, circle.radius, Stroke::new(3.0, Color32::RED));
+        paint_bounding_boxes(
+            painter,
+            &object_detections.value.inner,
+            confidence_thresholds.bounding_box,
+        );
+    }
+
+    fn latest_time(&self) -> Option<Time> {
+        self.object_detections.latest_time()
+    }
+}
+
+fn paint_bounding_boxes(
+    painter: &ImageOverlayPainter,
+    detections: &[Object<RobocupObjectLabel>],
+    confidence_threshold: f32,
+) {
+    for detection in detections
+        .iter()
+        .filter(|detection| detection.label == RobocupObjectLabel::Ball)
+    {
+        let bounding_box = detection.bounding_box;
+        if bounding_box.confidence < confidence_threshold {
+            continue;
         }
+        painter.detection_box(
+            bounding_box,
+            detection.label.into(),
+            prediction_colors::robocup_object(detection.label),
+        );
     }
 }

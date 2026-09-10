@@ -17,8 +17,8 @@ use types::{bounding_box::BoundingBox, time_wrapper::TimeWrapper};
 use crate::repaint::{ObservationContext, ObservationRepaint, RepaintOnUpdates};
 
 use super::overlays::{
-    BallDetectionOverlay, FieldBorderOverlay, FieldPoseDetectionOverlay, HorizonOverlay,
-    LineDetectionOverlay, ObjectDetectionOverlay, PoseDetectionOverlay, RobotPoseDetectionOverlay,
+    BallDetectionOverlay, FieldBorderOverlay, FieldPoseDetectionOverlay, FilteredBallsOverlay,
+    HorizonOverlay, LineDetectionOverlay, RobotPoseDetectionOverlay,
 };
 
 const OVERLAY_RETENTION_WINDOW: Duration = Duration::from_secs(2);
@@ -45,13 +45,12 @@ enum DetectionLabelPlacement {
 
 pub(super) struct ImageOverlays {
     line_detection: OverlaySlot<LineDetectionOverlay>,
-    ball_detection: OverlaySlot<BallDetectionOverlay>,
+    filtered_balls: OverlaySlot<FilteredBallsOverlay>,
     horizon: OverlaySlot<HorizonOverlay>,
     field_border: OverlaySlot<FieldBorderOverlay>,
-    object_detection: OverlaySlot<ObjectDetectionOverlay>,
+    ball_detection: OverlaySlot<BallDetectionOverlay>,
     field_pose_detection: OverlaySlot<FieldPoseDetectionOverlay>,
     robot_pose_detection: OverlaySlot<RobotPoseDetectionOverlay>,
-    pose_detection: OverlaySlot<PoseDetectionOverlay>,
 }
 
 impl ImageOverlays {
@@ -61,13 +60,12 @@ impl ImageOverlays {
     {
         Self {
             line_detection: OverlaySlot::new(value, context),
-            ball_detection: OverlaySlot::new(value, context),
+            filtered_balls: OverlaySlot::new(value, context),
             horizon: OverlaySlot::new(value, context),
             field_border: OverlaySlot::new(value, context),
-            object_detection: OverlaySlot::new(value, context),
+            ball_detection: OverlaySlot::new(value, context),
             field_pose_detection: OverlaySlot::new(value, context),
             robot_pose_detection: OverlaySlot::new(value, context),
-            pose_detection: OverlaySlot::new(value, context),
         }
     }
 
@@ -79,33 +77,30 @@ impl ImageOverlays {
             .config(MenuConfig::new().close_behavior(PopupCloseBehavior::CloseOnClickOutside))
             .ui(ui, |ui| {
                 self.line_detection.checkbox(ui, context);
-                self.ball_detection.checkbox(ui, context);
+                self.filtered_balls.checkbox(ui, context);
                 self.horizon.checkbox(ui, context);
                 self.field_border.checkbox(ui, context);
-                self.object_detection.checkbox(ui, context);
+                self.ball_detection.checkbox(ui, context);
                 self.field_pose_detection.checkbox(ui, context);
                 self.robot_pose_detection.checkbox(ui, context);
-                self.pose_detection.checkbox(ui, context);
             });
     }
 
     pub(super) fn paint(&self, painter: &ImageOverlayPainter, image_time: Time) {
         self.line_detection.paint(painter, image_time);
-        self.ball_detection.paint(painter, image_time);
+        self.filtered_balls.paint(painter, image_time);
         self.horizon.paint(painter, image_time);
         self.field_border.paint(painter, image_time);
-        self.object_detection.paint(painter, image_time);
+        self.ball_detection.paint(painter, image_time);
         self.field_pose_detection.paint(painter, image_time);
         self.robot_pose_detection.paint(painter, image_time);
-        self.pose_detection.paint(painter, image_time);
     }
 
     pub(super) fn preferred_image_time(&self) -> Option<Time> {
         [
-            self.object_detection.latest_time(),
+            self.ball_detection.latest_time(),
             self.field_pose_detection.latest_time(),
             self.robot_pose_detection.latest_time(),
-            self.pose_detection.latest_time(),
         ]
         .into_iter()
         .flatten()
@@ -115,13 +110,12 @@ impl ImageOverlays {
     pub(super) fn save(&self) -> Value {
         json!({
             LineDetectionOverlay::STORAGE_KEY: self.line_detection.save(),
-            BallDetectionOverlay::STORAGE_KEY: self.ball_detection.save(),
+            FilteredBallsOverlay::STORAGE_KEY: self.filtered_balls.save(),
             HorizonOverlay::STORAGE_KEY: self.horizon.save(),
             FieldBorderOverlay::STORAGE_KEY: self.field_border.save(),
-            ObjectDetectionOverlay::STORAGE_KEY: self.object_detection.save(),
+            BallDetectionOverlay::STORAGE_KEY: self.ball_detection.save(),
             FieldPoseDetectionOverlay::STORAGE_KEY: self.field_pose_detection.save(),
             RobotPoseDetectionOverlay::STORAGE_KEY: self.robot_pose_detection.save(),
-            PoseDetectionOverlay::STORAGE_KEY: self.pose_detection.save(),
         })
     }
 }
@@ -130,13 +124,12 @@ impl Default for ImageOverlays {
     fn default() -> Self {
         Self {
             line_detection: OverlaySlot::inactive(),
-            ball_detection: OverlaySlot::inactive(),
+            filtered_balls: OverlaySlot::inactive(),
             horizon: OverlaySlot::inactive(),
             field_border: OverlaySlot::inactive(),
-            object_detection: OverlaySlot::inactive(),
+            ball_detection: OverlaySlot::inactive(),
             field_pose_detection: OverlaySlot::inactive(),
             robot_pose_detection: OverlaySlot::inactive(),
-            pose_detection: OverlaySlot::inactive(),
         }
     }
 }
